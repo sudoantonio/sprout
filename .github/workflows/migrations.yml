@@ -1,0 +1,98 @@
+name: PostgreSQL migrations
+
+on:
+  pull_request:
+    paths:
+      - "db/migrations/**"
+      - "scripts/migrate.sh"
+      - "scripts/validate-migrations.sh"
+      - ".github/workflows/migrations.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main, master]
+    paths:
+      - "db/migrations/**"
+      - "scripts/migrate.sh"
+      - "scripts/validate-migrations.sh"
+      - ".github/workflows/migrations.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MIGRATIONS_DIR: db/migrations
+  DATABASE_URL: postgresql://sprout_ci@127.0.0.1:5432/sprout_ci
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:14-bookworm
+        env:
+          POSTGRES_DB: sprout_ci
+          POSTGRES_USER: sprout_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sprout_ci -d sprout_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+      - name: Validate migration files
+        id: migrations
+        run: scripts/validate-migrations.sh
+      - name: Install sqlx-cli
+        if: steps.migrations.outputs.present == 'true'
+        run: cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features rustls,postgres
+      - name: Apply migrations to an empty database
+        if: steps.migrations.outputs.present == 'true'
+        run: scripts/migrate.sh --apply
+      - name: Verify schema
+        if: steps.migrations.outputs.present == 'true'
+        run: psql "${DATABASE_URL}" --set ON_ERROR_STOP=1 --file db/tests/verify_schema.sql
+      - name: Verify database behavior
+        if: steps.migrations.outputs.present == 'true'
+        run: psql "${DATABASE_URL}" --set ON_ERROR_STOP=1 --file db/tests/verify_behavior.sql
+      - name: T-LLR-10.3 verify PostgreSQL 14 upgrade compatibility
+        if: steps.migrations.outputs.present == 'true'
+        run: |
+          upgrade_url="postgresql://sprout_ci@127.0.0.1:5432/sprout_upgrade_ci"
+          psql "postgresql://sprout_ci@127.0.0.1:5432/postgres" \
+            --set ON_ERROR_STOP=1 \
+            --command "CREATE DATABASE sprout_upgrade_ci"
+          previous_dir="$(mktemp -d)"
+          migrations=(db/migrations/*.sql)
+          if ((${#migrations[@]} > 1)); then
+            cp "${migrations[@]:0:${#migrations[@]}-1}" "${previous_dir}/"
+            DATABASE_URL="${upgrade_url}" sqlx migrate run --source "${previous_dir}"
+          fi
+          DATABASE_URL="${upgrade_url}" scripts/migrate.sh --apply
+          psql "${upgrade_url}" --set ON_ERROR_STOP=1 --file db/tests/verify_schema.sql
+      - name: Verify PostgreSQL backup and restore
+        if: steps.migrations.outputs.present == 'true'
+        run: |
+          dump="${RUNNER_TEMP}/sprout-ci.dump"
+          pg_dump "${DATABASE_URL}" --format=custom --file="${dump}"
+          psql "postgresql://sprout_ci@127.0.0.1:5432/postgres" \
+            --set ON_ERROR_STOP=1 \
+            --command "CREATE DATABASE sprout_restore_ci"
+          pg_restore \
+            --exit-on-error \
+            --no-owner \
+            --dbname="postgresql://sprout_ci@127.0.0.1:5432/sprout_restore_ci" \
+            "${dump}"
+          psql "postgresql://sprout_ci@127.0.0.1:5432/sprout_restore_ci" \
+            --set ON_ERROR_STOP=1 \
+            --file db/tests/verify_schema.sql

@@ -1,0 +1,54 @@
+name: License and advisory checks
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: T-LLR-11.1 licenses and T-LLR-11.2 advisories/SBOM
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.88.0"
+          command: check advisories licenses bans sources
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Rust advisories
+        run: cargo audit --deny warnings
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install frontend lockfile
+        working-directory: apps/web
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Audit high and critical npm vulnerabilities
+        working-directory: apps/web
+        run: npm audit --audit-level=high
+      - uses: anchore/sbom-action/download-syft@v0
+      - name: Generate SPDX and CycloneDX SBOMs
+        run: scripts/generate-sbom.sh --output-dir "${RUNNER_TEMP}/sbom"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lockfile-sboms
+          path: ${{ runner.temp }}/sbom
+          if-no-files-found: error

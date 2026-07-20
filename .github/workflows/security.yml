@@ -1,0 +1,58 @@
+name: Security static and fuzz checks
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: "41 4 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component clippy
+          rustup default 1.88.0
+      - name: Security-focused Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Telemetry and secret redaction tests
+        run: |
+          cargo test --workspace --locked redacts
+          cargo test --workspace --locked metrics_have_fixed_labels
+      - name: Shell static analysis
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+          shellcheck scripts/*.sh tests/system/*.sh
+      - name: Verify complete requirements traceability
+        run: scripts/verify-requirements-traceability.sh
+      - name: Verify release evidence gate fails closed
+        run: |
+          if scripts/release-gate.sh; then
+            echo "release gate unexpectedly passed without evidence" >&2
+            exit 1
+          fi
+
+  fuzz-smoke:
+    name: T-LLR-11.3 bounded protocol parser fuzz smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly fuzz toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      - name: Run bounded parser fuzz smoke
+        working-directory: fuzz
+        run: cargo +nightly fuzz run protocol_parsers -- -max_total_time=60 -max_len=1048576

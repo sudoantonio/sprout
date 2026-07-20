@@ -1,0 +1,89 @@
+# declared_test_id	test_artifact	named_evidence	status
+HLT-01	apps/web/tests/e2e/hlt01-webauthn.spec.ts	Docker identity, invitation, recovery-device, and browser passkey journey	automated
+T-LLR-01.1	scripts/validation/roundtrip.sh	case-equivalent email rejection and encrypted profile plaintext scan	automated
+T-LLR-01.2	apps/web/tests/e2e/hlt01-webauthn.spec.ts	single-use WebAuthn origin RP ID and user-verification matrix	automated
+T-LLR-01.3	scripts/validation/roundtrip.sh	recovery login cannot unwrap content before explicit device rekey	automated
+T-LLR-01.4	db/tests/verify_behavior.sql	shared-project count then project-modification recency total order	automated
+T-LLR-01.5	db/tests/verify_behavior.sql	pending invitation lifecycle	automated
+HLT-02	db/tests/verify_behavior.sql	three-user recursive grant, future-descendant, origin-isolated revoke matrix	automated
+T-LLR-02.1	apps/server/tests/requirements.rs	owner creator and unrelated resource policy matrix	automated
+T-LLR-02.2	db/tests/verify_behavior.sql	assignee-only completion questionnaire and upload matrix	automated
+T-LLR-02.3	db/tests/verify_behavior.sql	future descendant permission propagation	automated
+T-LLR-02.4	apps/server/tests/requirements.rs	container-only ancestor header allowed while body and sibling access are denied	automated
+T-LLR-02.5	apps/server/tests/requirements.rs	owner and non-owner assignment API matrix	automated
+T-LLR-02.6	tests/system/unit-requirements.sh	permission origin revocation unit test	automated
+T-LLR-02.7	db/tests/verify_behavior.sql	transactional list revocation behavior	automated
+T-LLR-02.8	db/tests/verify_behavior.sql	cross-project composite FK plus API authorization pair isolation	automated
+HLT-03	scripts/validation/hlt03-task-domain.sh	three-kind preset materialize complete copy and recur ceremony	automated
+T-LLR-03.1	tests/system/unit-requirements.sh	decrypted mixed-task client filtering	automated
+T-LLR-03.2	db/tests/verify_behavior.sql	pretask selected-value combinations	automated
+T-LLR-03.3	db/tests/verify_behavior.sql	materialized immutable snapshots	automated
+T-LLR-03.4	db/tests/verify_behavior.sql	completed transition and copy provenance	automated
+T-LLR-03.5	db/tests/verify_behavior.sql	atomic recurring completion fault path	automated
+T-LLR-03.6	scripts/validation/hlt03-task-domain.sh	two-worker next-occurrence uniqueness race	automated
+T-LLR-03.7	tests/system/unit-requirements.sh	virtual-clock recurring overdue presentation	automated
+HLT-04	db/tests/verify_behavior.sql	versioned questionnaire history journey	automated
+T-LLR-04.1	db/tests/verify_behavior.sql	published version immutability	automated
+T-LLR-04.2	tests/system/unit-requirements.sh	open choice multiple and boolean validation matrix	automated
+T-LLR-04.3	db/tests/verify_behavior.sql	pinned version option isolation	automated
+T-LLR-04.4	apps/web/tests/e2e/questionnaire-retry.spec.ts	authenticated browser recovers committed submission after response loss	automated
+T-LLR-04.5	db/tests/verify_behavior.sql	historical referential retention	automated
+HLT-05	apps/web/tests/e2e/hlt05-real-backend.spec.ts	real-backend provenance, offline ciphertext sync, exact active-epoch binding, and authorized second-device decryption	automated
+T-LLR-05.1	db/tests/verify_schema.sql	attachment provenance schema	automated
+T-LLR-05.2	scripts/validation/hlt05-filesystem.sh	populated server blob plaintext scan	automated
+T-LLR-05.3	db/tests/verify_behavior.sql	attachment authorization matrix	automated
+T-LLR-05.4	tests/system/unit-requirements.sh	atomic disk-full and crash fault tests	automated
+T-LLR-05.5	apps/web/tests/e2e/attachments.spec.ts	browser OPFS plaintext and outbound-path inspection	automated
+T-LLR-05.6	apps/web/tests/e2e/attachments.spec.ts	hostile content forced through opaque download	automated
+HLT-06	scripts/validation/roundtrip.sh	unprovisioned recovery fail-closed multi-device ceremony	automated
+T-LLR-06.1	tests/system/unit-requirements.sh	native WASM byte-for-byte vector parity	automated
+T-LLR-06.2	tests/system/unit-requirements.sh	nonce and AAD tamper unit test	automated
+T-LLR-06.3	tests/system/unit-requirements.sh	device key lifecycle separation	automated
+T-LLR-06.4	tests/system/unit-requirements.sh	resource key isolation and rotation	automated
+T-LLR-06.5	db/tests/verify_behavior.sql	online revocation filtering	automated
+T-LLR-06.6	tests/system/unit-requirements.sh	container-only header/body crypto oracle	automated
+T-LLR-06.7	tests/system/unit-requirements.sh	n-of-n recovery negative and positive cases	automated
+T-LLR-06.8	apps/server/tests/requirements.rs	provisioned recovery electorate freeze and finalize denial	automated
+T-LLR-06.9	apps/server/tests/requirements.rs	owner-only refusal and unreachable-electorate denial	automated
+HLT-07	scripts/validation/hlt07-sync.sh	sync projection idempotency and PWA catch-up oracles	automated
+T-LLR-07.1	tests/system/unit-requirements.sh	adversarial signed event chains	automated
+T-LLR-07.2	tests/system/unit-requirements.sh	WebSocket reconnect REST catch-up	automated
+T-LLR-07.3	apps/server/tests/sync_idempotency.rs	identical digest replay and collision conflict	automated
+T-LLR-07.4	apps/web/tests/e2e/sync-conflict.spec.ts	two-context conflict surface and catch-up contract	automated
+T-LLR-07.5	scripts/validation/hlt03-task-domain.sh	concurrent recurrence batch uniqueness	automated
+T-LLR-07.6	db/tests/verify_behavior.sql	projection rollback reconstruction and stale replay	automated
+HLT-08	apps/server/tests/retention.rs	single controlled-clock warning export-before-purge delivery corruption and expiry lifecycle	automated
+T-LLR-08.1	db/tests/verify_behavior.sql	15 and 30 day UTC boundaries	automated
+T-LLR-08.2	db/tests/verify_behavior.sql	calendar month and leap-year boundaries	automated
+T-LLR-08.3	db/tests/verify_behavior.sql	maximum dependency retention closure	automated
+T-LLR-08.4	apps/server/tests/retention.rs	concurrent in-app and email warning deduplication	automated
+T-LLR-08.5	apps/server/tests/retention.rs	per-user opt-in export authorization and isolation	automated
+T-LLR-08.6	tests/system/retention-postgres-restart.sh	real PostgreSQL restart after durable purge claim and exactly-once retry	automated
+T-LLR-08.7	apps/server/tests/retention.rs	next-login delivery and exact 30-day expiry	automated
+T-LLR-08.8	apps/server/tests/retention.rs	checksum signature corruption and forced download	automated
+HLT-09	apps/web/tests/e2e/pwa-journey.spec.ts	signed upgrade persistence offline shell and catch-up journey	automated
+T-LLR-09.1	apps/web/tests/e2e/pwa-storage-security.spec.ts	persistence refusal and quota preserve queued ciphertext	automated
+T-LLR-09.2	tests/system/unit-requirements.sh	local filtering without semantic API values	automated
+T-LLR-09.3	apps/web/tests/e2e/pwa-storage-security.spec.ts	service-worker cache and request plaintext inspection	automated
+T-LLR-09.4	apps/web/tests/e2e/workspace.spec.ts	Chromium Firefox and WebKit matrix	automated
+T-LLR-09.5	apps/web/tests/e2e/pwa-storage-security.spec.ts	Trusted Types CSP XSS and third-party script assertions	automated
+HLT-10	tests/system/requirements-gates.sh	Linux disaster-recovery release journey	external
+T-LLR-10.1	db/tests/verify_behavior.sql	transaction rollback and atomic projection fault	automated
+T-LLR-10.2	db/tests/verify_behavior.sql	direct SQL create read and update isolation through composite FKs and forced RLS	automated
+T-LLR-10.3	.github/workflows/migrations.yml	PostgreSQL 14 migration compatibility	automated
+T-LLR-10.4	tests/system/retention-postgres-restart.sh	competing lease exclusion plus expired-lease recovery after worker and PostgreSQL restart	automated
+T-LLR-10.5	tests/system/requirements-gates.sh	systemd VM hardening and graceful shutdown	external
+T-LLR-10.6	tests/system/requirements-gates.sh	signed consistency-set disaster recovery	external
+T-LLR-10.7	tests/system/run.sh	health metrics and telemetry redaction smoke	automated
+HLT-11	tests/system/requirements-gates.sh	immutable release-candidate gate	external
+T-LLR-11.1	.github/workflows/supply-chain.yml	cargo deny npm audit and license gate	partial
+T-LLR-11.2	.github/workflows/supply-chain.yml	advisory lockfile and SBOM gate	partial
+T-LLR-11.3	.github/workflows/security.yml	bounded parser fuzz suite	automated
+T-LLR-11.4	tests/system/requirements-gates.sh	signed threat-model evidence gate	external
+T-LLR-11.5	tests/system/requirements-gates.sh	independent audit and penetration evidence gate	external
+HLT-12	scripts/validation/roundtrip.sh	disposable per-device encrypted multi-client journey	automated
+T-LLR-12.1	scripts/validation/roundtrip.sh	authenticated task authorization transition	automated
+T-LLR-12.2	scripts/validation/roundtrip.sh	protocol round-trip wrong-key denial and plaintext scan	automated
+T-LLR-12.3	scripts/validation/roundtrip.sh	concurrent authenticated task update race	automated
+T-LLR-12.4	scripts/validation/roundtrip.sh	disposable Docker validation harness	automated
+T-LLR-12.5	scripts/validation/roundtrip.sh	independent-device envelope unwrap and next-epoch revocation denial	automated

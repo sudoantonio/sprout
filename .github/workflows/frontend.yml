@@ -1,0 +1,60 @@
+name: Frontend
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: apps/web
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install Rust and WASM target
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --target wasm32-unknown-unknown
+          rustup default 1.88.0
+      - name: Install pinned wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Build reproducible WASM
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: ../../scripts/verify-wasm-reproducible.sh
+      - name: Test
+        run: npm test -- --exclude src/security/wasm.generated.test.ts
+      - name: Test native/WASM vector parity
+        run: npm run test:wasm:parity
+      - name: Run unit requirement oracles
+        working-directory: .
+        run: bash tests/system/unit-requirements.sh
+      - name: Build
+        working-directory: apps/web
+        run: npm run build
+      - name: Audit high and critical npm vulnerabilities
+        run: npm audit --audit-level=high
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Run browser tests
+        run: npm run test:e2e
+      - name: Run production PWA journey
+        run: npm run test:e2e:pwa

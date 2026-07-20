@@ -1,0 +1,29 @@
+name: Rust
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.88.0
+      - name: Check formatting
+        run: cargo ci-fmt
+      - name: Run Clippy
+        run: cargo ci-clippy
+      - name: Run tests
+        run: cargo ci-test

@@ -1,0 +1,18 @@
+name: sprout-retention-restart
+
+services:
+  postgres:
+    image: postgres:14-bookworm
+    environment:
+      POSTGRES_DB: sprout_retention_restart
+      POSTGRES_USER: sprout_retention_restart
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U sprout_retention_restart -d sprout_retention_restart
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1:55432:5432"

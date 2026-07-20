@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+target
+**/target
+**/node_modules
+**/dist
+backups
+tests
+var
+secrets

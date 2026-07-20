@@ -1,0 +1,29 @@
+# Rust and JavaScript build output
+.DS_Store
+/target/
+**/target/
+**/node_modules/
+**/dist/
+
+# Generated WASM package output (source crates remain tracked)
+/apps/web/src/wasm/
+/apps/web/pkg/
+/apps/web/public/wasm/
+/apps/web/.wasm-target/
+/crates/crypto-wasm/pkg/
+
+# Runtime state and local secret material
+/var/
+**/var/
+/secrets/
+**/secrets/
+.env
+.env.*
+!.env.example
+
+# Test artifacts
+/test-results/
+/playwright-report/
+/.validation-evidence/
+
+# Lockfiles are intentionally not ignored.

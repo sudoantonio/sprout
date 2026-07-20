@@ -1,0 +1,9 @@
+[advisories]
+# Build-time dependency of the pinned libcrux suite. There is no maintained
+# upstream replacement; production remains blocked on independent crypto review.
+ignore = [
+    # Present only through SQLx's locked optional MySQL driver; `cargo tree`
+    # confirms it is absent from every workspace feature build.
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0173",
+]

@@ -1,0 +1,25 @@
+[package]
+name = "sprout-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+sprout-api-contract = { path = "../crates/api-contract" }
+sprout-crypto-protocol = { path = "../crates/crypto-protocol" }
+
+[[bin]]
+name = "protocol_parsers"
+path = "fuzz_targets/protocol_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

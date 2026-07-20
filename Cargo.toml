@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/server",
+    "crates/api-contract",
+    "crates/application",
+    "crates/crypto-protocol",
+    "crates/crypto-wasm",
+    "crates/domain",
+    "crates/storage-postgres",
+    "crates/test-support",
+    "crates/validation-cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

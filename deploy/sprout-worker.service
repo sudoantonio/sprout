@@ -1,0 +1,50 @@
+[Unit]
+Description=Sprout retention and encrypted export worker
+After=network-online.target sprout.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sprout
+Group=sprout
+ExecStart=/opt/sprout/bin/sprout-server worker --kind all --interval-seconds 30 --lease-ttl-seconds 120 --skip-migrations
+EnvironmentFile=-/etc/sprout/sprout.env
+EnvironmentFile=-/etc/sprout/sprout-worker.env
+Environment=SPROUT_MIGRATIONS_DIR=/opt/sprout/migrations
+WorkingDirectory=/var/lib/sprout
+StateDirectory=sprout
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+ReadOnlyPaths=/opt/sprout/migrations
+ReadWritePaths=/var/lib/sprout/blobs /var/lib/sprout/archives
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
