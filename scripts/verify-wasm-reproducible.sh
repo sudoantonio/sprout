@@ -17,7 +17,7 @@ for required_command in diff mktemp npm; do
 done
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-web_root="${repository_root}/apps/web"
+web_root="${repository_root}/frontend/sprout-web"
 output_dir="${web_root}/public/wasm"
 first="$(mktemp "${TMPDIR:-/tmp}/sprout-wasm-first.XXXXXX")"
 second="$(mktemp "${TMPDIR:-/tmp}/sprout-wasm-second.XXXXXX")"

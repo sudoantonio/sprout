@@ -9,7 +9,7 @@ This document describes the implemented routes. It is not yet a generated
 OpenAPI contract. The authoritative route registry remains
 `apps/server/src/routes/mod.rs`, request/response types live in
 `crates/api-contract`, and the browser client is in
-`apps/web/src/api/client.ts`.
+`frontend/sprout-web/src/api/client.ts`.
 
 ## One-command validation
 

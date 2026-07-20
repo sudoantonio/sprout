@@ -119,7 +119,7 @@ jobs:
         with:
           node-version-file: .nvmrc
           cache: npm
-          cache-dependency-path: apps/web/package-lock.json
+          cache-dependency-path: frontend/sprout-web/package-lock.json
       - name: Build disposable validation environment
         run: |
           install -d -m 0700 .validation-evidence
@@ -129,7 +129,7 @@ jobs:
         run: |
           docker compose -f compose.validation.yml run --rm validation
       - name: Run HLT-01 and HLT-05 real-backend browser journeys
-        working-directory: apps/web
+        working-directory: frontend/sprout-web
         env:
           HLT01_EVIDENCE_PATH: ${{ github.workspace }}/.validation-evidence/hlt05.json
           HLT05_EVIDENCE_PATH: ${{ github.workspace }}/.validation-evidence/hlt05.json

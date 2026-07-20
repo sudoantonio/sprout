@@ -72,7 +72,7 @@ while IFS=$'\t' read -r test_id path test_name status; do
     exit 1
   fi
   case "${path}" in
-    apps/server/tests/*|apps/web/tests/*|db/tests/*|tests/system/*|scripts/validation/*|.github/workflows/*) ;;
+    apps/server/tests/*|frontend/sprout-web/tests/*|db/tests/*|tests/system/*|scripts/validation/*|.github/workflows/*) ;;
     *)
       echo "${test_id} maps to non-test product or prose artifact: ${path}" >&2
       exit 1
