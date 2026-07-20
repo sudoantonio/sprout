@@ -137,6 +137,12 @@ This project is in early development. Before opening a pull request:
 2. Ensure new behavior is traceable to a requirement in [docs/requirements.md](docs/requirements.md) when applicable.
 3. Do not commit secrets, `.env` files, or generated WASM artifacts (`frontend/sprout-web/public/wasm/` is built at CI/deploy time).
 
+## Contributors
+
+Sprout was authored and built by [Francesco Antonio De Luca](https://github.com/francescoantoniodeluca).
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the full contributor list.
+
 ## License
 
 Licensed under either the [MIT License](LICENSE-MIT) or [Apache License 2.0](LICENSE-APACHE), at your option.

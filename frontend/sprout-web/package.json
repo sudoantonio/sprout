@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "author": "Francesco Antonio De Luca (https://github.com/francescoantoniodeluca)",
   "engines": {
     "node": ">=22.12.0"
   },
