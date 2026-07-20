@@ -7,3 +7,7 @@ See LICENSE-APACHE and LICENSE-MIT for the full license texts.
 
 Primary author: Francesco Antonio De Luca
 https://github.com/francescoantoniodeluca
+
+AI-assisted development: a substantial share of source code, tests, and
+technical documentation was generated with OpenAI ChatGPT under human
+direction, review, and integration. See CONTRIBUTORS.md.

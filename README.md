@@ -139,7 +139,9 @@ This project is in early development. Before opening a pull request:
 
 ## Contributors
 
-Sprout was authored and built by [Francesco Antonio De Luca](https://github.com/francescoantoniodeluca).
+Sprout was directed and integrated by [Francesco Antonio De Luca](https://github.com/francescoantoniodeluca).
+
+A substantial share of the source code, tests, and technical documentation was generated with **OpenAI ChatGPT**, under human review and integration.
 
 See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the full contributor list.
 
