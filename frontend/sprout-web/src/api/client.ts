@@ -207,6 +207,17 @@ export class ApiClient {
     })
   }
 
+  devLogin(input: {
+    email?: string
+    identity_handle?: string
+  } & DeviceSessionRequest): Promise<SessionResponse> {
+    return this.request('/v1/auth/dev/login', {
+      method: 'POST',
+      authenticated: false,
+      body: input,
+    })
+  }
+
   startPasskeyRegistration(): Promise<WebAuthnChallenge<unknown>> {
     return this.request('/v1/auth/passkeys/register/start', {
       method: 'POST',

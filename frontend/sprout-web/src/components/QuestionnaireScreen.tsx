@@ -410,12 +410,8 @@ export const QuestionnaireScreen = ({
   )
 
   return (
-    <section className="content-screen" aria-labelledby="questionnaires-title">
-      <div className="screen-heading">
-        <div>
-          <p className="eyebrow">Immutable encrypted forms</p>
-          <h2 id="questionnaires-title">Questionnaires</h2>
-        </div>
+    <section className="content-screen">
+      <div className="content-screen-actions">
         <button
           className="secondary-button inline-button"
           type="button"
@@ -481,12 +477,9 @@ export const QuestionnaireScreen = ({
 
       {selectedQuestionnaireId && (
         <div className="questionnaire-version-workspace">
-          <div className="screen-heading">
-            <div>
-              <p className="eyebrow">Version history</p>
-              <h2>{selectedTitle ?? 'Locked questionnaire'}</h2>
-            </div>
-          </div>
+          <h3 className="content-section-title">
+            {selectedTitle ?? 'Locked questionnaire'}
+          </h3>
           <ul className="archive-list version-list">
             {versions.map((version) => (
               <li key={version.wire.id}>

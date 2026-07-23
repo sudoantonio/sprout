@@ -48,6 +48,16 @@ export interface TaskListItem {
   lockedReason?: string
 }
 
+export interface BoardMember {
+  identityId: Uuid
+  label: string
+}
+
+export type BoardFocus =
+  | { type: 'generali' }
+  | { type: 'member'; identityId: Uuid }
+  | { type: 'topic'; topicId: Uuid }
+
 export interface AppState {
   session?: SessionResponse
   localAccess?: {
@@ -66,6 +76,8 @@ export interface AppState {
   taskLists: TaskListItem[]
   tasks: DecryptedTask[]
   lockedTasks: TaskDto[]
+  boardMembers: BoardMember[]
+  boardFocus: BoardFocus
   selectedProjectId?: Uuid
   selectedTopicId?: Uuid
   selectedListId?: Uuid
@@ -114,6 +126,8 @@ export type AppAction =
   | { type: 'select-project'; projectId: Uuid }
   | { type: 'set-topics'; topics: TopicItem[] }
   | { type: 'select-topic'; topicId: Uuid }
+  | { type: 'set-board-focus'; focus: BoardFocus }
+  | { type: 'set-board-members'; members: BoardMember[] }
   | { type: 'set-task-lists'; taskLists: TaskListItem[] }
   | { type: 'select-list'; listId: Uuid }
   | {
@@ -133,6 +147,8 @@ export const createInitialAppState = (): AppState => ({
   taskLists: [],
   tasks: [],
   lockedTasks: [],
+  boardMembers: [],
+  boardFocus: { type: 'generali' },
   taskFilter: 'open',
   loading: false,
   online: typeof navigator === 'undefined' ? true : navigator.onLine,
@@ -218,6 +234,8 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
       return {
         ...state,
         selectedProjectId: action.projectId,
+        boardFocus: { type: 'generali' },
+        boardMembers: [],
         selectedTopicId: undefined,
         selectedListId: undefined,
         selectedTaskId: undefined,
@@ -230,24 +248,46 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
       return {
         ...state,
         topics: action.topics,
-        selectedTopicId: action.topics[0]?.wire.id,
+        selectedTopicId:
+          state.boardFocus.type === 'topic'
+            ? state.boardFocus.topicId
+            : (state.selectedTopicId ?? action.topics[0]?.wire.id),
         loading: false,
       }
     case 'select-topic':
       return {
         ...state,
+        boardFocus: { type: 'topic', topicId: action.topicId },
         selectedTopicId: action.topicId,
         selectedListId: undefined,
         selectedTaskId: undefined,
-        taskLists: [],
-        tasks: [],
-        lockedTasks: [],
       }
+    case 'set-board-focus': {
+      const selectedTopicId =
+        action.focus.type === 'topic'
+          ? action.focus.topicId
+          : state.selectedTopicId
+      return {
+        ...state,
+        boardFocus: action.focus,
+        selectedTopicId,
+        selectedListId: undefined,
+        selectedTaskId: undefined,
+      }
+    }
+    case 'set-board-members':
+      return { ...state, boardMembers: action.members }
     case 'set-task-lists':
       return {
         ...state,
         taskLists: action.taskLists,
-        selectedListId: action.taskLists[0]?.wire.id,
+        selectedListId:
+          state.selectedListId &&
+          action.taskLists.some(
+            (list) => list.wire.id === state.selectedListId,
+          )
+            ? state.selectedListId
+            : action.taskLists[0]?.wire.id,
         loading: false,
       }
     case 'select-list':
@@ -255,8 +295,6 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
         ...state,
         selectedListId: action.listId,
         selectedTaskId: undefined,
-        tasks: [],
-        lockedTasks: [],
       }
     case 'set-tasks':
       return {
@@ -264,7 +302,10 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
         tasks: action.tasks,
         lockedTasks: action.lockedTasks,
         selectedTaskId:
-          state.selectedTaskId ?? action.tasks[0]?.wire.id,
+          state.selectedTaskId &&
+          action.tasks.some((task) => task.wire.id === state.selectedTaskId)
+            ? state.selectedTaskId
+            : action.tasks[0]?.wire.id,
         loading: false,
       }
     case 'select-task':

@@ -1,4 +1,5 @@
 mod assignments;
+mod dev_auth;
 mod device_keys;
 mod domain;
 mod email;
@@ -59,6 +60,7 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             "/v1/auth/email/recovery/finish",
             post(email::recovery_finish),
         )
+        .route("/v1/auth/dev/login", post(dev_auth::login))
         .route(
             "/v1/devices/{device_id}/key-packages",
             get(device_keys::list).post(device_keys::register),

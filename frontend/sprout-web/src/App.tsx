@@ -2,11 +2,13 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type FormEvent,
 } from 'react'
 import './App.css'
 import { ApiClient, ApiError } from './api/client'
+import { authErrorMessage } from './security/auth-errors'
 import type {
   AttachmentCollectionItemDto,
   EncryptedPayloadDto,
@@ -41,7 +43,6 @@ import {
   KeyIcon,
   LockIcon,
   ShieldIcon,
-  SproutIcon,
   WifiOffIcon,
 } from './components/icons'
 import {
@@ -57,6 +58,8 @@ import {
   type QuestionnaireAnswerValue,
 } from './components/QuestionnaireScreen'
 import { TasksScreen } from './components/TasksScreen'
+import { WorkspaceUserMenu } from './components/WorkspaceUserMenu'
+import { useTheme } from './hooks/useTheme'
 import {
   PresetScreen,
   type PresetMaterializationInput,
@@ -115,6 +118,20 @@ import { saveWithDownloadFallback } from './downloads/download'
 import { requestPersistentStorage } from './pwa'
 import { AuthController } from './security/auth-controller'
 import {
+  clearDevSession,
+  loadDevSession,
+} from './security/dev-session'
+import {
+  countBackupHitsForResources,
+  countDevResourceKeyBackup,
+  hasDevResourceKeyBackup,
+  mergeDevResourceKeysIntoSnapshot,
+  persistDevVault,
+  purgeZeroDevResourceKeys,
+  restoreAllDevResourceKeys,
+  restoreDevResourceKeys,
+} from './security/dev-resource-keys'
+import {
   base64ToBytes,
   bytesToBase64,
   combineRecoverySecret,
@@ -137,6 +154,8 @@ import {
 } from './sync/sync-engine'
 import {
   type AppScreen,
+  type BoardFocus,
+  type BoardMember,
   type ProjectItem,
   type TaskListItem,
   type TopicItem,
@@ -164,17 +183,17 @@ interface AppProps {
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : 'An unexpected error occurred'
 
-const navigation: Array<{ id: AppScreen; label: string }> = [
-  { id: 'tasks', label: 'Tasks' },
-  { id: 'people', label: 'People' },
-  { id: 'presets', label: 'Presets' },
-  { id: 'questionnaires', label: 'Questionnaires' },
-  { id: 'attachments', label: 'Attachments' },
-  { id: 'recovery', label: 'Recovery' },
-  { id: 'retention', label: 'Retention' },
-  { id: 'conflicts', label: 'Conflicts' },
-  { id: 'security', label: 'Security' },
-]
+const screenTitles: Record<AppScreen, string> = {
+  tasks: 'Board',
+  people: 'Persone',
+  presets: 'Preset',
+  questionnaires: 'Questionari',
+  attachments: 'Allegati',
+  recovery: 'Recovery',
+  retention: 'Retention',
+  conflicts: 'Conflitti',
+  security: 'Sicurezza',
+}
 
 const asLockedReason = (error: unknown): string =>
   error instanceof Error && error.message.includes('not available')
@@ -200,6 +219,7 @@ const hydrateServerProject = async (
   api: ApiClient,
   services: Services,
   project: ProjectView,
+  identityId?: Uuid,
 ): Promise<ProjectItem> => {
   const payload = decodePayloadContainer(project.encrypted_metadata_b64)
   await putRestRecord(
@@ -207,11 +227,14 @@ const hydrateServerProject = async (
     projectRecord(project, payload),
   )
   try {
+    if (import.meta.env.DEV && identityId) {
+      await restoreDevResourceKeys(identityId, services.auth.vault)
+    }
     const [envelopeResponse, packages] = await Promise.all([
       api.listResourceKeyEnvelopes(project.id),
       api.listProjectDevicePackages(project.id),
     ])
-    await importResourceKeyEnvelopes(services.auth.vault, {
+    const imported = await importResourceKeyEnvelopes(services.auth.vault, {
       projectId: project.id,
       envelopes: envelopeResponse.envelopes,
       packages,
@@ -223,13 +246,23 @@ const hydrateServerProject = async (
     if (rootKey) {
       await services.auth.vault.putResourceKey(
         project.id,
-        rootKey,
+        rootKey.slice(),
         project.key_epoch,
       )
     }
+    if (
+      !rootKey &&
+      imported === 0 &&
+      !services.auth.vault.getResourceKey(project.id, project.key_epoch)
+    ) {
+      throw new Error(
+        'No project keys on this device (no matching key envelopes). Sign in with the original device keys or use Recovery.',
+      )
+    }
+    const document = await decryptProject(project, services.auth.vault)
     return {
       wire: project,
-      document: await decryptProject(project, services.auth.vault),
+      document,
     }
   } catch (error) {
     return { wire: project, lockedReason: errorMessage(error) }
@@ -295,6 +328,7 @@ const putRestRecord = async (
 
 const App = ({ apiClient, initialSession }: AppProps) => {
   const api = useMemo(() => apiClient ?? new ApiClient(), [apiClient])
+  const { appearance, setAppearance } = useTheme()
   const [state, dispatch] = useAppStore()
   const [services, setServices] = useState<Services>()
   const [offlineVaultAvailable, setOfflineVaultAvailable] = useState(false)
@@ -337,6 +371,9 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     RetentionWarningDto[]
   >([])
   const deviceId = useMemo(getOrCreateDeviceId, [])
+  const sessionRef = useRef(state.session)
+  sessionRef.current = state.session
+  const [boardReloadToken, setBoardReloadToken] = useState(0)
 
   const selectedProject = state.projects.find(
     (project) => project.wire.id === state.selectedProjectId,
@@ -407,6 +444,32 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             session: initialSession,
             vaultPersistence: 'locked',
           })
+        } else if (import.meta.env.DEV) {
+          const saved = loadDevSession()
+          if (saved?.vault) {
+            // Synchronous merge+restore — no async gap for StrictMode to
+            // overwrite localStorage with an empty vault mid-restore.
+            api.setSession(saved.session.token)
+            purgeZeroDevResourceKeys()
+            const merged = mergeDevResourceKeysIntoSnapshot(
+              saved.session.identity_id,
+              saved.vault,
+            )
+            auth.vault.restoreDevSnapshot(merged)
+            auth.vault.ensureIdentityId(saved.session.identity_id)
+            persistDevVault(saved.session, auth.vault)
+            dispatch({
+              type: 'session-ready',
+              session: saved.session,
+              vaultPersistence: auth.vault.persistence,
+            })
+          } else if (saved) {
+            // Session without device keys cannot decrypt anything — drop it and
+            // the stale device id so the next login can provision a new vault
+            // instead of showing a Locked board.
+            clearDevSession()
+            localStorage.removeItem('sprout.device-id')
+          }
         }
       })
       .catch((error: unknown) =>
@@ -414,12 +477,59 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       )
     return () => {
       active = false
+      // Persist DEV vault BEFORE tearing down. Do NOT call auth.logout() here:
+      // it clears the shared ApiClient session token, and React StrictMode
+      // remounts would leave the next mount briefly unauthenticated / keyless.
+      // persistDevVault never replaces a richer key set with an emptier one.
+      if (import.meta.env.DEV && initialized?.auth.vault.isUnlocked) {
+        const saved = loadDevSession()
+        if (saved?.session) {
+          persistDevVault(saved.session, initialized.auth.vault)
+        }
+      }
       initialized?.wake.stop()
       initialized?.sync.clearMemory()
-      initialized?.auth.logout()
+      initialized?.auth.vault.clearMemory()
       opened?.close()
     }
   }, [api, deviceId, dispatch, initialSession])
+
+  useEffect(() => {
+    if (!import.meta.env.DEV || !services) return
+    services.auth.vault.setDevMutationListener(() => {
+      const session = sessionRef.current
+      if (!session || !services.auth.vault.isUnlocked) return
+      services.auth.vault.ensureIdentityId(session.identity_id)
+      persistDevVault(session, services.auth.vault)
+    })
+    return () => services.auth.vault.setDevMutationListener(undefined)
+  }, [services])
+
+  useEffect(() => {
+    if (!services || !state.session) return
+    services.auth.vault.ensureIdentityId(state.session.identity_id)
+  }, [services, state.session])
+
+  useEffect(() => {
+    if (!import.meta.env.DEV || !services || !state.session) {
+      return
+    }
+    const onPersist = () => {
+      persistDevVault(state.session!, services.auth.vault)
+    }
+    // beforeunload alone is unreliable (Safari/Chrome often skip localStorage
+    // writes). Also persist on pagehide / tab hide and right after mount.
+    onPersist()
+    window.addEventListener('pagehide', onPersist)
+    window.addEventListener('beforeunload', onPersist)
+    document.addEventListener('visibilitychange', onPersist)
+    return () => {
+      onPersist()
+      window.removeEventListener('pagehide', onPersist)
+      window.removeEventListener('beforeunload', onPersist)
+      document.removeEventListener('visibilitychange', onPersist)
+    }
+  }, [services, state.session])
 
   useEffect(() => {
     const online = () => dispatch({ type: 'set-online', value: true })
@@ -474,12 +584,22 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     void api
       .listProjects()
       .then(async (projects) => {
+        const identityId = state.session?.identity_id
+        if (import.meta.env.DEV && identityId) {
+          await restoreDevResourceKeys(identityId, services.auth.vault)
+        }
         const items = await Promise.all(
           projects.map((project) =>
-            hydrateServerProject(api, services, project),
+            hydrateServerProject(api, services, project, identityId),
           ),
         )
-        if (active) dispatch({ type: 'set-projects', projects: items })
+        if (!active) return
+        // After envelopes are imported, persist DEV vault so a reload can
+        // decrypt without waiting for beforeunload.
+        if (import.meta.env.DEV && state.session) {
+          persistDevVault(state.session, services.auth.vault)
+        }
+        dispatch({ type: 'set-projects', projects: items })
       })
       .catch((error: unknown) => {
         if (active) {
@@ -580,8 +700,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     if (
       !services ||
       state.phase !== 'local-ready' ||
-      !state.selectedProjectId ||
-      !state.selectedTopicId
+      !state.selectedProjectId
     ) {
       return
     }
@@ -590,75 +709,32 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       .listRecords(state.selectedProjectId)
       .then(async (records) => {
         const taskLists: TaskListItem[] = []
+        const tasks: DecryptedTask[] = []
+        const lockedTasks: TaskDto[] = []
         for (const record of records) {
-          if (
-            record.kind !== 'task-list' ||
-            record.parentId !== state.selectedTopicId ||
-            !record.wire
-          ) {
+          if (record.kind === 'task-list' && record.wire) {
+            const wire = record.wire as TaskListDto
+            try {
+              taskLists.push({
+                wire,
+                document: await decryptTaskList(wire, services.auth.vault),
+              })
+            } catch (error) {
+              taskLists.push({ wire, lockedReason: asLockedReason(error) })
+            }
             continue
           }
-          const wire = record.wire as TaskListDto
-          try {
-            taskLists.push({
-              wire,
-              document: await decryptTaskList(wire, services.auth.vault),
-            })
-          } catch (error) {
-            taskLists.push({ wire, lockedReason: asLockedReason(error) })
+          if (record.kind === 'task' && record.wire) {
+            const wire = record.wire as TaskDto
+            try {
+              tasks.push(await decryptTask(wire, services.auth.vault))
+            } catch {
+              lockedTasks.push(wire)
+            }
           }
         }
         if (active) {
           dispatch({ type: 'set-task-lists', taskLists })
-        }
-      })
-      .catch((error: unknown) => {
-        if (active) {
-          dispatch({ type: 'set-error', message: errorMessage(error) })
-        }
-      })
-    return () => {
-      active = false
-    }
-  }, [
-    dispatch,
-    services,
-    state.phase,
-    state.selectedProjectId,
-    state.selectedTopicId,
-  ])
-
-  useEffect(() => {
-    if (
-      !services ||
-      state.phase !== 'local-ready' ||
-      !state.selectedProjectId ||
-      !state.selectedListId
-    ) {
-      return
-    }
-    let active = true
-    void services.database
-      .listRecords(state.selectedProjectId)
-      .then(async (records) => {
-        const tasks: DecryptedTask[] = []
-        const lockedTasks: TaskDto[] = []
-        for (const record of records) {
-          if (
-            record.kind !== 'task' ||
-            record.parentId !== state.selectedListId ||
-            !record.wire
-          ) {
-            continue
-          }
-          const wire = record.wire as TaskDto
-          try {
-            tasks.push(await decryptTask(wire, services.auth.vault))
-          } catch {
-            lockedTasks.push(wire)
-          }
-        }
-        if (active) {
           dispatch({ type: 'set-tasks', tasks, lockedTasks })
         }
       })
@@ -670,13 +746,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     return () => {
       active = false
     }
-  }, [
-    dispatch,
-    services,
-    state.phase,
-    state.selectedListId,
-    state.selectedProjectId,
-  ])
+  }, [dispatch, services, state.phase, state.selectedProjectId])
 
   useEffect(() => {
     if (!services || !state.selectedProjectId || !state.session) return
@@ -710,6 +780,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     }
   }, [
     api,
+    boardReloadToken,
     dispatch,
     services,
     state.selectedProjectId,
@@ -717,35 +788,34 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   ])
 
   useEffect(() => {
-    if (
-      !services ||
-      !state.selectedProjectId ||
-      !state.selectedTopicId ||
-      !state.session
-    ) {
+    if (!services || !state.selectedProjectId || !state.session) {
+      return
+    }
+    if (state.topics.length === 0) {
+      dispatch({ type: 'set-task-lists', taskLists: [] })
       return
     }
     let active = true
+    const projectId = state.selectedProjectId
     dispatch({ type: 'set-loading', value: true })
-    void api
-      .listTaskLists(state.selectedProjectId, state.selectedTopicId)
-      .then(async ({ task_lists: taskLists }) => {
-        const items = await Promise.all(
-          taskLists.map(async (list): Promise<TaskListItem> => {
+    void Promise.all(
+      state.topics.map((topic) => api.listTaskLists(projectId, topic.wire.id)),
+    )
+      .then(async (responses) => {
+        const items: TaskListItem[] = []
+        for (const { task_lists: lists } of responses) {
+          for (const list of lists) {
             await putRestRecord(services.database, listRecord(list))
             try {
-              return {
+              items.push({
                 wire: list,
-                document: await decryptTaskList(
-                  list,
-                  services.auth.vault,
-                ),
-              }
+                document: await decryptTaskList(list, services.auth.vault),
+              })
             } catch (error) {
-              return { wire: list, lockedReason: asLockedReason(error) }
+              items.push({ wire: list, lockedReason: asLockedReason(error) })
             }
-          }),
-        )
+          }
+        }
         if (active) dispatch({ type: 'set-task-lists', taskLists: items })
       })
       .catch((error: unknown) => {
@@ -761,32 +831,35 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     dispatch,
     services,
     state.selectedProjectId,
-    state.selectedTopicId,
     state.session,
+    state.topics,
   ])
 
   useEffect(() => {
-    if (
-      !services ||
-      !state.selectedProjectId ||
-      !state.selectedListId ||
-      !state.session
-    ) {
+    if (!services || !state.selectedProjectId || !state.session) {
+      return
+    }
+    if (state.taskLists.length === 0) {
+      dispatch({ type: 'set-tasks', tasks: [], lockedTasks: [] })
       return
     }
     let active = true
+    const projectId = state.selectedProjectId
     dispatch({ type: 'set-loading', value: true })
-    void api
-      .listTasks(state.selectedProjectId, state.selectedListId)
-      .then(async ({ tasks }) => {
+    void Promise.all(
+      state.taskLists.map((list) => api.listTasks(projectId, list.wire.id)),
+    )
+      .then(async (responses) => {
         const decrypted: DecryptedTask[] = []
         const locked: TaskDto[] = []
-        for (const task of tasks) {
-          await putRestRecord(services.database, taskRecord(task))
-          try {
-            decrypted.push(await decryptTask(task, services.auth.vault))
-          } catch {
-            locked.push(task)
+        for (const { tasks } of responses) {
+          for (const task of tasks) {
+            await putRestRecord(services.database, taskRecord(task))
+            try {
+              decrypted.push(await decryptTask(task, services.auth.vault))
+            } catch {
+              locked.push(task)
+            }
           }
         }
         if (active) {
@@ -810,7 +883,70 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     dispatch,
     services,
     state.selectedProjectId,
-    state.selectedListId,
+    state.session,
+    state.taskLists,
+  ])
+
+  useEffect(() => {
+    if (!services || !state.selectedProjectId || !state.session) {
+      return
+    }
+    let active = true
+    const projectId = state.selectedProjectId
+    const project = state.projects.find(
+      (candidate) => candidate.wire.id === projectId,
+    )
+    void (async () => {
+      try {
+        const [packages, invites] = await Promise.all([
+          api.listProjectDevicePackages(projectId),
+          api.listProjectInvitations(projectId),
+        ])
+        const identityIds = new Set<Uuid>()
+        if (project) identityIds.add(project.wire.owner_identity_id)
+        for (const devicePackage of packages) {
+          identityIds.add(devicePackage.identity_id)
+        }
+        for (const invitation of invites) {
+          if (invitation.accepted_by_identity_id) {
+            identityIds.add(invitation.accepted_by_identity_id)
+          }
+        }
+        const handleById = new Map<Uuid, string>()
+        try {
+          const suggestions = await api.suggestProjectParticipants(
+            projectId,
+            '',
+          )
+          for (const suggestion of suggestions) {
+            handleById.set(suggestion.identity_id, suggestion.identity_handle)
+          }
+        } catch {
+          // Handles are best-effort; fall back to truncated identity IDs.
+        }
+        const members: BoardMember[] = [...identityIds].map((identityId) => ({
+          identityId,
+          label:
+            handleById.get(identityId) ?? `User ${identityId.slice(0, 8)}`,
+        }))
+        if (active) {
+          dispatch({ type: 'set-board-members', members })
+        }
+      } catch (error: unknown) {
+        if (active) {
+          dispatch({ type: 'set-error', message: errorMessage(error) })
+        }
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [
+    api,
+    dispatch,
+    services,
+    state.projects,
+    state.selectedProjectId,
     state.session,
   ])
 
@@ -918,12 +1054,31 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       session: SessionResponse
       requiresAuthorizedDevice: boolean
     }>,
+    phase: 'signin' | 'verify' | 'recover' = 'signin',
+    successNotice?: string,
   ) => {
     dispatch({ type: 'auth-started' })
     try {
       const outcome = await operation()
       const current = requireServices()
-      if (outcome.requiresAuthorizedDevice) {
+      // Prefer the live vault: older clients reported requiresAuthorizedDevice
+      // even after a successful device provision, which skipped DEV key save
+      // and left every resource Locked after reload.
+      const vaultReady = current.auth.vault.isUnlocked
+      if (outcome.requiresAuthorizedDevice && !vaultReady) {
+        // Last chance in DEV: a previous snapshot may still hold this device's keys.
+        if (import.meta.env.DEV) {
+          const saved = loadDevSession()
+          if (
+            saved?.vault &&
+            saved.vault.deviceId === outcome.session.device_id
+          ) {
+            current.auth.vault.restoreDevSnapshot(saved.vault)
+            current.auth.vault.ensureIdentityId(outcome.session.identity_id)
+          }
+        }
+      }
+      if (outcome.requiresAuthorizedDevice && !current.auth.vault.isUnlocked) {
         dispatch({
           type: 'vault-locked',
           session: outcome.session,
@@ -936,11 +1091,152 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           session: outcome.session,
           vaultPersistence: current.auth.vault.persistence,
         })
+        if (import.meta.env.DEV) {
+          await restoreDevResourceKeys(
+            outcome.session.identity_id,
+            current.auth.vault,
+          )
+          persistDevVault(outcome.session, current.auth.vault)
+        }
+        if (successNotice) {
+          dispatch({ type: 'set-notice', message: successNotice })
+        } else if (outcome.requiresAuthorizedDevice && vaultReady) {
+          dispatch({
+            type: 'set-notice',
+            message:
+              'Sessione ripristinata con le chiavi locali di questo device.',
+          })
+        }
       }
     } catch (error) {
-      dispatch({ type: 'set-error', message: errorMessage(error) })
+      dispatch({ type: 'set-error', message: authErrorMessage(error, phase) })
     }
   }
+
+  const resetLocalDeviceKeys = () => {
+    // Keep sprout-dev-resource-keys: raw resource keys are enough to decrypt
+    // even after minting a new device package.
+    clearDevSession()
+    localStorage.removeItem('sprout.device-id')
+    if (services) {
+      services.wake.stop()
+      services.sync.clearMemory()
+      services.auth.logout()
+    }
+    setPresetResult(undefined)
+    setQuestionnaires([])
+    setQuestionnaireVersions([])
+    setSelectedQuestionnaireId(undefined)
+    setTaskQuestionnaireVersion(undefined)
+    setQuestionnaireSubmission(undefined)
+    setAttachments([])
+    dispatch({ type: 'logout' })
+    dispatch({
+      type: 'set-notice',
+      message:
+        'Device locale resettato. Usa Dev login: se esiste un backup chiavi per questo account, i progetti torneranno leggibili.',
+    })
+  }
+
+  const retryDevKeyRestore = async () => {
+    if (!services || !state.session) return
+    const identityId = state.session.identity_id
+    services.auth.vault.ensureIdentityId(identityId)
+    const purged = purgeZeroDevResourceKeys()
+    const restored = await restoreAllDevResourceKeys(services.auth.vault)
+    persistDevVault(state.session, services.auth.vault)
+    const projects = await api.listProjects()
+    const hydrated = await Promise.all(
+      projects.map((project) =>
+        hydrateServerProject(api, services, project, identityId),
+      ),
+    )
+    dispatch({ type: 'set-projects', projects: hydrated })
+
+    // Decrypt topics immediately with the restored keys (don't wait on effects).
+    if (state.selectedProjectId) {
+      const { topics } = await api.listTopics(state.selectedProjectId)
+      const topicItems: TopicItem[] = []
+      for (const topic of topics) {
+        await putRestRecord(services.database, topicRecord(topic))
+        try {
+          topicItems.push({
+            wire: topic,
+            document: await decryptTopic(topic, services.auth.vault),
+          })
+        } catch (error) {
+          topicItems.push({ wire: topic, lockedReason: asLockedReason(error) })
+        }
+      }
+      dispatch({ type: 'set-topics', topics: topicItems })
+      const coverage = countBackupHitsForResources(
+        topicItems.map((topic) => ({
+          resourceId: topic.wire.resource_node_id,
+          epoch: topic.wire.key_epoch,
+          needsBody: topic.wire.payload != null,
+        })),
+      )
+      const stillLocked = topicItems.filter((topic) => !topic.document).length
+      const firstReason = topicItems.find((topic) => topic.lockedReason)
+        ?.lockedReason
+      dispatch({
+        type: 'set-notice',
+        message:
+          `Purged=${purged}, restored=${restored}, exact-hits=${coverage.hits}/${topicItems.length} (epochMiss=${coverage.epochMiss}, purposeMiss=${coverage.purposeMiss}), locked=${stillLocked}.` +
+          (firstReason ? ` Errore: ${firstReason}` : '') +
+          (stillLocked === 0
+            ? ' Board sbloccata (incluso recovery ciphertext a chiave-zero).'
+            : ' Se resta locked: ricrea le risorse dopo questo fix.'),
+      })
+    } else {
+      dispatch({
+        type: 'set-notice',
+        message: hasDevResourceKeyBackup(identityId)
+          ? `Purged=${purged}, ripristinate ${restored} chiavi vive. Nessun progetto selezionato.`
+          : `Purged=${purged}. Nessun backup chiavi vive in questo browser.`,
+      })
+    }
+    setBoardReloadToken((token) => token + 1)
+  }
+
+  const lockedBoardReason = useMemo(() => {
+    if (!state.session || state.phase === 'locked') return undefined
+    const lockedTopics = state.topics.filter((topic) => !topic.document)
+    const lockedLists = state.taskLists.filter((list) => !list.document)
+    if (
+      state.topics.length === 0 &&
+      state.taskLists.length === 0 &&
+      state.projects.every((project) => project.document)
+    ) {
+      return undefined
+    }
+    if (
+      state.topics.length > 0 &&
+      lockedTopics.length === state.topics.length
+    ) {
+      return (
+        lockedTopics[0]?.lockedReason ??
+        state.projects.find((project) => project.lockedReason)?.lockedReason ??
+        'Resource keys missing on this device'
+      )
+    }
+    if (
+      state.taskLists.length > 0 &&
+      lockedLists.length === state.taskLists.length
+    ) {
+      return (
+        lockedLists[0]?.lockedReason ??
+        'Resource keys missing on this device'
+      )
+    }
+    return undefined
+  }, [
+    state.phase,
+    state.projects,
+    state.session,
+    state.taskLists,
+    state.topics,
+  ])
 
   const unlockLocalVault = async () => {
     dispatch({ type: 'auth-started' })
@@ -962,18 +1258,65 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   }) => {
     dispatch({ type: 'auth-started' })
     try {
-      await requireServices().auth.startSignup({ ...input, deviceId })
+      const response = await requireServices().auth.startSignup({ ...input, deviceId })
+      if (
+        import.meta.env.DEV &&
+        response.identity_id &&
+        !response.dev_verification_token
+      ) {
+        dispatch({ type: 'set-error' })
+        await runAuth(
+          () =>
+            requireServices().auth.devLogin({
+              email: input.email,
+              identityHandle: input.identityHandle,
+              deviceId,
+            }),
+          'signup',
+        )
+        return response
+      }
       dispatch({ type: 'set-error' })
       dispatch({
         type: 'set-notice',
-        message:
-          'Verification requested. Enter the identity ID and token from the email.',
+        message: response.dev_verification_token
+          ? 'Verifica pronta: identity ID e token sono stati compilati automaticamente.'
+          : 'Verifica richiesta. Inserisci identity ID e token dall’outbox di sviluppo.',
       })
+      return response
     } catch (error) {
-      dispatch({ type: 'set-error', message: errorMessage(error) })
+      if (
+        import.meta.env.DEV &&
+        error instanceof ApiError &&
+        error.status === 409
+      ) {
+        dispatch({ type: 'set-error' })
+        await runAuth(
+          () =>
+            requireServices().auth.devLogin({
+              email: input.email,
+              identityHandle: input.identityHandle,
+              deviceId,
+            }),
+          'signup',
+        )
+        return { accepted: true, identity_id: undefined }
+      }
+      dispatch({ type: 'set-error', message: authErrorMessage(error, 'signup') })
       throw error
     }
   }
+
+  const devLogin = (input: { email: string; identityHandle: string }) =>
+    runAuth(
+      () =>
+        requireServices().auth.devLogin({
+          email: input.email,
+          identityHandle: input.identityHandle,
+          deviceId,
+        }),
+      'signin',
+    )
 
   const startRecovery = async (email: string) => {
     dispatch({ type: 'auth-started' })
@@ -983,7 +1326,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       dispatch({
         type: 'set-notice',
         message:
-          'If the account exists, a recovery message has been queued.',
+          'Se l’account esiste, un messaggio di recupero è in coda.',
       })
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
@@ -1038,6 +1381,9 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         project.root_resource_id,
         projectKey,
       )
+      if (import.meta.env.DEV) {
+        persistDevVault(state.session, current.auth.vault)
+      }
       await putRestRecord(current.database, projectRecord(project, payload))
       dispatch({
         type: 'set-projects',
@@ -1156,11 +1502,18 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     )
     const current = requireServices()
     const projects = await api.listProjects()
+    const identityId = state.session?.identity_id
+    if (import.meta.env.DEV && identityId) {
+      await restoreDevResourceKeys(identityId, current.auth.vault)
+    }
     const hydrated = await Promise.all(
       projects.map((project) =>
-        hydrateServerProject(api, current, project),
+        hydrateServerProject(api, current, project, identityId),
       ),
     )
+    if (import.meta.env.DEV && identityId && state.session) {
+      persistDevVault(state.session, current.auth.vault)
+    }
     dispatch({ type: 'set-projects', projects: hydrated })
     dispatch({
       type: 'set-notice',
@@ -1450,12 +1803,8 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     }
   }
 
-  const createTaskList = async (name: string) => {
-    if (
-      !state.session ||
-      !state.selectedProjectId ||
-      !state.selectedTopicId
-    ) {
+  const createTaskList = async (name: string, topicId: Uuid) => {
+    if (!state.session || !state.selectedProjectId || !topicId) {
       dispatch({
         type: 'set-error',
         message: 'Server sign-in is required to create a task list.',
@@ -1497,10 +1846,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       })
       const { task_list: list } = await api.createTaskList(
         state.selectedProjectId,
-        state.selectedTopicId,
+        topicId,
         {
           id,
-          topic_id: state.selectedTopicId,
+          topic_id: topicId,
           resource_node_id: resourceId,
           payload,
           header,
@@ -1514,17 +1863,19 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         taskLists: [...state.taskLists, { wire: list, document }],
       })
       dispatch({ type: 'select-list', listId: list.id })
+      if (state.boardFocus.type !== 'topic') {
+        dispatch({
+          type: 'set-board-focus',
+          focus: { type: 'topic', topicId },
+        })
+      }
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
     }
   }
 
-  const createTask = async (input: TaskCreationInput) => {
-    if (
-      !state.session ||
-      !state.selectedProjectId ||
-      !state.selectedListId
-    ) {
+  const createTask = async (input: TaskCreationInput, listId: Uuid) => {
+    if (!state.session || !state.selectedProjectId || !listId) {
       dispatch({
         type: 'set-error',
         message: 'Server sign-in is required to create a task.',
@@ -1533,6 +1884,14 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     }
     try {
       const current = requireServices()
+      const list = state.taskLists.find(
+        (candidate) => candidate.wire.id === listId,
+      )
+      if (!list) throw new Error('Selected task list is unavailable')
+      const topic = state.topics.find(
+        (candidate) => candidate.wire.id === list.wire.topic_id,
+      )
+      if (!topic) throw new Error('Task list topic is unavailable')
       const creation = buildTaskCreation(input)
       const id = crypto.randomUUID()
       const resourceId = crypto.randomUUID()
@@ -1599,7 +1958,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         )
         await api.createRecurrence(state.selectedProjectId, {
           id: recurrenceSeriesId,
-          list_id: state.selectedListId,
+          list_id: listId,
           encrypted_rule: encryptedRule,
           idempotency_key: crypto.randomUUID(),
         })
@@ -1608,7 +1967,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         state.selectedProjectId,
         {
         id,
-        list_id: state.selectedListId,
+        list_id: listId,
         resource_node_id: resourceId,
         task_kind: creation.taskKind,
         payload,
@@ -1624,15 +1983,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       const project = state.projects.find(
         (candidate) => candidate.wire.id === state.selectedProjectId,
       )
-      const topic = state.topics.find(
-        (candidate) => candidate.wire.id === state.selectedTopicId,
-      )
-      const list = state.taskLists.find(
-        (candidate) => candidate.wire.id === state.selectedListId,
-      )
-      if (!project || !topic || !list) {
+      if (!project) {
         throw new Error('Task hierarchy is unavailable for assignment')
       }
+      dispatch({ type: 'select-list', listId })
       const assignmentId = crypto.randomUUID()
       const assignmentEnvelopes = (
         await Promise.all(
@@ -3865,6 +4219,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       services.sync.clearMemory()
       services.auth.logout()
     }
+    clearDevSession()
     setPresetResult(undefined)
     setQuestionnaires([])
     setQuestionnaireVersions([])
@@ -3874,6 +4229,47 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     setAttachments([])
     dispatch({ type: 'logout' })
   }
+
+  const userLabel = useMemo(() => {
+    if (!state.session) return 'Utente'
+    const member = state.boardMembers.find(
+      (item) => item.identityId === state.session?.identity_id,
+    )
+    return member?.label ?? `User ${state.session.identity_id.slice(0, 8)}`
+  }, [state.boardMembers, state.session])
+
+  const userMenuProps = useMemo(
+    () => ({
+      userLabel,
+      projects: state.projects,
+      selectedProjectId: state.selectedProjectId,
+      currentScreen: state.screen,
+      conflictCount: state.conflicts.length,
+      projectName,
+      onProjectNameChange: setProjectName,
+      onSelectProject: (projectId: string) =>
+        dispatch({ type: 'select-project', projectId }),
+      onCreateProject: (event: FormEvent) => void createProject(event),
+      onNavigate: (screen: AppScreen) =>
+        dispatch({ type: 'set-screen', screen }),
+      onLogout: logout,
+      appearance,
+      onAppearanceChange: setAppearance,
+    }),
+    [
+      userLabel,
+      state.projects,
+      state.selectedProjectId,
+      state.screen,
+      state.conflicts.length,
+      projectName,
+      dispatch,
+      logout,
+      createProject,
+      appearance,
+      setAppearance,
+    ],
+  )
 
   if (!state.session) {
     return (
@@ -3886,131 +4282,45 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         offlineVaultAvailable={offlineVaultAvailable}
         onOfflineUnlock={unlockLocalVault}
         onSignIn={(input) =>
-          runAuth(() =>
-            requireServices().auth.authenticatePasskey({
-              ...input,
-              deviceId,
-            }),
+          runAuth(
+            () =>
+              requireServices().auth.authenticatePasskey({
+                ...input,
+                deviceId,
+              }),
+            'signin',
           )
         }
         onSignup={startSignup}
         onVerify={(input) =>
-          runAuth(() =>
-            requireServices().auth.finishSignup({
-              ...input,
-              deviceId,
-            }),
+          runAuth(
+            () =>
+              requireServices().auth.finishSignup({
+                ...input,
+                deviceId,
+              }),
+            'verify',
+            'Account attivato. Vai in Security e registra una passkey prima di uscire, così potrai rientrare con Accedi.',
           )
         }
         onRecoveryStart={startRecovery}
         onRecoveryFinish={(input) =>
-          runAuth(() =>
-            requireServices().auth.finishRecovery({
-              ...input,
-              deviceId,
-            }),
+          runAuth(
+            () =>
+              requireServices().auth.finishRecovery({
+                ...input,
+                deviceId,
+              }),
+            'recover',
           )
         }
+        onDevLogin={import.meta.env.DEV ? devLogin : undefined}
       />
     )
   }
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <a className="brand" href="/" aria-label="Sprout home">
-          <span className="brand-mark">
-            <SproutIcon />
-          </span>
-          <span>Sprout</span>
-        </a>
-        <div className="topbar-status" aria-live="polite">
-          {!state.online ? (
-            <span className="status-chip warning-chip">
-              <WifiOffIcon />
-              Offline
-            </span>
-          ) : (
-            <span className="status-chip">Online</span>
-          )}
-          <span className="status-chip">
-            {state.queueCount} encrypted queued
-          </span>
-          <span className="status-chip">Wake: {state.wakeStatus}</span>
-        </div>
-        <button type="button" className="text-button" onClick={logout}>
-          Clear memory and sign out
-        </button>
-      </header>
-
-      <aside className="sidebar">
-        <div className="project-picker">
-          <label htmlFor="project-select">Project</label>
-          <select
-            id="project-select"
-            value={state.selectedProjectId ?? ''}
-            onChange={(event) =>
-              dispatch({
-                type: 'select-project',
-                projectId: event.target.value,
-              })
-            }
-          >
-            <option value="" disabled>
-              Select project
-            </option>
-            {state.projects.map((project) => (
-              <option key={project.wire.id} value={project.wire.id}>
-                {project.document?.name ?? `Locked ${project.wire.id.slice(0, 8)}`}
-              </option>
-            ))}
-          </select>
-        </div>
-        <details className="create-panel project-create">
-          <summary>New encrypted project</summary>
-          <form onSubmit={(event) => void createProject(event)}>
-            <label>
-              Private name
-              <input
-                required
-                value={projectName}
-                onChange={(event) => setProjectName(event.target.value)}
-              />
-            </label>
-            <button type="submit" className="secondary-button">
-              Create
-            </button>
-          </form>
-        </details>
-        <nav aria-label="Workspace">
-          <ul>
-            {navigation.map((item) => (
-              <li key={item.id}>
-                <button
-                  type="button"
-                  className={state.screen === item.id ? 'active' : ''}
-                  onClick={() =>
-                    dispatch({ type: 'set-screen', screen: item.id })
-                  }
-                >
-                  {item.label}
-                  {item.id === 'conflicts' && state.conflicts.length > 0 && (
-                    <span className="count-badge">{state.conflicts.length}</span>
-                  )}
-                </button>
-              </li>
-            ))}
-          </ul>
-        </nav>
-        <div className="encryption-note">
-          <LockIcon />
-          <div>
-            <strong>End-to-end encrypted</strong>
-            <p>Decrypted content is held in memory only.</p>
-          </div>
-        </div>
-      </aside>
-
       <main className="main-content">
         {state.phase === 'locked' && (
           <div className="app-banner warning-banner" role="alert">
@@ -4021,6 +4331,64 @@ const App = ({ apiClient, initialSession }: AppProps) => {
                 The passkey authenticated this session but did not reveal
                 encryption keys. Use another authorized device or Recovery.
               </p>
+              {import.meta.env.DEV && (
+                <p>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={resetLocalDeviceKeys}
+                  >
+                    DEV: reset local device keys
+                  </button>
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+        {lockedBoardReason && (
+          <div className="app-banner warning-banner" role="alert">
+            <KeyIcon />
+            <div>
+              <strong>Board locked: missing decryption keys</strong>
+              <p>{lockedBoardReason}</p>
+              <p>
+                Sei loggato, ma questo browser non ha le resource key per
+                decifrare topic/list/task. Il messaggio verde sopra è solo la
+                coda recovery email, non sblocca i dati.
+              </p>
+              {import.meta.env.DEV && state.session && (
+                <>
+                  <p style={{ fontSize: '0.8rem', opacity: 0.85 }}>
+                    DEV diag: vault{' '}
+                    {services?.auth.vault.isUnlocked ? 'unlocked' : 'locked'},
+                    backup keys=
+                    {countDevResourceKeyBackup(state.session.identity_id)},
+                    identity=
+                    {services?.auth.vault.localIdentityId?.slice(0, 8) ??
+                      'none'}
+                    …, device session={state.session.device_id.slice(0, 8)}…
+                    {services?.auth.vault.localDeviceId
+                      ? `, vault=${services.auth.vault.localDeviceId.slice(0, 8)}…`
+                      : ', vault=none'}
+                  </p>
+                  <p style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => void retryDevKeyRestore()}
+                    >
+                      DEV: retry key restore
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={resetLocalDeviceKeys}
+                    >
+                      DEV: reset device + re-login
+                    </button>
+                  </p>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -4058,14 +4426,18 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             taskLists={state.taskLists}
             tasks={state.tasks}
             lockedTasks={state.lockedTasks}
+            boardMembers={state.boardMembers}
+            boardFocus={state.boardFocus}
             selectedTopicId={state.selectedTopicId}
             selectedListId={state.selectedListId}
             selectedTaskId={state.selectedTaskId}
+            currentUserLabel={userLabel}
             publishedQuestionnaireVersions={publishedQuestionnaireVersions}
             filter={state.taskFilter}
             loading={state.loading}
-            onSelectTopic={(topicId) =>
-              dispatch({ type: 'select-topic', topicId })
+            userMenu={userMenuProps}
+            onSelectFocus={(focus: BoardFocus) =>
+              dispatch({ type: 'set-board-focus', focus })
             }
             onSelectList={(listId) =>
               dispatch({ type: 'select-list', listId })
@@ -4084,129 +4456,141 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             onCopyTask={copyTask}
           />
         )}
-        {state.screen === 'people' && (
-          <ProjectPeopleScreen
-            invitations={invitations}
-            suggestions={participantSuggestions}
-            onRefresh={refreshProjectPeople}
-            onInvite={inviteProjectParticipant}
-            onAccept={acceptProjectInvitation}
-            onShare={shareProjectWithParticipant}
-            managedGrants={managedResourceGrants}
-            onRevoke={revokeProjectResourceGrant}
-            onSuggest={suggestProjectParticipants}
-          />
-        )}
-        {state.screen === 'presets' && (
-          <PresetScreen
-            destinationReady={Boolean(
-              state.session &&
-                state.selectedProjectId &&
-                state.selectedListId,
-            )}
-            result={presetResult}
-            onMaterialize={materializePresetJourney}
-          />
-        )}
-        {state.screen === 'questionnaires' && (
-          <QuestionnaireScreen
-            questionnaires={questionnaires}
-            versions={selectedQuestionnaireVersions}
-            selectedQuestionnaireId={selectedQuestionnaireId}
-            assigneeTasks={questionnaireAssigneeTasks}
-            taskVersion={taskQuestionnaireVersion}
-            submission={questionnaireSubmission}
-            submissionAnswers={questionnaireSubmissionAnswers}
-            onRefresh={refreshQuestionnaires}
-            onCreate={createQuestionnaire}
-            onSelect={async (questionnaireId) =>
-              setSelectedQuestionnaireId(questionnaireId)
-            }
-            onSaveVersion={saveQuestionnaireVersion}
-            onPublish={publishQuestionnaireVersion}
-            onLoadTask={loadTaskQuestionnaire}
-            onSubmitTask={submitTaskQuestionnaire}
-          />
-        )}
-        {state.screen === 'attachments' && (
-          <AttachmentScreen
-            assigneeTasks={activeAssigneeTasks}
-            attachments={attachments}
-            onRefresh={refreshTaskAttachments}
-            onUpload={uploadCompletedAttachment}
-            onResume={resumeAttachmentUpload}
-            onDownload={downloadAttachment}
-          />
-        )}
-        {state.screen === 'retention' && (
-          <RetentionScreen
-            autoExport={autoExport}
-            archives={archives}
-            warnings={retentionWarnings}
-            onRefresh={refreshRetention}
-            onToggle={async (value) => {
-              const response = await api.updateRetentionPreference(value)
-              setAutoExport(response.preference.auto_export_enabled)
-            }}
-            onDownload={downloadArchive}
-          />
-        )}
-        {state.screen === 'recovery' && (
-          <RecoveryScreen
-            projectId={state.selectedProjectId}
-            status={state.recoveryStatus}
-            onProvision={provisionSelectedProjectRecovery}
-            onStart={startProjectRecovery}
-            onLoad={async (requestId) => {
-              if (!state.selectedProjectId) return
-              dispatch({
-                type: 'set-recovery',
-                status: await api.getProjectRecovery(
-                  state.selectedProjectId,
-                  requestId,
-                ),
-              })
-            }}
-            onApprove={approveRecovery}
-            onCombine={combineShares}
-          />
-        )}
-        {state.screen === 'security' && (
-          <SecurityScreen
-            vaultPersistence={state.vaultPersistence}
-            storagePersistence={state.storagePersistence}
-            onRegisterPasskey={async () => {
-              const current = requireServices()
-              const result = await current.auth.registerPasskey(
-                state.session?.device_id as Uuid,
-              )
-              dispatch({
-                type: 'set-vault-persistence',
-                value: current.auth.vault.persistence,
-              })
-              dispatch({
-                type: 'set-notice',
-                message: result.prfSupported
-                  ? 'Passkey registered and the local vault was wrapped with PRF-derived input.'
-                  : 'Passkey registered. PRF output was unavailable, so keys remain session-only.',
-              })
-            }}
-            onPersistStorage={async () =>
-              dispatch({
-                type: 'set-storage-persistence',
-                value: (await requestPersistentStorage())
-                  ? 'granted'
-                  : 'not-granted',
-              })
-            }
-          />
-        )}
-        {state.screen === 'conflicts' && (
-          <ConflictScreen
-            conflicts={state.conflicts}
-            onDiscard={discardConflict}
-            onRetry={retryConflict}
-          />
+        {state.screen !== 'tasks' && (
+          <div className="settings-layout">
+            <aside className="settings-sidebar" aria-label="Workspace">
+              <WorkspaceUserMenu {...userMenuProps} variant="overview" />
+            </aside>
+            <div className="settings-main">
+              <header className="settings-toolbar">
+                <h1>{screenTitles[state.screen]}</h1>
+              </header>
+              {state.screen === 'people' && (
+                <ProjectPeopleScreen
+                  invitations={invitations}
+                  suggestions={participantSuggestions}
+                  onRefresh={refreshProjectPeople}
+                  onInvite={inviteProjectParticipant}
+                  onAccept={acceptProjectInvitation}
+                  onShare={shareProjectWithParticipant}
+                  managedGrants={managedResourceGrants}
+                  onRevoke={revokeProjectResourceGrant}
+                  onSuggest={suggestProjectParticipants}
+                />
+              )}
+              {state.screen === 'presets' && (
+                <PresetScreen
+                  destinationReady={Boolean(
+                    state.session &&
+                      state.selectedProjectId &&
+                      state.selectedListId,
+                  )}
+                  result={presetResult}
+                  onMaterialize={materializePresetJourney}
+                />
+              )}
+              {state.screen === 'questionnaires' && (
+                <QuestionnaireScreen
+                  questionnaires={questionnaires}
+                  versions={selectedQuestionnaireVersions}
+                  selectedQuestionnaireId={selectedQuestionnaireId}
+                  assigneeTasks={questionnaireAssigneeTasks}
+                  taskVersion={taskQuestionnaireVersion}
+                  submission={questionnaireSubmission}
+                  submissionAnswers={questionnaireSubmissionAnswers}
+                  onRefresh={refreshQuestionnaires}
+                  onCreate={createQuestionnaire}
+                  onSelect={async (questionnaireId) =>
+                    setSelectedQuestionnaireId(questionnaireId)
+                  }
+                  onSaveVersion={saveQuestionnaireVersion}
+                  onPublish={publishQuestionnaireVersion}
+                  onLoadTask={loadTaskQuestionnaire}
+                  onSubmitTask={submitTaskQuestionnaire}
+                />
+              )}
+              {state.screen === 'attachments' && (
+                <AttachmentScreen
+                  assigneeTasks={activeAssigneeTasks}
+                  attachments={attachments}
+                  onRefresh={refreshTaskAttachments}
+                  onUpload={uploadCompletedAttachment}
+                  onResume={resumeAttachmentUpload}
+                  onDownload={downloadAttachment}
+                />
+              )}
+              {state.screen === 'retention' && (
+                <RetentionScreen
+                  autoExport={autoExport}
+                  archives={archives}
+                  warnings={retentionWarnings}
+                  onRefresh={refreshRetention}
+                  onToggle={async (value) => {
+                    const response = await api.updateRetentionPreference(value)
+                    setAutoExport(response.preference.auto_export_enabled)
+                  }}
+                  onDownload={downloadArchive}
+                />
+              )}
+              {state.screen === 'recovery' && (
+                <RecoveryScreen
+                  projectId={state.selectedProjectId}
+                  status={state.recoveryStatus}
+                  onProvision={provisionSelectedProjectRecovery}
+                  onStart={startProjectRecovery}
+                  onLoad={async (requestId) => {
+                    if (!state.selectedProjectId) return
+                    dispatch({
+                      type: 'set-recovery',
+                      status: await api.getProjectRecovery(
+                        state.selectedProjectId,
+                        requestId,
+                      ),
+                    })
+                  }}
+                  onApprove={approveRecovery}
+                  onCombine={combineShares}
+                />
+              )}
+              {state.screen === 'security' && (
+                <SecurityScreen
+                  vaultPersistence={state.vaultPersistence}
+                  storagePersistence={state.storagePersistence}
+                  onRegisterPasskey={async () => {
+                    const current = requireServices()
+                    const result = await current.auth.registerPasskey(
+                      state.session?.device_id as Uuid,
+                    )
+                    dispatch({
+                      type: 'set-vault-persistence',
+                      value: current.auth.vault.persistence,
+                    })
+                    dispatch({
+                      type: 'set-notice',
+                      message: result.prfSupported
+                        ? 'Passkey registered and the local vault was wrapped with PRF-derived input.'
+                        : 'Passkey registered. PRF output was unavailable, so keys remain session-only.',
+                    })
+                  }}
+                  onPersistStorage={async () =>
+                    dispatch({
+                      type: 'set-storage-persistence',
+                      value: (await requestPersistentStorage())
+                        ? 'granted'
+                        : 'not-granted',
+                    })
+                  }
+                />
+              )}
+              {state.screen === 'conflicts' && (
+                <ConflictScreen
+                  conflicts={state.conflicts}
+                  onDiscard={discardConflict}
+                  onRetry={retryConflict}
+                />
+              )}
+            </div>
+          </div>
         )}
       </main>
 

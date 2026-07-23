@@ -10,7 +10,57 @@ import {
   zeroBytes,
 } from './wasm'
 
-interface SerializedDeviceSecrets {
+const DEV_RESOURCE_KEYS_STORAGE = 'sprout-dev-resource-keys'
+
+const isAllZeroKey = (key: Uint8Array): boolean =>
+  key.length === 0 || key.every((byte) => byte === 0)
+
+const readDevBackupTree = (): Record<string, Record<string, string>> => {
+  if (!import.meta.env.DEV) return {}
+  try {
+    const raw = localStorage.getItem(DEV_RESOURCE_KEYS_STORAGE)
+    if (!raw) return {}
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return {}
+    return parsed as Record<string, Record<string, string>>
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * DEV decrypt fallback. Exact purpose/resource/epoch only (wrong epoch breaks
+ * AEAD). Skips all-zero keys left by clearMemory corruption. Searches the
+ * preferred identity first, then any other identity backup.
+ */
+const peekDevBackupKey = (
+  identityId: Uuid | undefined,
+  resourceId: Uuid,
+  epoch: number,
+  purpose: ResourceKeyPurpose,
+): Uint8Array | undefined => {
+  if (!import.meta.env.DEV) return undefined
+  const tree = readDevBackupTree()
+  const exactSlot = `${purpose}:${resourceId}:${epoch}`
+  const identityOrder = identityId
+    ? [identityId, ...Object.keys(tree).filter((id) => id !== identityId)]
+    : Object.keys(tree)
+
+  for (const id of identityOrder) {
+    const value = tree[id]?.[exactSlot]
+    if (!value) continue
+    try {
+      const bytes = base64ToBytes(value)
+      if (bytes.length === 0 || bytes.every((byte) => byte === 0)) continue
+      return bytes
+    } catch {
+      // try next identity
+    }
+  }
+  return undefined
+}
+
+export interface SerializedDeviceSecrets {
   keyVersion: number
   suiteVersion: number
   publicPackageB64: string
@@ -18,6 +68,14 @@ interface SerializedDeviceSecrets {
   mlKem768PrivateKeyB64: string
   ed25519PrivateKeyB64: string
   mlDsa65PrivateKeyB64: string
+}
+
+/** Dev-only vault snapshot for localStorage session restore after reload. */
+export interface DevVaultSnapshot {
+  deviceId: Uuid
+  identityId?: Uuid
+  device: SerializedDeviceSecrets
+  resourceKeys: Record<string, string>
 }
 
 interface VaultPlaintext {
@@ -104,9 +162,15 @@ export class KeyVault {
   #wrappingKey?: CryptoKey
   #salt?: Uint8Array
   #persistence: VaultPersistence = 'locked'
+  #devMutationListener?: () => void
 
   constructor(database: EncryptedDatabase) {
     this.#database = database
+  }
+
+  /** DEV-only hook: fired after resource keys change so App can persist them. */
+  setDevMutationListener(listener?: () => void): void {
+    this.#devMutationListener = listener
   }
 
   get persistence(): VaultPersistence {
@@ -142,6 +206,48 @@ export class KeyVault {
     this.#identityId = identityId
     this.#deviceSecrets = secrets
     this.#persistence = 'session-only'
+  }
+
+  exportDevSnapshot(): DevVaultSnapshot | undefined {
+    if (!this.#deviceId || !this.#deviceSecrets) {
+      return undefined
+    }
+    return {
+      deviceId: this.#deviceId,
+      identityId: this.#identityId,
+      device: serializeDevice(this.#deviceSecrets),
+      resourceKeys: Object.fromEntries(
+        [...this.#resourceKeys].map(([id, key]) => [
+          id,
+          bytesToBase64(key),
+        ]),
+      ),
+    }
+  }
+
+  restoreDevSnapshot(snapshot: DevVaultSnapshot): void {
+    this.clearMemory()
+    this.#deviceId = snapshot.deviceId
+    this.#identityId = snapshot.identityId
+    this.#deviceSecrets = deserializeDevice(snapshot.device)
+    this.#resourceKeys = new Map()
+    for (const [id, value] of Object.entries(snapshot.resourceKeys)) {
+      try {
+        const bytes = base64ToBytes(value)
+        if (isAllZeroKey(bytes)) continue
+        this.#resourceKeys.set(id, bytes)
+      } catch {
+        // skip corrupt slots
+      }
+    }
+    this.#persistence = 'session-only'
+  }
+
+  /** Fill missing identity after DEV restore from a session payload. */
+  ensureIdentityId(identityId: Uuid): void {
+    if (!this.#identityId) {
+      this.#identityId = identityId
+    }
   }
 
   async enablePrfPersistence(
@@ -242,11 +348,45 @@ export class KeyVault {
   }
 
   getResourceKey(resourceId: Uuid, epoch = 1): Uint8Array | undefined {
-    return this.#resourceKeys.get(resourceKeySlot(resourceId, epoch, 'body'))
+    const slot = resourceKeySlot(resourceId, epoch, 'body')
+    const existing = this.#resourceKeys.get(slot)
+    // All-zero entries are clearMemory leftovers — treat as missing so DEV
+    // backup (or a later restore) can supply a live key.
+    if (existing && !isAllZeroKey(existing)) return existing
+    if (existing) {
+      this.#resourceKeys.delete(slot)
+    }
+    const fromBackup = peekDevBackupKey(
+      this.#identityId,
+      resourceId,
+      epoch,
+      'body',
+    )
+    if (fromBackup) {
+      this.#resourceKeys.set(slot, fromBackup)
+      return fromBackup
+    }
+    return undefined
   }
 
   getHeaderKey(resourceId: Uuid, epoch = 1): Uint8Array | undefined {
-    return this.#resourceKeys.get(resourceKeySlot(resourceId, epoch, 'header'))
+    const slot = resourceKeySlot(resourceId, epoch, 'header')
+    const existing = this.#resourceKeys.get(slot)
+    if (existing && !isAllZeroKey(existing)) return existing
+    if (existing) {
+      this.#resourceKeys.delete(slot)
+    }
+    const fromBackup = peekDevBackupKey(
+      this.#identityId,
+      resourceId,
+      epoch,
+      'header',
+    )
+    if (fromBackup) {
+      this.#resourceKeys.set(slot, fromBackup)
+      return fromBackup
+    }
+    return undefined
   }
 
   getLatestResourceKey(
@@ -274,11 +414,15 @@ export class KeyVault {
     epoch = 1,
     purpose: ResourceKeyPurpose = 'body',
   ): Promise<void> {
+    if (isAllZeroKey(key)) {
+      throw new Error('Refusing to store an all-zero resource key')
+    }
     const slot = resourceKeySlot(resourceId, epoch, purpose)
     const existing = this.#resourceKeys.get(slot)
     zeroBytes(existing)
     this.#resourceKeys.set(slot, key.slice())
     await this.persist()
+    this.#devMutationListener?.()
   }
 
   async persist(): Promise<boolean> {

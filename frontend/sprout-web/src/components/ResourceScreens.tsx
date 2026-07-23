@@ -68,12 +68,8 @@ export const ProjectPeopleScreen = ({
   const [prefix, setPrefix] = useState('')
 
   return (
-    <section className="content-screen" aria-labelledby="people-title">
-      <div className="screen-heading">
-        <div>
-          <p className="eyebrow">Project access</p>
-          <h2 id="people-title">Participants and invitations</h2>
-        </div>
+    <section className="content-screen">
+      <div className="content-screen-actions">
         <button
           className="secondary-button inline-button"
           type="button"
@@ -258,12 +254,7 @@ export const ProjectPeopleScreen = ({
         ))}
       </ul>
 
-      <div className="screen-heading">
-        <div>
-          <p className="eyebrow">Encrypted resource grants</p>
-          <h3>Managed topic access</h3>
-        </div>
-      </div>
+      <h3 className="content-section-title">Managed topic access</h3>
       <ul className="archive-list">
         {managedGrants.map(({ topicName, resourceId, grant }) => (
           <li key={grant.id}>
@@ -322,13 +313,7 @@ export const ResourceLookupScreen = ({
   }
 
   return (
-    <section className="content-screen" aria-labelledby={`${kind}-title`}>
-      <div className="screen-heading">
-        <div>
-          <p className="eyebrow">Encrypted resource</p>
-          <h2 id={`${kind}-title`}>{title}</h2>
-        </div>
-      </div>
+    <section className="content-screen">
       <div className="resource-grid">
         <form className="panel-form" onSubmit={(event) => void create(event)}>
           <h3>Create {kind}</h3>
@@ -414,13 +399,7 @@ export const AttachmentScreen = ({
   )
 
   return (
-    <section className="content-screen" aria-labelledby="attachment-title">
-      <div className="screen-heading">
-        <div>
-          <p className="eyebrow">Ciphertext files</p>
-          <h2 id="attachment-title">Attachments</h2>
-        </div>
-      </div>
+    <section className="content-screen">
       <div className="resource-grid">
         <form
           className="panel-form"
@@ -579,12 +558,8 @@ export const RetentionScreen = ({
   onRefresh,
   onDownload,
 }: RetentionScreenProps) => (
-  <section className="content-screen" aria-labelledby="retention-title">
-    <div className="screen-heading">
-      <div>
-        <p className="eyebrow">Deletion and export</p>
-        <h2 id="retention-title">Retention archives</h2>
-      </div>
+  <section className="content-screen">
+    <div className="content-screen-actions">
       <button
         className="secondary-button inline-button"
         type="button"
@@ -696,13 +671,7 @@ export const RecoveryScreen = ({
   }
 
   return (
-    <section className="content-screen" aria-labelledby="recovery-title">
-      <div className="screen-heading">
-        <div>
-          <p className="eyebrow">Unanimous recovery</p>
-          <h2 id="recovery-title">Recovery ceremony</h2>
-        </div>
-      </div>
+    <section className="content-screen">
       <div className="recovery-summary">
         <ShieldIcon />
         <div>
@@ -861,13 +830,7 @@ export const SecurityScreen = ({
   onRegisterPasskey,
   onPersistStorage,
 }: SecurityScreenProps) => (
-  <section className="content-screen" aria-labelledby="security-title">
-    <div className="screen-heading">
-      <div>
-        <p className="eyebrow">Device security</p>
-        <h2 id="security-title">Passkeys and local storage</h2>
-      </div>
-    </div>
+  <section className="content-screen">
     <div className="security-grid">
       <article>
         <KeyIcon />
@@ -886,7 +849,7 @@ export const SecurityScreen = ({
         </button>
       </article>
       <article>
-        <LockIcon />
+        <LockIcon className="security-icon-accent" />
         <h3>Persistent encrypted storage</h3>
         <p>
           Persistence reduces browser eviction risk but does not prevent a user
@@ -902,7 +865,7 @@ export const SecurityScreen = ({
         </button>
       </article>
       <article className="limitations-card">
-        <ShieldIcon />
+        <ShieldIcon className="security-icon-accent" />
         <h3>Security limitations</h3>
         <ul>
           <li>A compromised origin can steal keys while unlocked.</li>
@@ -926,13 +889,7 @@ export const ConflictScreen = ({
   onDiscard,
   onRetry,
 }: ConflictScreenProps) => (
-  <section className="content-screen" aria-labelledby="conflicts-title">
-    <div className="screen-heading">
-      <div>
-        <p className="eyebrow">Client-side resolution</p>
-        <h2 id="conflicts-title">Encrypted conflicts</h2>
-      </div>
-    </div>
+  <section className="content-screen">
     {conflicts.length === 0 ? (
       <div className="screen-empty compact-empty">
         <h3>No unresolved conflicts</h3>

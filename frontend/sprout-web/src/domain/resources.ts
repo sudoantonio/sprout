@@ -54,7 +54,42 @@ const requireKey = (
   return key
 }
 
-const decryptBodyOrHeader = <T>(
+/**
+ * DEV recovery for ciphertext encrypted with an all-zero key when
+ * createEncryptedResource used to `return encryptDocument(...)` without await,
+ * so `finally { zeroBytes(key) }` ran mid-encrypt.
+ */
+const decryptWithDevZeroKeyFallback = async <T>(
+  ciphertext: EncryptedPayloadDto,
+  options: {
+    projectId: Uuid
+    resourceId: Uuid
+    kind: ResourceKind
+    aggregateVersion: number
+    keyEpoch: number
+    resourceKey?: Uint8Array
+  },
+  primaryError?: unknown,
+): Promise<T> => {
+  if (!import.meta.env.DEV) {
+    if (primaryError instanceof Error) throw primaryError
+    throw new Error('This resource key is not available on this device')
+  }
+  const zeroKey = new Uint8Array(32)
+  try {
+    return await decryptDocument<T>(ciphertext, {
+      ...options,
+      resourceKey: zeroKey,
+    })
+  } catch {
+    if (primaryError instanceof Error) throw primaryError
+    throw new Error('This resource key is not available on this device')
+  } finally {
+    zeroBytes(zeroKey)
+  }
+}
+
+const decryptBodyOrHeader = async <T>(
   vault: KeyVault,
   input: {
     payload: EncryptedPayloadDto | null
@@ -71,36 +106,57 @@ const decryptBodyOrHeader = <T>(
     throw new Error('No encrypted resource content was returned')
   }
   const key = input.payload
-    ? requireKey(vault, input.resourceId, input.keyEpoch)
+    ? vault.getResourceKey(input.resourceId, input.keyEpoch)
     : vault.getHeaderKey(input.resourceId, input.keyEpoch)
-  if (!key) {
-    throw new Error('This resource key is not available on this device')
-  }
-  return decryptDocument<T>(ciphertext, {
+  const options = {
     projectId: input.projectId,
     resourceId: input.resourceId,
     kind: input.kind,
     aggregateVersion: input.aggregateVersion,
     keyEpoch: input.keyEpoch,
-    resourceKey: key,
-  })
+  }
+  if (key) {
+    try {
+      return await decryptDocument<T>(ciphertext, {
+        ...options,
+        resourceKey: key,
+      })
+    } catch (error) {
+      return decryptWithDevZeroKeyFallback<T>(ciphertext, options, error)
+    }
+  }
+  return decryptWithDevZeroKeyFallback<T>(ciphertext, options)
 }
 
-export const decryptProject = (
+export const decryptProject = async (
   project: ProjectView,
   vault: KeyVault,
-): Promise<ProjectDocument> =>
-  decryptDocument<ProjectDocument>(
-    decodePayloadContainer(project.encrypted_metadata_b64),
-    {
-      projectId: project.id,
-      resourceId: project.id,
-      kind: 'project',
-      aggregateVersion: 0,
-      keyEpoch: project.key_epoch,
-      resourceKey: requireKey(vault, project.id, project.key_epoch),
-    },
-  )
+): Promise<ProjectDocument> => {
+  const ciphertext = decodePayloadContainer(project.encrypted_metadata_b64)
+  const options = {
+    projectId: project.id,
+    resourceId: project.id,
+    kind: 'project' as const,
+    aggregateVersion: 0,
+    keyEpoch: project.key_epoch,
+  }
+  const key = vault.getResourceKey(project.id, project.key_epoch)
+  if (key) {
+    try {
+      return await decryptDocument<ProjectDocument>(ciphertext, {
+        ...options,
+        resourceKey: key,
+      })
+    } catch (error) {
+      return decryptWithDevZeroKeyFallback<ProjectDocument>(
+        ciphertext,
+        options,
+        error,
+      )
+    }
+  }
+  return decryptWithDevZeroKeyFallback<ProjectDocument>(ciphertext, options)
+}
 
 export const decryptTopic = (
   topic: TopicDto,
@@ -159,7 +215,9 @@ export const createEncryptedResource = async <T>(
   const key = crypto.getRandomValues(new Uint8Array(32))
   try {
     await vault.putResourceKey(input.resourceId, key)
-    return encryptDocument(input.document, {
+    // Must await: a bare `return encryptDocument(...)` runs finally/zeroBytes
+    // before encryption finishes, producing all-zero-key ciphertext.
+    return await encryptDocument(input.document, {
       projectId: input.projectId,
       resourceId: input.resourceId,
       keyId: crypto.randomUUID(),
@@ -186,7 +244,7 @@ export const createEncryptedResourceHeader = async <T>(
   const key = crypto.getRandomValues(new Uint8Array(32))
   try {
     await vault.putResourceKey(input.resourceId, key, 1, 'header')
-    return encryptDocument(input.document, {
+    return await encryptDocument(input.document, {
       projectId: input.projectId,
       resourceId: input.resourceId,
       keyId: crypto.randomUUID(),

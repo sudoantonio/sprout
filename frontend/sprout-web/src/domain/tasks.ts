@@ -1,3 +1,4 @@
+import type { Uuid } from '../api/contracts'
 import type {
   DecryptedTask,
   TaskCreationInput,
@@ -5,6 +6,11 @@ import type {
   TaskFilter,
   TaskSelectedValueDocument,
 } from './models'
+
+export interface BoardListLike {
+  wire: { id: Uuid; topic_id: Uuid }
+  document?: { name: string }
+}
 
 export interface BuiltTaskCreation {
   taskKind: DecryptedTask['wire']['task_kind']
@@ -171,6 +177,54 @@ export const filterTasks = (
 
     return due > todayEnd
   })
+}
+
+/** Task lists that contain at least one task assigned to the given identity. */
+export const taskListsForMember = <T extends BoardListLike>(
+  lists: T[],
+  tasks: DecryptedTask[],
+  identityId: Uuid,
+): T[] => {
+  const listIds = new Set(
+    tasks
+      .filter((task) => task.wire.active_assignee_identity_id === identityId)
+      .map((task) => task.wire.list_id),
+  )
+  return lists.filter((list) => listIds.has(list.wire.id))
+}
+
+export const taskListsForTopic = <T extends BoardListLike>(
+  lists: T[],
+  topicId: Uuid,
+): T[] => lists.filter((list) => list.wire.topic_id === topicId)
+
+export const filterBoardSearch = <T extends BoardListLike>(
+  lists: T[],
+  tasks: DecryptedTask[],
+  query: string,
+): { lists: T[]; tasks: DecryptedTask[] } => {
+  const normalized = query.trim().toLowerCase()
+  if (!normalized) {
+    return { lists, tasks }
+  }
+
+  const matchingTasks = tasks.filter((task) => {
+    const title = task.document.title.toLowerCase()
+    const notes = (task.document.notes ?? '').toLowerCase()
+    return title.includes(normalized) || notes.includes(normalized)
+  })
+  const matchingTaskListIds = new Set(
+    matchingTasks.map((task) => task.wire.list_id),
+  )
+  const matchingLists = lists.filter((list) => {
+    const name = (list.document?.name ?? '').toLowerCase()
+    return name.includes(normalized) || matchingTaskListIds.has(list.wire.id)
+  })
+  const visibleListIds = new Set(matchingLists.map((list) => list.wire.id))
+  return {
+    lists: matchingLists,
+    tasks: matchingTasks.filter((task) => visibleListIds.has(task.wire.list_id)),
+  }
 }
 
 export const formatDueDate = (dueAt: string, now = new Date()): string => {

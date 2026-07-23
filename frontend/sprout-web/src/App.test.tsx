@@ -10,18 +10,19 @@ afterEach(() => {
 })
 
 describe('Sprout API shell', () => {
-  it('starts with real account ceremonies and the passkey limitation', () => {
+  it('starts with a minimal passkey sign-in screen', () => {
     render(<App />)
+    expect(screen.getByText('Sprout')).toBeInTheDocument()
     expect(
-      screen.getByRole('heading', {
-        name: /your work stays readable only on authorized devices/i,
+      screen.getByText(/workspace cifrato, solo sui tuoi device/i),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', { name: /^(Accedi|Crea account)$/i }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', {
+        name: /continua con passkey|attendere/i,
       }),
-    ).toBeInTheDocument()
-    expect(
-      screen.getByRole('heading', { name: /sign in with a passkey/i }),
-    ).toBeInTheDocument()
-    expect(
-      screen.getByText(/a passkey does not reveal encryption keys/i),
     ).toBeInTheDocument()
   })
 
@@ -74,11 +75,11 @@ describe('Sprout API shell', () => {
     vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false)
     render(<App />)
     expect(
-      screen.getByText(/account ceremonies require a network connection/i),
+      screen.getByText(/serve connessione per accedere o creare un account/i),
     ).toBeInTheDocument()
     await waitFor(() =>
       expect(
-        screen.getByRole('button', { name: /working|use passkey/i }),
+        screen.getByRole('button', { name: /attendere|continua con passkey/i }),
       ).toBeDisabled(),
     )
   })

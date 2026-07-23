@@ -4,8 +4,10 @@ import type { DecryptedTask } from './models'
 import {
   buildNextRecurringTask,
   buildTaskCreation,
+  filterBoardSearch,
   filterTasks,
   isRecurringTaskOverdue,
+  taskListsForMember,
 } from './tasks'
 
 const now = new Date('2026-07-18T12:00:00.000Z')
@@ -59,6 +61,53 @@ const task = (
       ? { frequency: 'daily', interval: 1 }
       : undefined,
   },
+})
+
+describe('board focus helpers', () => {
+  it('returns only lists that contain tasks for the member', () => {
+    const memberId = crypto.randomUUID()
+    const listA = { wire: { id: crypto.randomUUID(), topic_id: crypto.randomUUID() } }
+    const listB = { wire: { id: crypto.randomUUID(), topic_id: crypto.randomUUID() } }
+    const assigned = task({ state: 'open' })
+    assigned.wire.list_id = listA.wire.id
+    assigned.wire.active_assignee_identity_id = memberId
+    const other = task({ state: 'open' })
+    other.wire.list_id = listB.wire.id
+    other.wire.active_assignee_identity_id = crypto.randomUUID()
+
+    expect(taskListsForMember([listA, listB], [assigned, other], memberId)).toEqual([
+      listA,
+    ])
+  })
+
+  it('filters lists and tasks by search query', () => {
+    const listMatch = {
+      wire: { id: crypto.randomUUID(), topic_id: crypto.randomUUID() },
+      document: { name: 'Mattina' },
+    }
+    const listOther = {
+      wire: { id: crypto.randomUUID(), topic_id: crypto.randomUUID() },
+      document: { name: 'Notte' },
+    }
+    const titled = task({ state: 'open' })
+    titled.wire.list_id = listOther.wire.id
+    titled.document.title = 'Controllo irrigazione'
+    const unrelated = task({ state: 'open' })
+    unrelated.wire.list_id = listOther.wire.id
+    unrelated.document.title = 'Altro'
+
+    const byList = filterBoardSearch([listMatch, listOther], [titled, unrelated], 'matt')
+    expect(byList.lists).toEqual([listMatch])
+    expect(byList.tasks).toEqual([])
+
+    const byTask = filterBoardSearch(
+      [listMatch, listOther],
+      [titled, unrelated],
+      'irrigazione',
+    )
+    expect(byTask.lists).toEqual([listOther])
+    expect(byTask.tasks).toEqual([titled])
+  })
 })
 
 describe('local task filters', () => {

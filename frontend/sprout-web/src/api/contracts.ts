@@ -24,6 +24,8 @@ export interface SessionResponse {
 
 export interface EmailStartResponse {
   accepted: boolean
+  identity_id?: Uuid
+  dev_verification_token?: string
 }
 
 export interface WebAuthnChallenge<TOptions> {

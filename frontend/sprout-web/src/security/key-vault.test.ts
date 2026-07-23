@@ -21,6 +21,48 @@ describe('local key vault', () => {
     expect(vault.getResourceKey(resourceId, 3)).toBeUndefined()
   })
 
+  it('exports and restores dev snapshots without touching PRF persistence', async () => {
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const deviceId = crypto.randomUUID()
+    const resourceId = crypto.randomUUID()
+    const resourceKey = crypto.getRandomValues(new Uint8Array(32))
+    const secrets: DeviceSecrets = {
+      keyVersion: 2,
+      suiteVersion: 0x8001,
+      publicPackage: crypto.getRandomValues(new Uint8Array(64)),
+      x25519PrivateKey: crypto.getRandomValues(new Uint8Array(32)),
+      mlKem768PrivateKey: crypto.getRandomValues(new Uint8Array(48)),
+      ed25519PrivateKey: crypto.getRandomValues(new Uint8Array(32)),
+      mlDsa65PrivateKey: crypto.getRandomValues(new Uint8Array(64)),
+    }
+
+    vault.setSessionSecrets(deviceId, secrets, crypto.randomUUID())
+    await vault.putResourceKey(resourceId, resourceKey, 1)
+
+    const snapshot = vault.exportDevSnapshot()
+    expect(snapshot?.deviceId).toBe(deviceId)
+
+    vault.clearMemory()
+    expect(vault.isUnlocked).toBe(false)
+
+    vault.restoreDevSnapshot(snapshot!)
+    expect(vault.isUnlocked).toBe(true)
+    expect(vault.persistence).toBe('session-only')
+    expect(vault.getResourceKey(resourceId, 1)).toEqual(resourceKey)
+    expect(vault.localDeviceId).toBe(deviceId)
+
+    const identityId = crypto.randomUUID()
+    vault.clearMemory()
+    vault.restoreDevSnapshot({
+      ...snapshot!,
+      identityId: undefined,
+      resourceKeys: snapshot!.resourceKeys,
+    })
+    vault.ensureIdentityId(identityId)
+    expect(vault.localIdentityId).toBe(identityId)
+  })
+
   it('persists only PRF-wrapped key material and clears memory', async () => {
     let stored: VaultCipherRecord | undefined
     const database = {

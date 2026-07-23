@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react'
-import type { Uuid } from '../api/contracts'
-import { KeyIcon, LockIcon, SproutIcon } from './icons'
+import type { EmailStartResponse, Uuid } from '../api/contracts'
+import { KeyIcon, SproutIcon } from './icons'
+import './AuthScreen.css'
 
 type AuthMode = 'signin' | 'signup' | 'verify' | 'recover'
 
@@ -19,7 +20,7 @@ interface AuthScreenProps {
   onSignup(input: {
     email: string
     identityHandle: string
-  }): Promise<void>
+  }): Promise<EmailStartResponse>
   onVerify(input: {
     identityId: Uuid
     token: string
@@ -29,6 +30,29 @@ interface AuthScreenProps {
     identityId: Uuid
     token: string
   }): Promise<void>
+  onDevLogin?(input: {
+    email: string
+    identityHandle: string
+  }): Promise<void>
+}
+
+const DEV_EMAIL = 'admin@example.test'
+const DEV_HANDLE = 'admin.minerva'
+
+const titles: Record<AuthMode, string> = {
+  signin: 'Accedi',
+  signup: 'Crea account',
+  recover: 'Recupera accesso',
+  verify: 'Verifica email',
+}
+
+const hints: Record<AuthMode, string> = {
+  signin:
+    'Accedi con passkey funziona solo dopo verifica email e registrazione passkey. Se è la prima volta, usa Verifica email qui sotto.',
+  signup: 'In sviluppo: «Continua» entra direttamente. La cifratura resta attiva.',
+  recover: "Ti invieremo un token se l'account esiste.",
+  verify:
+    'Account già verificato? Usa Recupera. Altrimenti incolla il token completo (64 caratteri).',
 }
 
 export const AuthScreen = ({
@@ -44,15 +68,25 @@ export const AuthScreen = ({
   onVerify,
   onRecoveryStart,
   onRecoveryFinish,
+  onDevLogin,
 }: AuthScreenProps) => {
-  const [mode, setMode] = useState<AuthMode>('signin')
+  const [mode, setMode] = useState<AuthMode>(
+    import.meta.env.DEV ? 'signup' : 'signin',
+  )
   const [verificationKind, setVerificationKind] = useState<
     'signup' | 'recovery'
   >('signup')
-  const [email, setEmail] = useState('')
-  const [identityHandle, setIdentityHandle] = useState('')
+  const [email, setEmail] = useState(import.meta.env.DEV ? DEV_EMAIL : '')
+  const [identityHandle, setIdentityHandle] = useState(
+    import.meta.env.DEV ? DEV_HANDLE : '',
+  )
   const [identityId, setIdentityId] = useState('')
   const [token, setToken] = useState('')
+
+  const switchMode = (next: AuthMode) => {
+    setMode(next)
+    if (next !== 'verify') setToken('')
+  }
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -61,7 +95,18 @@ export const AuthScreen = ({
       return
     }
     if (mode === 'signup') {
-      await onSignup({ email, identityHandle })
+      if (import.meta.env.DEV && onDevLogin) {
+        await onDevLogin({ email, identityHandle })
+        return
+      }
+      const response = await onSignup({ email, identityHandle })
+      if (!response.dev_verification_token) {
+        return
+      }
+      if (response.identity_id) {
+        setIdentityId(response.identity_id)
+      }
+      setToken(response.dev_verification_token)
       setVerificationKind('signup')
       setMode('verify')
       return
@@ -79,191 +124,256 @@ export const AuthScreen = ({
     }
   }
 
+  const submitLabel = busy
+    ? 'Attendere…'
+    : mode === 'signin'
+      ? 'Continua con passkey'
+      : mode === 'verify'
+        ? 'Verifica'
+        : mode === 'signup' && import.meta.env.DEV
+          ? 'Entra (dev)'
+          : 'Continua'
+
   return (
     <main className="auth-page">
-      <section className="auth-intro" aria-labelledby="auth-title">
-        <a className="brand auth-brand" href="/" aria-label="Sprout home">
-          <span className="brand-mark">
-            <SproutIcon />
-          </span>
-          <span>Sprout</span>
-        </a>
-        <p className="eyebrow">Encrypted workspace</p>
-        <h1 id="auth-title">Your work stays readable only on authorized devices.</h1>
-        <p>
-          Sprout sends ciphertext and routing metadata to the service. Private
-          keys and decrypted content remain in this browser&apos;s memory.
-        </p>
-        <ul className="auth-assurances">
-          <li>
-            <LockIcon />
-            Rust/WASM encryption with resource and version-bound context
-          </li>
-          <li>
-            <KeyIcon />
-            Passkeys authenticate; PRF may wrap a local key vault
-          </li>
-        </ul>
-        <div className="security-disclosure">
-          <strong>Passkey limitation</strong>
-          <p>
-            A passkey does not reveal encryption keys. Without WebAuthn PRF and
-            this device&apos;s wrapped vault, another authorized device or
-            unanimous project recovery is required.
+      <div className="auth-card">
+        <header className="auth-brand">
+          <a className="auth-brand-link" href="/" aria-label="Sprout">
+            <span className="auth-brand-mark">
+              <SproutIcon />
+            </span>
+            <span className="auth-brand-name">Sprout</span>
+          </a>
+          <p className="auth-brand-tagline">
+            Workspace cifrato, solo sui tuoi device.
           </p>
-        </div>
-      </section>
+        </header>
 
-      <section className="auth-card" aria-labelledby="form-title">
-        <div className="auth-tabs" role="tablist" aria-label="Account access">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={mode === 'signin'}
-            onClick={() => setMode('signin')}
+        <section className="auth-panel" aria-labelledby="form-title">
+          {import.meta.env.DEV && onDevLogin && mode !== 'verify' && (
+            <div className="auth-dev-login">
+              <p>Sviluppo frontend: accesso rapido con cifratura attiva.</p>
+              <button
+                type="button"
+                className="auth-dev-login-button"
+                disabled={busy || !online}
+                onClick={() =>
+                  void onDevLogin({
+                    email: email || DEV_EMAIL,
+                    identityHandle: identityHandle || DEV_HANDLE,
+                  })
+                }
+              >
+                Entra come {identityHandle || DEV_HANDLE}
+              </button>
+            </div>
+          )}
+
+          {mode !== 'verify' && (
+            <div className="auth-segment" role="tablist" aria-label="Accesso">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mode === 'signin'}
+                onClick={() => switchMode('signin')}
+              >
+                Accedi
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mode === 'signup'}
+                onClick={() => switchMode('signup')}
+              >
+                Crea
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mode === 'recover'}
+                onClick={() => switchMode('recover')}
+              >
+                Recupera
+              </button>
+            </div>
+          )}
+
+          <form
+            className="auth-form"
+            onSubmit={(event) => {
+              void submit(event).catch(() => undefined)
+            }}
           >
-            Sign in
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={mode === 'signup'}
-            onClick={() => setMode('signup')}
-          >
-            Create account
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={mode === 'recover'}
-            onClick={() => setMode('recover')}
-          >
-            Recover
-          </button>
-        </div>
+            <div className="auth-form-head">
+              <h1 id="form-title">
+                {mode === 'verify'
+                  ? verificationKind === 'signup'
+                    ? 'Verifica email'
+                    : 'Completa recupero'
+                  : titles[mode]}
+              </h1>
+              <p>{mode === 'verify' ? hints.verify : hints[mode]}</p>
+            </div>
 
-        <form
-          onSubmit={(event) => {
-            void submit(event).catch(() => undefined)
-          }}
-        >
-          <h2 id="form-title">
-            {mode === 'signin' && 'Sign in with a passkey'}
-            {mode === 'signup' && 'Create your encrypted account'}
-            {mode === 'recover' && 'Request account recovery'}
-            {mode === 'verify' &&
-              (verificationKind === 'signup'
-                ? 'Verify your email'
-                : 'Finish account recovery')}
-          </h2>
+            <div className="auth-fields">
+              {(mode === 'signup' || mode === 'recover') && (
+                <label className="auth-field">
+                  Email
+                  <input
+                    type="email"
+                    autoComplete="email"
+                    required
+                    placeholder="tu@esempio.test"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                  />
+                </label>
+              )}
 
-          {(mode === 'signup' || mode === 'recover') && (
-            <label>
-              Email
-              <input
-                type="email"
-                autoComplete="email"
-                required
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-              />
-            </label>
-          )}
+              {(mode === 'signin' || mode === 'signup') && (
+                <label className="auth-field">
+                  Handle
+                  <input
+                    type="text"
+                    minLength={3}
+                    maxLength={128}
+                    autoComplete="username"
+                    required
+                    placeholder="nome.cognome"
+                    value={identityHandle}
+                    onChange={(event) => setIdentityHandle(event.target.value)}
+                  />
+                </label>
+              )}
 
-          {(mode === 'signin' || mode === 'signup') && (
-            <label>
-              Identity handle
-              <input
-                type="text"
-                minLength={3}
-                maxLength={128}
-                autoComplete="username"
-                required
-                value={identityHandle}
-                onChange={(event) => setIdentityHandle(event.target.value)}
-              />
-            </label>
-          )}
+              {(mode === 'signin' || mode === 'verify') && (
+                <label className="auth-field">
+                  Identity ID
+                  <input
+                    type="text"
+                    inputMode="text"
+                    required
+                    pattern="[0-9a-fA-F-]{36}"
+                    spellCheck={false}
+                    placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                    value={identityId}
+                    onChange={(event) => setIdentityId(event.target.value)}
+                  />
+                </label>
+              )}
 
-          {(mode === 'signin' || mode === 'verify') && (
-            <label>
-              Identity ID
-              <input
-                type="text"
-                inputMode="text"
-                required
-                pattern="[0-9a-fA-F-]{36}"
-                value={identityId}
-                onChange={(event) => setIdentityId(event.target.value)}
-              />
-            </label>
-          )}
+              {mode === 'verify' && (
+                <label className="auth-field auth-field--token">
+                  Token email
+                  <input
+                    type="text"
+                    minLength={64}
+                    maxLength={64}
+                    autoComplete="one-time-code"
+                    required
+                    spellCheck={false}
+                    placeholder="64 caratteri esadecimali"
+                    value={token}
+                    onChange={(event) => setToken(event.target.value.trim())}
+                  />
+                  <span className="auth-field-hint">
+                    {token.length}/64 caratteri
+                  </span>
+                </label>
+              )}
+            </div>
 
-          {mode === 'verify' && (
-            <label>
-              Email token
-              <input
-                type="text"
-                minLength={64}
-                maxLength={64}
-                autoComplete="one-time-code"
-                required
-                value={token}
-                onChange={(event) => setToken(event.target.value)}
-              />
-            </label>
-          )}
+            {!online && (
+              <p className="auth-message auth-message--warning" role="status">
+                Serve connessione per accedere o creare un account.
+              </p>
+            )}
+            {error && (
+              <p className="auth-message auth-message--error" role="alert">
+                {error}
+              </p>
+            )}
+            {notice && (
+              <p className="auth-message auth-message--neutral" role="status">
+                {notice}
+              </p>
+            )}
 
-          {!online && (
-            <p className="form-message warning" role="status">
-              Account ceremonies require a network connection.
-            </p>
-          )}
-          {error && (
-            <p className="form-message error" role="alert">
-              {error}
-            </p>
-          )}
-          {notice && (
-            <p className="form-message" role="status">
-              {notice}
-            </p>
-          )}
-
-          <button
-            className="primary-button auth-submit"
-            type="submit"
-            disabled={busy || !online}
-          >
-            {busy ? 'Working…' : mode === 'signin' ? 'Use passkey' : 'Continue'}
-          </button>
-        </form>
-
-        {offlineVaultAvailable && (
-          <div className="local-unlock">
-            <hr />
-            <h3>Open this device offline</h3>
-            <p>
-              A fresh local WebAuthn challenge requests PRF output from the
-              passkey bound to this encrypted vault. This does not create a
-              server session.
-            </p>
             <button
-              className="secondary-button"
-              type="button"
-              disabled={busy}
-              onClick={() => void onOfflineUnlock()}
+              className="auth-primary"
+              type="submit"
+              disabled={busy || !online}
             >
-              Unlock local workspace
+              {mode === 'signin' && <KeyIcon />}
+              {submitLabel}
             </button>
-          </div>
-        )}
 
-        <p className="device-footnote">
-          Device routing ID: <code>{deviceId}</code>. It is metadata, not a
-          decryption key.
+            {mode === 'signin' && (
+              <button
+                type="button"
+                className="auth-ghost"
+                onClick={() => {
+                  setVerificationKind('signup')
+                  setMode('verify')
+                }}
+              >
+                Hai già creato l’account? Verifica email
+              </button>
+            )}
+
+            {mode === 'verify' && (
+              <>
+                <details className="auth-dev">
+                  <summary>Sviluppo: account già creato ma non verificato</summary>
+                  <p>
+                    Accedi con passkey funziona solo dopo verifica email e
+                    registrazione passkey. Se hai già creato l’account, incolla
+                    identity ID e token dall’outbox locale.
+                  </p>
+                  <pre>{`docker compose -f compose.validation.yml exec -T postgres \\
+  psql -U sprout_validation -d sprout_validation -tA -F '|' \\
+  -c "SELECT identity_id::text, encode(payload_nonce,'hex'), encode(encrypted_payload,'hex') FROM email_outbox WHERE recipient_email='TU@EMAIL' AND message_kind='signup_verification' ORDER BY created_at DESC LIMIT 1;" \\
+| while IFS='|' read -r ID NONCE CT; do
+  docker compose -f compose.validation.yml run --rm -T \\
+    --entrypoint sprout-validation-crypto validation \\
+    decrypt-email --identity-id "$ID" --message-kind signup_verification \\
+    --nonce-hex "$NONCE" --ciphertext-hex "$CT"
+done`}</pre>
+                </details>
+                <button
+                  type="button"
+                  className="auth-ghost"
+                  onClick={() =>
+                    switchMode(
+                      verificationKind === 'signup' ? 'signup' : 'recover',
+                    )
+                  }
+                >
+                  Indietro
+                </button>
+              </>
+            )}
+          </form>
+
+          {offlineVaultAvailable && (
+            <div className="auth-offline">
+              <p>Vault locale disponibile su questo device.</p>
+              <button
+                className="auth-secondary"
+                type="button"
+                disabled={busy}
+                onClick={() => void onOfflineUnlock()}
+              >
+                Sblocca offline
+              </button>
+            </div>
+          )}
+        </section>
+
+        <p className="auth-foot">
+          Device <code>{deviceId.slice(0, 8)}</code>
         </p>
-      </section>
+      </div>
     </main>
   )
 }

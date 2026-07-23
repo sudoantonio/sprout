@@ -1,6 +1,7 @@
-import { ApiClient } from '../api/client'
+import { ApiClient, ApiError } from '../api/client'
 import type {
   DeviceKeyPackageView,
+  EmailStartResponse,
   SessionResponse,
   Uuid,
 } from '../api/contracts'
@@ -10,6 +11,8 @@ import {
   getLocalVaultPrf,
   getPasskey,
 } from './webauthn'
+import { mergeDevResourceKeysIntoSnapshot } from './dev-resource-keys'
+import { loadDevSession } from './dev-session'
 import { KeyVault } from './key-vault'
 import {
   bytesToBase64,
@@ -106,7 +109,7 @@ export class AuthController {
     email: string
     identityHandle: string
     deviceId: Uuid
-  }): Promise<{ accepted: boolean }> {
+  }): Promise<EmailStartResponse> {
     return encryptedBootstrapPayload(input.deviceId, { schema: 1 }).then(
       (encryptedProfile) =>
         this.#api.startEmailVerification({
@@ -115,6 +118,82 @@ export class AuthController {
           encrypted_profile_b64: encryptedProfile,
         }),
     )
+  }
+
+  async devLogin(input: {
+    email?: string
+    identityHandle?: string
+    deviceId: Uuid
+  }): Promise<AuthenticationOutcome> {
+    // Reuse the stable browser device id so reload/re-login keeps the same
+    // key packages and envelopes. A fresh UUID every login made every resource
+    // appear Locked after refresh.
+    const storedDeviceId = localStorage.getItem('sprout.device-id')
+    const deviceId =
+      storedDeviceId &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        storedDeviceId,
+      )
+        ? storedDeviceId
+        : input.deviceId
+    const encryptedLabel = await encryptedBootstrapPayload(deviceId, {
+      schema: 1,
+      kind: 'web',
+    })
+    const session = await this.#api.devLogin({
+      email: input.email,
+      identity_handle: input.identityHandle,
+      device_id: deviceId,
+      device_kind: 'web',
+      encrypted_device_label_b64: encryptedLabel,
+    })
+    this.#api.setSession(session.token)
+    localStorage.setItem('sprout.device-id', session.device_id)
+    let provisioned = this.#restoreDevVaultForSession(session)
+    if (!provisioned) {
+      try {
+        provisioned = await this.#provisionDevice(
+          session.device_id,
+          session.identity_id,
+        )
+      } catch (error) {
+        if (!(error instanceof ApiError && error.status === 409)) {
+          throw error
+        }
+      }
+    }
+    // Device already registered but local keys were lost: mint a new device so
+    // DEV can keep working. Existing ciphertext for the old device stays Locked.
+    if (!provisioned && !this.vault.isUnlocked && import.meta.env.DEV) {
+      const freshDeviceId = crypto.randomUUID()
+      localStorage.setItem('sprout.device-id', freshDeviceId)
+      const freshLabel = await encryptedBootstrapPayload(freshDeviceId, {
+        schema: 1,
+        kind: 'web',
+      })
+      const freshSession = await this.#api.devLogin({
+        email: input.email,
+        identity_handle: input.identityHandle,
+        device_id: freshDeviceId,
+        device_kind: 'web',
+        encrypted_device_label_b64: freshLabel,
+      })
+      this.#api.setSession(freshSession.token)
+      provisioned = await this.#provisionDevice(
+        freshSession.device_id,
+        freshSession.identity_id,
+      )
+      return {
+        session: freshSession,
+        requiresAuthorizedDevice: !this.vault.isUnlocked,
+        prfSupported: false,
+      }
+    }
+    return {
+      session,
+      requiresAuthorizedDevice: !this.vault.isUnlocked,
+      prfSupported: false,
+    }
   }
 
   async finishSignup(input: {
@@ -194,11 +273,18 @@ export class AuthController {
         passkey.prfOutput,
       )
     }
+    // DEV: restore session-only vault snapshot when PRF did not unlock.
+    // Without this, a successful provision was ignored and keys were never
+    // persisted — reload left every resource Locked.
+    if (!unlocked) {
+      unlocked = this.#restoreDevVaultForSession(session)
+    }
     if (!unlocked) {
       const provisioned = await this.#provisionDevice(
         session.device_id,
         session.identity_id,
       )
+      unlocked = provisioned || this.vault.isUnlocked
       if (persistenceOutput && provisioned) {
         await this.vault.enablePrfPersistence(
           persistenceOutput,
@@ -213,7 +299,9 @@ export class AuthController {
 
     return {
       session,
-      requiresAuthorizedDevice: !unlocked,
+      // Device secrets (PRF, DEV snapshot, or fresh provision) are what matter —
+      // not whether PRF specifically succeeded.
+      requiresAuthorizedDevice: !this.vault.isUnlocked,
       prfSupported: passkey.prfSupported,
     }
   }
@@ -270,12 +358,36 @@ export class AuthController {
     return session
   }
 
+  #restoreDevVaultForSession(session: SessionResponse): boolean {
+    if (!import.meta.env.DEV) return false
+    const saved = loadDevSession()
+    if (!saved?.vault) return false
+    // Snapshot must match this session device or unwrap will fail for every key.
+    if (saved.vault.deviceId !== session.device_id) return false
+    const merged = mergeDevResourceKeysIntoSnapshot(
+      session.identity_id,
+      saved.vault,
+    )
+    this.vault.restoreDevSnapshot(merged)
+    this.vault.ensureIdentityId(session.identity_id)
+    return this.vault.isUnlocked
+  }
+
   async #provisionDevice(
     deviceId: Uuid,
     identityId: Uuid,
   ): Promise<boolean> {
     const packages = await this.#api.listDevicePackages(deviceId)
     if (!shouldProvisionDevice(packages)) {
+      // Device already registered: succeed only when this browser already holds
+      // the matching private keys (DEV vault restore / prior unlock).
+      if (
+        this.vault.isUnlocked &&
+        this.vault.localDeviceId === deviceId
+      ) {
+        this.vault.ensureIdentityId(identityId)
+        return true
+      }
       return false
     }
     const secrets = await generateDeviceSecrets(deviceId)

@@ -62,13 +62,7 @@ export const PresetScreen = ({
   }
 
   return (
-    <section className="content-screen" aria-labelledby="preset-title">
-      <div className="screen-heading">
-        <div>
-          <p className="eyebrow">Preset lifecycle</p>
-          <h2 id="preset-title">Preset, assignment and materialization</h2>
-        </div>
-      </div>
+    <section className="content-screen">
       <form className="panel-form" onSubmit={(event) => void submit(event)}>
         <p>
           Creates an immutable version with all three pretask kinds, assigns
