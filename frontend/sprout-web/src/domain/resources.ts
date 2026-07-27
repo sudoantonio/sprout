@@ -42,11 +42,38 @@ export const decodePayloadContainer = (
   }
 }
 
+/**
+ * Prefer wire epoch; fall back to any restored/backed-up body epoch.
+ * Mirrors resolveHierarchyHeaderKey for body (payload) keys.
+ */
+export const resolveActiveResourceKey = (
+  vault: {
+    getResourceKey: (resourceId: Uuid, epoch?: number) => Uint8Array | undefined
+    getLatestResourceKey: (
+      resourceId: Uuid,
+    ) => { epoch: number; key: Uint8Array } | undefined
+  },
+  resourceId: Uuid,
+  preferredEpoch: number,
+): { epoch: number; key: Uint8Array } | undefined => {
+  const exact = vault.getResourceKey(resourceId, preferredEpoch)
+  if (exact) return { epoch: preferredEpoch, key: exact }
+  const latest = vault.getLatestResourceKey(resourceId)
+  if (latest) return latest
+  if (preferredEpoch !== 1) {
+    const genesis = vault.getResourceKey(resourceId, 1)
+    if (genesis) return { epoch: 1, key: genesis }
+  }
+  return undefined
+}
+
 const requireKey = (
   vault: KeyVault,
   resourceId: Uuid,
   keyEpoch: number,
 ): Uint8Array => {
+  // Exact epoch only: keyEpoch is bound into ciphertext AAD. Callers must
+  // resolve via resolveActiveResourceKey and pass the matching epoch.
   const key = vault.getResourceKey(resourceId, keyEpoch)
   if (!key) {
     throw new Error('This resource key is not available on this device')
@@ -105,21 +132,31 @@ const decryptBodyOrHeader = async <T>(
   if (!ciphertext) {
     throw new Error('No encrypted resource content was returned')
   }
-  const key = input.payload
-    ? vault.getResourceKey(input.resourceId, input.keyEpoch)
-    : vault.getHeaderKey(input.resourceId, input.keyEpoch)
+  const resolved = input.payload
+    ? resolveActiveResourceKey(vault, input.resourceId, input.keyEpoch)
+    : (() => {
+        const exact = vault.getHeaderKey(input.resourceId, input.keyEpoch)
+        if (exact) return { epoch: input.keyEpoch, key: exact }
+        const latest = vault.getLatestHeaderKey(input.resourceId)
+        if (latest) return latest
+        if (input.keyEpoch !== 1) {
+          const genesis = vault.getHeaderKey(input.resourceId, 1)
+          if (genesis) return { epoch: 1, key: genesis }
+        }
+        return undefined
+      })()
   const options = {
     projectId: input.projectId,
     resourceId: input.resourceId,
     kind: input.kind,
     aggregateVersion: input.aggregateVersion,
-    keyEpoch: input.keyEpoch,
+    keyEpoch: resolved?.epoch ?? input.keyEpoch,
   }
-  if (key) {
+  if (resolved) {
     try {
       return await decryptDocument<T>(ciphertext, {
         ...options,
-        resourceKey: key,
+        resourceKey: resolved.key,
       })
     } catch (error) {
       return decryptWithDevZeroKeyFallback<T>(ciphertext, options, error)
@@ -213,6 +250,9 @@ export const createEncryptedResource = async <T>(
   },
 ): Promise<EncryptedPayloadDto> => {
   const key = crypto.getRandomValues(new Uint8Array(32))
+  // Encrypt with a dedicated copy so finally/zeroBytes cannot touch the vault
+  // slot (putResourceKey also stores its own copy).
+  const encryptKey = key.slice()
   try {
     await vault.putResourceKey(input.resourceId, key)
     // Must await: a bare `return encryptDocument(...)` runs finally/zeroBytes
@@ -224,10 +264,10 @@ export const createEncryptedResource = async <T>(
       kind: input.kind,
       aggregateVersion: input.aggregateVersion,
       keyEpoch: 1,
-      resourceKey: key,
+      resourceKey: encryptKey,
     })
   } finally {
-    zeroBytes(key)
+    zeroBytes(key, encryptKey)
   }
 }
 
@@ -242,8 +282,13 @@ export const createEncryptedResourceHeader = async <T>(
   },
 ): Promise<EncryptedPayloadDto> => {
   const key = crypto.getRandomValues(new Uint8Array(32))
+  // Encrypt with a dedicated copy so finally/zeroBytes cannot touch the vault
+  // slot (putResourceKey also stores its own copy).
+  const encryptKey = key.slice()
   try {
     await vault.putResourceKey(input.resourceId, key, 1, 'header')
+    // Must await: same zeroBytes race as createEncryptedResource (header
+    // keys are required later for hierarchy task assignment).
     return await encryptDocument(input.document, {
       projectId: input.projectId,
       resourceId: input.resourceId,
@@ -251,10 +296,10 @@ export const createEncryptedResourceHeader = async <T>(
       kind: input.kind,
       aggregateVersion: input.aggregateVersion,
       keyEpoch: 1,
-      resourceKey: key,
+      resourceKey: encryptKey,
     })
   } finally {
-    zeroBytes(key)
+    zeroBytes(key, encryptKey)
   }
 }
 

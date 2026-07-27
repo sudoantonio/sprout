@@ -75,6 +75,7 @@ import {
   encodePayloadContainer,
   encryptExistingResource,
   INITIAL_PAYLOAD_VERSION,
+  resolveActiveResourceKey,
 } from './domain/resources'
 import type {
   DecryptedTask,
@@ -92,6 +93,7 @@ import type {
   TaskListDocument,
   TopicDocument,
 } from './domain/models'
+import { isSameTaskListIcon } from './domain/models'
 import {
   buildAssigneeSubmissionRequest,
   decryptQuestionnaireVersion,
@@ -155,6 +157,7 @@ import {
 import {
   type AppScreen,
   type BoardFocus,
+  type BoardViewMode,
   type BoardMember,
   type ProjectItem,
   type TaskListItem,
@@ -180,8 +183,12 @@ interface AppProps {
   initialSession?: SessionResponse
 }
 
-const errorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : 'An unexpected error occurred'
+const errorMessage = (error: unknown): string => {
+  if (error instanceof ApiError && error.status === 429) {
+    return 'Troppe richieste, riprova tra qualche secondo'
+  }
+  return error instanceof Error ? error.message : 'An unexpected error occurred'
+}
 
 const screenTitles: Record<AppScreen, string> = {
   tasks: 'Board',
@@ -215,6 +222,101 @@ const projectRecord = (
   updatedAt: project.updated_at,
 })
 
+/** Reload DEV backups + server envelopes so body/header slots are available. */
+const recoverProjectResourceKeys = async (
+  api: ApiClient,
+  services: Services,
+  projectId: Uuid,
+  identityId?: Uuid,
+): Promise<number> => {
+  if (import.meta.env.DEV) {
+    if (identityId) {
+      await restoreDevResourceKeys(identityId, services.auth.vault)
+    }
+    await restoreAllDevResourceKeys(services.auth.vault)
+  }
+  const [envelopeResponse, packages] = await Promise.all([
+    api.listResourceKeyEnvelopes(projectId),
+    api.listProjectDevicePackages(projectId),
+  ])
+  return importResourceKeyEnvelopes(services.auth.vault, {
+    projectId,
+    envelopes: envelopeResponse.envelopes,
+    packages,
+  })
+}
+
+/** Prefer wire epoch; fall back to any restored/backed-up header epoch. */
+const resolveHierarchyHeaderKey = (
+  vault: {
+    getHeaderKey: (resourceId: Uuid, epoch?: number) => Uint8Array | undefined
+    getLatestHeaderKey: (
+      resourceId: Uuid,
+    ) => { epoch: number; key: Uint8Array } | undefined
+  },
+  resourceId: Uuid,
+  preferredEpoch: number,
+): { epoch: number; key: Uint8Array } | undefined => {
+  const exact = vault.getHeaderKey(resourceId, preferredEpoch)
+  if (exact) return { epoch: preferredEpoch, key: exact }
+  const latest = vault.getLatestHeaderKey(resourceId)
+  if (latest) return latest
+  if (preferredEpoch !== 1) {
+    const genesis = vault.getHeaderKey(resourceId, 1)
+    if (genesis) return { epoch: 1, key: genesis }
+  }
+  return undefined
+}
+
+/**
+ * Resolve a body key for encrypt/update: vault → envelope/DEV restore →
+ * (DEV) mint a replacement when plaintext is already in memory but the body
+ * slot was lost/zero-purged (header-only display still works in that state).
+ */
+const ensureActiveResourceKey = async (
+  api: ApiClient,
+  services: Services,
+  session: SessionResponse,
+  projectId: Uuid,
+  resourceId: Uuid,
+  preferredEpoch: number,
+  missingMessage: string,
+): Promise<{ epoch: number; key: Uint8Array }> => {
+  const vault = services.auth.vault
+  let resolved = resolveActiveResourceKey(vault, resourceId, preferredEpoch)
+  if (!resolved) {
+    try {
+      await recoverProjectResourceKeys(
+        api,
+        services,
+        projectId,
+        session.identity_id,
+      )
+      if (import.meta.env.DEV) {
+        persistDevVault(session, vault)
+      }
+    } catch {
+      // Envelope restore may be offline; DEV mint below can still unblock edits.
+    }
+    resolved = resolveActiveResourceKey(vault, resourceId, preferredEpoch)
+  }
+  if (!resolved && import.meta.env.DEV) {
+    // Body keys are often missing after zero-key purge while header keys
+    // remain (board still decrypts via header / DEV zero-key fallback).
+    // Mint a replacement at the wire epoch so this device can rewrite payload.
+    const minted = crypto.getRandomValues(new Uint8Array(32))
+    try {
+      await vault.putResourceKey(resourceId, minted, preferredEpoch, 'body')
+      persistDevVault(session, vault)
+      resolved = { epoch: preferredEpoch, key: minted.slice() }
+    } finally {
+      zeroBytes(minted)
+    }
+  }
+  if (!resolved) throw new Error(missingMessage)
+  return resolved
+}
+
 const hydrateServerProject = async (
   api: ApiClient,
   services: Services,
@@ -227,18 +329,12 @@ const hydrateServerProject = async (
     projectRecord(project, payload),
   )
   try {
-    if (import.meta.env.DEV && identityId) {
-      await restoreDevResourceKeys(identityId, services.auth.vault)
-    }
-    const [envelopeResponse, packages] = await Promise.all([
-      api.listResourceKeyEnvelopes(project.id),
-      api.listProjectDevicePackages(project.id),
-    ])
-    const imported = await importResourceKeyEnvelopes(services.auth.vault, {
-      projectId: project.id,
-      envelopes: envelopeResponse.envelopes,
-      packages,
-    })
+    const imported = await recoverProjectResourceKeys(
+      api,
+      services,
+      project.id,
+      identityId,
+    )
     const rootKey = services.auth.vault.getResourceKey(
       project.root_resource_id,
       project.key_epoch,
@@ -354,6 +450,9 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   const [attachments, setAttachments] = useState<
     AttachmentCollectionItemDto[]
   >([])
+  const [attachmentLabels, setAttachmentLabels] = useState<
+    Record<string, string>
+  >({})
   const [invitations, setInvitations] = useState<ProjectInvitationDto[]>([])
   const [managedResourceGrants, setManagedResourceGrants] = useState<
     Array<{
@@ -373,6 +472,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   const deviceId = useMemo(getOrCreateDeviceId, [])
   const sessionRef = useRef(state.session)
   sessionRef.current = state.session
+  const attachmentRefreshInFlight = useRef(new Map<Uuid, Promise<void>>())
   const [boardReloadToken, setBoardReloadToken] = useState(0)
 
   const selectedProject = state.projects.find(
@@ -1130,6 +1230,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     setTaskQuestionnaireVersion(undefined)
     setQuestionnaireSubmission(undefined)
     setAttachments([])
+    setAttachmentLabels({})
     dispatch({ type: 'logout' })
     dispatch({
       type: 'set-notice',
@@ -1792,12 +1893,260 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         ...epoch,
         idempotency_key: crypto.randomUUID(),
       })
+      if (import.meta.env.DEV) {
+        persistDevVault(state.session, current.auth.vault)
+      }
       await putRestRecord(current.database, topicRecord(topic))
       dispatch({
         type: 'set-topics',
         topics: [...state.topics, { wire: topic, document }],
       })
       dispatch({ type: 'select-topic', topicId: topic.id })
+    } catch (error) {
+      dispatch({ type: 'set-error', message: errorMessage(error) })
+    }
+  }
+
+  const updateTopicDocument = async (
+    topic: TopicItem,
+    document: TopicDocument,
+  ) => {
+    if (!state.selectedProjectId || !state.session) {
+      dispatch({
+        type: 'set-error',
+        message: 'Server sign-in is required to update a topic.',
+      })
+      return
+    }
+    if (!topic.document) {
+      throw new Error('This topic cannot be edited on this device')
+    }
+    const current = requireServices()
+    const active = await ensureActiveResourceKey(
+      api,
+      current,
+      state.session,
+      state.selectedProjectId,
+      topic.wire.resource_node_id,
+      topic.wire.key_epoch,
+      'Missing active topic resource key',
+    )
+    const payload = await encryptExistingResource(current.auth.vault, {
+      projectId: state.selectedProjectId,
+      resourceId: topic.wire.resource_node_id,
+      kind: 'topic',
+      aggregateVersion: topic.wire.payload_version + 1,
+      keyEpoch: active.epoch,
+      document,
+    })
+    const body = {
+      expected_payload_version: topic.wire.payload_version,
+      key_epoch: active.epoch,
+      payload,
+      idempotency_key: crypto.randomUUID(),
+    }
+    const { topic: wire } = await api.updateTopic(
+      state.selectedProjectId,
+      topic.wire.id,
+      body,
+    )
+    const mergedWire: typeof wire = {
+      ...topic.wire,
+      ...wire,
+      header: wire.header ?? topic.wire.header,
+      payload: wire.payload ?? payload,
+    }
+    await putRestRecord(current.database, topicRecord(mergedWire))
+    dispatch({
+      type: 'set-topics',
+      topics: state.topics.map((item) =>
+        item.wire.id === topic.wire.id
+          ? { wire: mergedWire, document }
+          : item,
+      ),
+    })
+  }
+
+  const renameTopic = async (topic: TopicItem, name: string) => {
+    const trimmed = name.trim()
+    if (!trimmed) return
+    try {
+      await updateTopicDocument(topic, {
+        ...topic.document!,
+        name: trimmed,
+      })
+      dispatch({
+        type: 'set-notice',
+        message: 'Categoria rinominata.',
+      })
+    } catch (error) {
+      dispatch({ type: 'set-error', message: errorMessage(error) })
+    }
+  }
+
+  const updateTaskListDocument = async (
+    list: TaskListItem,
+    document: TaskListDocument,
+  ) => {
+    if (!state.selectedProjectId || !state.session) {
+      dispatch({
+        type: 'set-error',
+        message: 'Server sign-in is required to update a task list.',
+      })
+      return
+    }
+    if (!list.document) {
+      throw new Error('This task list cannot be edited on this device')
+    }
+    const current = requireServices()
+    const active = await ensureActiveResourceKey(
+      api,
+      current,
+      state.session,
+      state.selectedProjectId,
+      list.wire.resource_node_id,
+      list.wire.key_epoch,
+      'Missing active task-list resource key',
+    )
+    const payload = await encryptExistingResource(current.auth.vault, {
+      projectId: state.selectedProjectId,
+      resourceId: list.wire.resource_node_id,
+      kind: 'task-list',
+      aggregateVersion: list.wire.payload_version + 1,
+      keyEpoch: active.epoch,
+      document,
+    })
+    const body = {
+      expected_payload_version: list.wire.payload_version,
+      key_epoch: active.epoch,
+      payload,
+      idempotency_key: crypto.randomUUID(),
+    }
+    const { task_list: wire } = await api.updateTaskList(
+      state.selectedProjectId,
+      list.wire.id,
+      body,
+    )
+    const mergedWire: typeof wire = {
+      ...list.wire,
+      ...wire,
+      header: wire.header ?? list.wire.header,
+      payload: wire.payload ?? payload,
+    }
+    await putRestRecord(current.database, listRecord(mergedWire))
+    dispatch({
+      type: 'set-task-lists',
+      taskLists: state.taskLists.map((item) =>
+        item.wire.id === list.wire.id ? { wire: mergedWire, document } : item,
+      ),
+    })
+  }
+
+  const updateTaskList = async (
+    list: TaskListItem,
+    input: {
+      name: string
+      color?: TaskListDocument['color']
+      icon?: TaskListDocument['icon']
+    },
+  ) => {
+    if (!list.document) return
+    const trimmed = input.name.trim()
+    if (!trimmed) return
+    const previousName = list.document.name
+    const previousColor = list.document.color
+    const previousIcon = list.document.icon
+    const unchanged =
+      trimmed === previousName &&
+      input.color === previousColor &&
+      isSameTaskListIcon(input.icon, previousIcon)
+    if (unchanged) return
+    try {
+      await updateTaskListDocument(list, {
+        ...list.document,
+        name: trimmed,
+        color: input.color,
+        icon: input.icon,
+      })
+    } catch (error) {
+      dispatch({ type: 'set-error', message: errorMessage(error) })
+    }
+  }
+
+  const toggleTopicFavorite = async (topic: TopicItem) => {
+    if (!topic.document) return
+    try {
+      const favorite = !topic.document.favorite
+      await updateTopicDocument(topic, {
+        ...topic.document,
+        favorite: favorite || undefined,
+      })
+      dispatch({
+        type: 'set-notice',
+        message: favorite
+          ? 'Categoria aggiunta ai preferiti.'
+          : 'Categoria rimossa dai preferiti.',
+      })
+    } catch (error) {
+      dispatch({ type: 'set-error', message: errorMessage(error) })
+    }
+  }
+
+  const deleteTopic = async (topic: TopicItem) => {
+    if (!state.selectedProjectId || !state.session) {
+      dispatch({
+        type: 'set-error',
+        message: 'Server sign-in is required to delete a topic.',
+      })
+      return
+    }
+    try {
+      const current = requireServices()
+      await api.deleteTopic(state.selectedProjectId, topic.wire.id)
+      const listsToRemove = state.taskLists.filter(
+        (list) => list.wire.topic_id === topic.wire.id,
+      )
+      const listIds = new Set(listsToRemove.map((list) => list.wire.id))
+      await current.database.deleteRecord(topic.wire.resource_node_id)
+      await Promise.all(
+        listsToRemove.map((list) =>
+          current.database.deleteRecord(list.wire.resource_node_id),
+        ),
+      )
+      await Promise.all(
+        state.tasks
+          .filter((task) => listIds.has(task.wire.list_id))
+          .map((task) =>
+            current.database.deleteRecord(task.wire.resource_node_id),
+          ),
+      )
+      if (
+        state.boardFocus.type === 'topic' &&
+        state.boardFocus.topicId === topic.wire.id
+      ) {
+        dispatch({ type: 'set-board-focus', focus: { type: 'generali' } })
+      }
+      dispatch({
+        type: 'set-topics',
+        topics: state.topics.filter((item) => item.wire.id !== topic.wire.id),
+      })
+      dispatch({
+        type: 'set-task-lists',
+        taskLists: state.taskLists.filter(
+          (list) => list.wire.topic_id !== topic.wire.id,
+        ),
+      })
+      dispatch({
+        type: 'set-tasks',
+        tasks: state.tasks.filter((task) => !listIds.has(task.wire.list_id)),
+        lockedTasks: state.lockedTasks.filter(
+          (task) => !listIds.has(task.list_id),
+        ),
+      })
+      dispatch({
+        type: 'set-notice',
+        message: 'Categoria eliminata.',
+      })
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
     }
@@ -1857,6 +2206,9 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           idempotency_key: crypto.randomUUID(),
         },
       )
+      if (import.meta.env.DEV) {
+        persistDevVault(state.session, current.auth.vault)
+      }
       await putRestRecord(current.database, listRecord(list))
       dispatch({
         type: 'set-task-lists',
@@ -1987,43 +2339,88 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         throw new Error('Task hierarchy is unavailable for assignment')
       }
       dispatch({ type: 'select-list', listId })
+      const assigneeIdentityId =
+        input.assigneeIdentityId ?? state.session.identity_id
       const assignmentId = crypto.randomUUID()
+      const hierarchyResources = [
+        {
+          resourceId: topic.wire.resource_node_id,
+          epoch: topic.wire.key_epoch,
+          body: false,
+        },
+        {
+          resourceId: list.wire.resource_node_id,
+          epoch: list.wire.key_epoch,
+          body: false,
+        },
+        { resourceId, epoch: 1, body: true },
+      ]
+      const missingHierarchyHeader = hierarchyResources.some(
+        (item) =>
+          !resolveHierarchyHeaderKey(
+            current.auth.vault,
+            item.resourceId,
+            item.epoch,
+          ),
+      )
+      if (missingHierarchyHeader) {
+        await recoverProjectResourceKeys(
+          api,
+          current,
+          state.selectedProjectId,
+          state.session.identity_id,
+        )
+        if (import.meta.env.DEV) {
+          persistDevVault(state.session, current.auth.vault)
+        }
+      }
       const assignmentEnvelopes = (
         await Promise.all(
-          [
-            { resourceId: topic.wire.resource_node_id, epoch: topic.wire.key_epoch, body: false },
-            { resourceId: list.wire.resource_node_id, epoch: list.wire.key_epoch, body: false },
-            { resourceId, epoch: 1, body: true },
-          ].map(async (hierarchyResource) => {
-            const headerKey = current.auth.vault.getHeaderKey(
+          hierarchyResources.map(async (hierarchyResource) => {
+            const resolvedHeader = resolveHierarchyHeaderKey(
+              current.auth.vault,
               hierarchyResource.resourceId,
               hierarchyResource.epoch,
             )
-            if (!headerKey) {
-              throw new Error('A hierarchy header key is unavailable for task assignment')
+            if (!resolvedHeader) {
+              throw new Error(
+                'A hierarchy header key is unavailable for task assignment',
+              )
             }
-            const headerEnvelopes = await buildResourceKeyEnvelopes(current.auth.vault, {
-              projectId: state.selectedProjectId as Uuid,
-              resourceId: hierarchyResource.resourceId,
-              resourceKey: headerKey,
-              keyPurpose: 'header',
-              recipientIdentityId: state.session?.identity_id as Uuid,
-              packages,
-            })
+            const headerEnvelopes = await buildResourceKeyEnvelopes(
+              current.auth.vault,
+              {
+                projectId: state.selectedProjectId as Uuid,
+                resourceId: hierarchyResource.resourceId,
+                resourceKey: resolvedHeader.key,
+                keyPurpose: 'header',
+                recipientIdentityId: assigneeIdentityId,
+                packages,
+                epoch: resolvedHeader.epoch,
+              },
+            )
             if (!hierarchyResource.body) return headerEnvelopes
-            const bodyKey = current.auth.vault.getResourceKey(
+            const exactBody = current.auth.vault.getResourceKey(
               hierarchyResource.resourceId,
               hierarchyResource.epoch,
             )
-            if (!bodyKey) throw new Error('The assigned task body key is unavailable')
+            const resolvedBody = exactBody
+              ? { epoch: hierarchyResource.epoch, key: exactBody }
+              : current.auth.vault.getLatestResourceKey(
+                  hierarchyResource.resourceId,
+                )
+            if (!resolvedBody) {
+              throw new Error('The assigned task body key is unavailable')
+            }
             return [
               ...headerEnvelopes,
               ...(await buildResourceKeyEnvelopes(current.auth.vault, {
                 projectId: state.selectedProjectId as Uuid,
                 resourceId: hierarchyResource.resourceId,
-                resourceKey: bodyKey,
-                recipientIdentityId: state.session?.identity_id as Uuid,
+                resourceKey: resolvedBody.key,
+                recipientIdentityId: assigneeIdentityId,
                 packages,
+                epoch: resolvedBody.epoch,
               })),
             ]
           }),
@@ -2039,7 +2436,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           document: {
             schema: 1,
             assignment_id: assignmentId,
-            assignee_identity_id: state.session.identity_id,
+            assignee_identity_id: assigneeIdentityId,
           },
         },
       )
@@ -2049,7 +2446,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         {
           assignment_id: assignmentId,
           permission_grant_id: crypto.randomUUID(),
-          assignee_identity_id: state.session.identity_id,
+          assignee_identity_id: assigneeIdentityId,
           encrypted_payload_b64: encodePayloadContainer(
             encryptedAssignment,
           ),
@@ -2069,6 +2466,91 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         lockedTasks: state.lockedTasks,
       })
       dispatch({ type: 'select-task', taskId: task.id })
+      if (input.requiredAttachments?.length) {
+        const attachmentResourceKey = current.auth.vault.getResourceKey(
+          task.resource_node_id,
+          task.key_epoch,
+        )
+        if (!attachmentResourceKey) {
+          throw new Error('The new task key is unavailable for attachments')
+        }
+        for (const file of input.requiredAttachments) {
+          const attachmentId = crypto.randomUUID()
+          const blobId = crypto.randomUUID()
+          const ciphertext = await encryptAttachment(
+            file,
+            attachmentResourceKey,
+            {
+              projectId: state.selectedProjectId,
+              resourceId: task.resource_node_id,
+              blobId,
+              keyEpoch: task.key_epoch,
+            },
+          )
+          await writeEncryptedAttachment(blobId, ciphertext)
+          const [ciphertextSha256, encryptedBlobMetadata, encryptedMetadata] =
+            await Promise.all([
+              attachmentCiphertextSha256(ciphertext),
+              encryptExistingResource(current.auth.vault, {
+                projectId: state.selectedProjectId,
+                resourceId: task.resource_node_id,
+                kind: 'attachment',
+                aggregateVersion: 0,
+                keyEpoch: task.key_epoch,
+                document: {
+                  schema: 1,
+                  format: 'sprout-attachment-v1',
+                  plaintext_size: file.size,
+                },
+              }),
+              encryptExistingResource(current.auth.vault, {
+                projectId: state.selectedProjectId,
+                resourceId: task.resource_node_id,
+                kind: 'attachment',
+                aggregateVersion: 0,
+                keyEpoch: task.key_epoch,
+                document: {
+                  schema: 1,
+                  file_name: file.name,
+                  content_type: file.type || 'application/octet-stream',
+                } satisfies AttachmentDocument,
+              }),
+            ])
+          const declaration = await api.declareTaskRequiredAttachment(
+            state.selectedProjectId,
+            task.id,
+            {
+              id: attachmentId,
+              source_template_attachment_id: null,
+              blob: {
+                blob_id: blobId,
+                resource_node_id: task.resource_node_id,
+                ciphertext_size: ciphertext.size,
+                ciphertext_sha256: ciphertextSha256,
+                key_epoch: task.key_epoch,
+                encrypted_blob_metadata: encryptedBlobMetadata,
+                encrypted_attachment_metadata: encryptedMetadata,
+              },
+              idempotency_key: crypto.randomUUID(),
+            },
+          )
+          await api.uploadAttachmentCiphertext(
+            state.selectedProjectId,
+            blobId,
+            await readEncryptedAttachment(blobId),
+            declaration.upload_url,
+          )
+          await api.finalizeAttachment(state.selectedProjectId, blobId)
+        }
+        await refreshTaskAttachments(task.id)
+        dispatch({
+          type: 'set-notice',
+          message:
+            input.requiredAttachments.length === 1
+              ? 'Task creato con 1 allegato.'
+              : `Task creato con ${input.requiredAttachments.length} allegati.`,
+        })
+      }
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
     }
@@ -2076,7 +2558,14 @@ const App = ({ apiClient, initialSession }: AppProps) => {
 
   const updateTask = async (
     task: DecryptedTask,
-    input: { title: string; notes?: string },
+    input: {
+      title: string
+      notes?: string
+      priority?: TaskDocument['priority']
+      start_at?: string
+      due_at?: string
+      recurrence?: TaskDocument['recurrence']
+    },
   ) => {
     const actorIdentityId =
       state.session?.identity_id ?? state.localAccess?.identityId
@@ -2096,10 +2585,31 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         ...task.document,
         title: input.title,
         notes: input.notes,
+        ...(input.priority !== undefined ? { priority: input.priority } : {}),
+        ...(input.start_at !== undefined ? { start_at: input.start_at } : {}),
+        ...(input.due_at !== undefined ? { due_at: input.due_at } : {}),
+        ...(input.recurrence !== undefined
+          ? { recurrence: input.recurrence }
+          : {}),
       }
-      const activeKey = current.auth.vault.getLatestResourceKey(
-        task.wire.resource_node_id,
-      )
+      if (document.due_at === undefined) {
+        delete document.start_at
+      }
+      const activeKey = state.session
+        ? await ensureActiveResourceKey(
+            api,
+            current,
+            state.session,
+            task.wire.project_id,
+            task.wire.resource_node_id,
+            task.wire.key_epoch,
+            'Missing active task resource key',
+          )
+        : resolveActiveResourceKey(
+            current.auth.vault,
+            task.wire.resource_node_id,
+            task.wire.key_epoch,
+          )
       if (!activeKey) throw new Error('Missing active task resource key')
       const payload = await encryptExistingResource(
         current.auth.vault,
@@ -2123,6 +2633,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           document: {
             schema: 1,
             priority: document.priority,
+            start_at: document.start_at,
             due_at: document.due_at,
             recurrence: document.recurrence,
           } satisfies TaskSelectedValueDocument,
@@ -2201,11 +2712,282 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         type: 'set-queue-count',
         count: await current.database.queueCount(),
       })
+    } catch (error) {
+      dispatch({ type: 'set-error', message: errorMessage(error) })
+    }
+  }
+
+  const assignTask = async (
+    task: DecryptedTask,
+    assigneeIdentityId: Uuid,
+  ) => {
+    if (!state.session || !state.selectedProjectId) {
       dispatch({
-        type: 'set-notice',
-        message: state.online && state.session
-          ? 'Encrypted task updated.'
-          : 'Dual-signed encrypted update queued; sync waits for server reauthentication.',
+        type: 'set-error',
+        message: 'Server sign-in is required to assign a task.',
+      })
+      return
+    }
+    if (task.wire.active_assignee_identity_id === assigneeIdentityId) {
+      return
+    }
+    try {
+      const current = requireServices()
+      const projectId = state.selectedProjectId
+      let workingTask = task
+
+      if (workingTask.wire.active_assignment_id) {
+        const listed = await api.listTaskAssignments(
+          projectId,
+          workingTask.wire.id,
+        )
+        const activeAssignment = listed.assignments.find(
+          (item) =>
+            item.id === listed.active_assignment_id &&
+            item.revoked_at == null,
+        )
+        if (!activeAssignment) {
+          throw new Error('Active task assignment is unavailable')
+        }
+        const [plan, revokePackages] = await Promise.all([
+          api.getResourceRotationPlan(
+            projectId,
+            workingTask.wire.resource_node_id,
+            activeAssignment.permission_root_grant_id,
+          ),
+          api.listProjectDevicePackages(projectId),
+        ])
+        if (plan.revoked_identity_id !== activeAssignment.assignee_identity_id) {
+          throw new Error('Assignment rotation plan identity mismatch')
+        }
+        const builtRotations: Awaited<
+          ReturnType<typeof buildResourceEpochRotation>
+        >[] = []
+        try {
+          for (const resource of plan.resources) {
+            const previousKeyCommitment = base64ToBytes(
+              resource.previous_key_commitment_b64,
+            )
+            const previousHeaderKeyCommitment =
+              resource.previous_header_key_commitment_b64 === null
+                ? undefined
+                : base64ToBytes(resource.previous_header_key_commitment_b64)
+            try {
+              builtRotations.push(
+                await buildResourceEpochRotation(current.auth.vault, {
+                  projectId,
+                  resourceId: resource.resource_id,
+                  previousEpochId: resource.previous_epoch_id,
+                  currentEpoch: resource.current_epoch,
+                  previousKeyCommitment,
+                  previousHeaderKeyCommitment,
+                  recipientIdentityIds: resource.recipient_identity_ids,
+                  bodyRecipientIdentityIds:
+                    resource.body_recipient_identity_ids,
+                  headerRecipientIdentityIds:
+                    resource.header_recipient_identity_ids,
+                  packages: revokePackages,
+                }),
+              )
+            } finally {
+              zeroBytes(previousKeyCommitment, previousHeaderKeyCommitment)
+            }
+          }
+          await api.revokeTaskAssignment(
+            projectId,
+            workingTask.wire.id,
+            activeAssignment.id,
+            {
+              rotations: builtRotations.map((item) => item.rotation),
+              idempotency_key: crypto.randomUUID(),
+            },
+          )
+          await Promise.all(
+            builtRotations.flatMap((item) => [
+              current.auth.vault.putResourceKey(
+                item.rotation.resource_id,
+                item.resourceKey,
+                item.rotation.new_epoch,
+              ),
+              ...(item.headerKey
+                ? [
+                    current.auth.vault.putResourceKey(
+                      item.rotation.resource_id,
+                      item.headerKey,
+                      item.rotation.new_epoch,
+                      'header',
+                    ),
+                  ]
+                : []),
+            ]),
+          )
+          const rotatedTask = builtRotations.find(
+            (item) =>
+              item.rotation.resource_id === workingTask.wire.resource_node_id,
+          )
+          workingTask = {
+            ...workingTask,
+            wire: {
+              ...workingTask.wire,
+              active_assignment_id: null,
+              active_assignee_identity_id: null,
+              key_epoch:
+                rotatedTask?.rotation.new_epoch ?? workingTask.wire.key_epoch,
+            },
+          }
+        } finally {
+          zeroBytes(
+            ...builtRotations.flatMap((item) => [
+              item.resourceKey,
+              item.headerKey,
+            ]),
+          )
+        }
+      }
+
+      const list = state.taskLists.find(
+        (candidate) => candidate.wire.id === workingTask.wire.list_id,
+      )
+      if (!list) throw new Error('Task list is unavailable for assignment')
+      const topic = state.topics.find(
+        (candidate) => candidate.wire.id === list.wire.topic_id,
+      )
+      if (!topic) throw new Error('Task topic is unavailable for assignment')
+      const packages = await api.listProjectDevicePackages(projectId)
+      const assignmentId = crypto.randomUUID()
+      const latestTaskBody = current.auth.vault.getLatestResourceKey(
+        workingTask.wire.resource_node_id,
+      )
+      const taskBodyEpoch =
+        latestTaskBody?.epoch ?? workingTask.wire.key_epoch
+      const hierarchyResources = [
+        {
+          resourceId: topic.wire.resource_node_id,
+          epoch: topic.wire.key_epoch,
+          body: false,
+        },
+        {
+          resourceId: list.wire.resource_node_id,
+          epoch: list.wire.key_epoch,
+          body: false,
+        },
+        {
+          resourceId: workingTask.wire.resource_node_id,
+          epoch: taskBodyEpoch,
+          body: true,
+        },
+      ]
+      const missingHierarchyHeader = hierarchyResources.some(
+        (item) =>
+          !resolveHierarchyHeaderKey(
+            current.auth.vault,
+            item.resourceId,
+            item.epoch,
+          ),
+      )
+      if (missingHierarchyHeader) {
+        await recoverProjectResourceKeys(
+          api,
+          current,
+          projectId,
+          state.session.identity_id,
+        )
+        if (import.meta.env.DEV) {
+          persistDevVault(state.session, current.auth.vault)
+        }
+      }
+      const assignmentEnvelopes = (
+        await Promise.all(
+          hierarchyResources.map(async (hierarchyResource) => {
+            const resolvedHeader = resolveHierarchyHeaderKey(
+              current.auth.vault,
+              hierarchyResource.resourceId,
+              hierarchyResource.epoch,
+            )
+            if (!resolvedHeader) {
+              throw new Error(
+                'A hierarchy header key is unavailable for task assignment',
+              )
+            }
+            const headerEnvelopes = await buildResourceKeyEnvelopes(
+              current.auth.vault,
+              {
+                projectId,
+                resourceId: hierarchyResource.resourceId,
+                resourceKey: resolvedHeader.key,
+                keyPurpose: 'header',
+                recipientIdentityId: assigneeIdentityId,
+                packages,
+                epoch: resolvedHeader.epoch,
+              },
+            )
+            if (!hierarchyResource.body) return headerEnvelopes
+            const exactBody = current.auth.vault.getResourceKey(
+              hierarchyResource.resourceId,
+              hierarchyResource.epoch,
+            )
+            const resolvedBody = exactBody
+              ? { epoch: hierarchyResource.epoch, key: exactBody }
+              : current.auth.vault.getLatestResourceKey(
+                  hierarchyResource.resourceId,
+                )
+            if (!resolvedBody) {
+              throw new Error('The assigned task body key is unavailable')
+            }
+            return [
+              ...headerEnvelopes,
+              ...(await buildResourceKeyEnvelopes(current.auth.vault, {
+                projectId,
+                resourceId: hierarchyResource.resourceId,
+                resourceKey: resolvedBody.key,
+                recipientIdentityId: assigneeIdentityId,
+                packages,
+                epoch: resolvedBody.epoch,
+              })),
+            ]
+          }),
+        )
+      ).flat()
+      const encryptedAssignment = await encryptExistingResource(
+        current.auth.vault,
+        {
+          projectId,
+          resourceId: workingTask.wire.resource_node_id,
+          kind: 'task',
+          aggregateVersion: INITIAL_PAYLOAD_VERSION,
+          document: {
+            schema: 1,
+            assignment_id: assignmentId,
+            assignee_identity_id: assigneeIdentityId,
+          },
+        },
+      )
+      const { assignment } = await api.assignTask(
+        projectId,
+        workingTask.wire.id,
+        {
+          assignment_id: assignmentId,
+          permission_grant_id: crypto.randomUUID(),
+          assignee_identity_id: assigneeIdentityId,
+          encrypted_payload_b64: encodePayloadContainer(encryptedAssignment),
+          envelopes: assignmentEnvelopes,
+          idempotency_key: crypto.randomUUID(),
+        },
+      )
+      const updatedTask: TaskDto = {
+        ...workingTask.wire,
+        active_assignment_id: assignment.id,
+        active_assignee_identity_id: assignment.assignee_identity_id,
+      }
+      await putRestRecord(current.database, taskRecord(updatedTask))
+      dispatch({
+        type: 'set-tasks',
+        tasks: state.tasks.map((item) =>
+          item.wire.id === workingTask.wire.id
+            ? { ...item, wire: updatedTask }
+            : item,
+        ),
+        lockedTasks: state.lockedTasks,
       })
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
@@ -3372,47 +4154,100 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     }
   }
 
-  const refreshTaskAttachments = async (taskId: Uuid) => {
-    if (!state.selectedProjectId) return
-    try {
-      const loadAll = async (
-        loadPage: (
-          cursor?: string,
-        ) => Promise<{
-          attachments: AttachmentCollectionItemDto[]
-          next_cursor: string | null
-        }>,
-      ) => {
-        const values: AttachmentCollectionItemDto[] = []
-        let cursor: string | undefined
-        do {
-          const page = await loadPage(cursor)
-          values.push(...page.attachments)
-          cursor = page.next_cursor ?? undefined
-        } while (cursor)
-        return values
-      }
-      const [required, completed] = await Promise.all([
-        loadAll((cursor) =>
-          api.listTaskRequiredAttachments(
-            state.selectedProjectId as Uuid,
-            taskId,
-            cursor,
-          ),
-        ),
-        loadAll((cursor) =>
-          api.listTaskCompletedAttachments(
-            state.selectedProjectId as Uuid,
-            taskId,
-            cursor,
-          ),
-        ),
-      ])
-      setAttachments([...required, ...completed])
-    } catch (error) {
-      dispatch({ type: 'set-error', message: errorMessage(error) })
-    }
-  }
+  const refreshTaskAttachments = useCallback(
+    async (taskId: Uuid) => {
+      if (!state.selectedProjectId) return
+      const inFlight = attachmentRefreshInFlight.current.get(taskId)
+      if (inFlight) return inFlight
+
+      const refresh = (async () => {
+        try {
+          const projectId = state.selectedProjectId as Uuid
+          const loadAll = async (
+            loadPage: (
+              cursor?: string,
+            ) => Promise<{
+              attachments: AttachmentCollectionItemDto[]
+              next_cursor: string | null
+            }>,
+          ) => {
+            const values: AttachmentCollectionItemDto[] = []
+            let cursor: string | undefined
+            do {
+              const page = await loadPage(cursor)
+              values.push(...page.attachments)
+              cursor = page.next_cursor ?? undefined
+            } while (cursor)
+            return values
+          }
+          const [required, completed] = await Promise.all([
+            loadAll((cursor) =>
+              api.listTaskRequiredAttachments(projectId, taskId, cursor),
+            ),
+            loadAll((cursor) =>
+              api.listTaskCompletedAttachments(projectId, taskId, cursor),
+            ),
+          ])
+          const nextAttachments = [...required, ...completed]
+          setAttachments(nextAttachments)
+
+          let current: Services | undefined
+          try {
+            current = requireServices()
+          } catch {
+            current = undefined
+          }
+          if (!current) return
+
+          const labels = await Promise.all(
+            nextAttachments.map(async (item) => {
+              if (!item.encrypted_metadata) {
+                return [item.id, 'Allegato'] as const
+              }
+              try {
+                const resourceKey = current.auth.vault.getResourceKey(
+                  item.resource_node_id,
+                  item.key_epoch,
+                )
+                if (!resourceKey) {
+                  return [item.id, 'Allegato'] as const
+                }
+                const metadata = await decryptDocument<AttachmentDocument>(
+                  item.encrypted_metadata,
+                  {
+                    projectId: item.project_id,
+                    resourceId: item.resource_node_id,
+                    kind: 'attachment',
+                    aggregateVersion: 0,
+                    keyEpoch: item.key_epoch,
+                    resourceKey,
+                  },
+                )
+                return [item.id, metadata.file_name] as const
+              } catch {
+                return [item.id, 'Allegato'] as const
+              }
+            }),
+          )
+          setAttachmentLabels((previous) => {
+            const next = { ...previous }
+            for (const [id, label] of labels) {
+              next[id] = label
+            }
+            return next
+          })
+        } catch (error) {
+          dispatch({ type: 'set-error', message: errorMessage(error) })
+        } finally {
+          attachmentRefreshInFlight.current.delete(taskId)
+        }
+      })()
+
+      attachmentRefreshInFlight.current.set(taskId, refresh)
+      return refresh
+    },
+    [api, dispatch, state.selectedProjectId],
+  )
 
   const uploadCompletedAttachment = async (
     task: DecryptedTask,
@@ -4227,6 +5062,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     setTaskQuestionnaireVersion(undefined)
     setQuestionnaireSubmission(undefined)
     setAttachments([])
+    setAttachmentLabels({})
     dispatch({ type: 'logout' })
   }
 
@@ -4428,6 +5264,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             lockedTasks={state.lockedTasks}
             boardMembers={state.boardMembers}
             boardFocus={state.boardFocus}
+            boardViewMode={state.boardViewMode}
             selectedTopicId={state.selectedTopicId}
             selectedListId={state.selectedListId}
             selectedTaskId={state.selectedTaskId}
@@ -4439,6 +5276,9 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             onSelectFocus={(focus: BoardFocus) =>
               dispatch({ type: 'set-board-focus', focus })
             }
+            onBoardViewModeChange={(mode: BoardViewMode) =>
+              dispatch({ type: 'set-board-view-mode', mode })
+            }
             onSelectList={(listId) =>
               dispatch({ type: 'select-list', listId })
             }
@@ -4449,11 +5289,21 @@ const App = ({ apiClient, initialSession }: AppProps) => {
               dispatch({ type: 'set-task-filter', filter })
             }
             onCreateTopic={createTopic}
+            onRenameTopic={renameTopic}
+            onToggleTopicFavorite={toggleTopicFavorite}
+            onDeleteTopic={deleteTopic}
             onCreateList={createTaskList}
+            onUpdateTaskList={updateTaskList}
             onCreateTask={createTask}
             onUpdateTask={updateTask}
+            onAssignTask={assignTask}
             onCompleteTask={completeTask}
             onCopyTask={copyTask}
+            onInviteMember={inviteProjectParticipant}
+            taskAttachments={attachments}
+            taskAttachmentLabels={attachmentLabels}
+            onRefreshTaskAttachments={refreshTaskAttachments}
+            onDownloadTaskAttachment={downloadAttachment}
           />
         )}
         {state.screen !== 'tasks' && (

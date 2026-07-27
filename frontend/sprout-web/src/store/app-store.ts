@@ -55,8 +55,30 @@ export interface BoardMember {
 
 export type BoardFocus =
   | { type: 'generali' }
+  | { type: 'members' }
   | { type: 'member'; identityId: Uuid }
   | { type: 'topic'; topicId: Uuid }
+
+export type BoardViewMode = 'board' | 'timeline'
+
+const BOARD_VIEW_MODE_KEY = 'sprout-board-view-mode'
+
+export const readBoardViewMode = (): BoardViewMode => {
+  try {
+    const value = localStorage.getItem(BOARD_VIEW_MODE_KEY)
+    return value === 'timeline' ? 'timeline' : 'board'
+  } catch {
+    return 'board'
+  }
+}
+
+export const persistBoardViewMode = (mode: BoardViewMode): void => {
+  try {
+    localStorage.setItem(BOARD_VIEW_MODE_KEY, mode)
+  } catch {
+    // ignore storage failures
+  }
+}
 
 export interface AppState {
   session?: SessionResponse
@@ -78,6 +100,7 @@ export interface AppState {
   lockedTasks: TaskDto[]
   boardMembers: BoardMember[]
   boardFocus: BoardFocus
+  boardViewMode: BoardViewMode
   selectedProjectId?: Uuid
   selectedTopicId?: Uuid
   selectedListId?: Uuid
@@ -127,6 +150,7 @@ export type AppAction =
   | { type: 'set-topics'; topics: TopicItem[] }
   | { type: 'select-topic'; topicId: Uuid }
   | { type: 'set-board-focus'; focus: BoardFocus }
+  | { type: 'set-board-view-mode'; mode: BoardViewMode }
   | { type: 'set-board-members'; members: BoardMember[] }
   | { type: 'set-task-lists'; taskLists: TaskListItem[] }
   | { type: 'select-list'; listId: Uuid }
@@ -149,6 +173,7 @@ export const createInitialAppState = (): AppState => ({
   lockedTasks: [],
   boardMembers: [],
   boardFocus: { type: 'generali' },
+  boardViewMode: readBoardViewMode(),
   taskFilter: 'open',
   loading: false,
   online: typeof navigator === 'undefined' ? true : navigator.onLine,
@@ -235,6 +260,7 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
         ...state,
         selectedProjectId: action.projectId,
         boardFocus: { type: 'generali' },
+        boardViewMode: 'board',
         boardMembers: [],
         selectedTopicId: undefined,
         selectedListId: undefined,
@@ -275,6 +301,9 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
         selectedTaskId: undefined,
       }
     }
+    case 'set-board-view-mode':
+      persistBoardViewMode(action.mode)
+      return { ...state, boardViewMode: action.mode }
     case 'set-board-members':
       return { ...state, boardMembers: action.members }
     case 'set-task-lists':
@@ -305,7 +334,7 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
           state.selectedTaskId &&
           action.tasks.some((task) => task.wire.id === state.selectedTaskId)
             ? state.selectedTaskId
-            : action.tasks[0]?.wire.id,
+            : undefined,
         loading: false,
       }
     case 'select-task':

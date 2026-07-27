@@ -14,7 +14,7 @@ export interface ThreePretaskPresetInput {
   deadlineDueAt: string
   recurringTitle: string
   recurringDueAt: string
-  frequency: 'daily' | 'weekly' | 'monthly'
+  frequency: 'minutes' | 'daily' | 'weekly' | 'monthly'
   interval: number
 }
 

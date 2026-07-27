@@ -10,6 +10,7 @@ import {
   mergeDevResourceKeysIntoSnapshot,
   persistDevVault,
   purgeZeroDevResourceKeys,
+  restoreDevResourceKeys,
 } from './dev-resource-keys'
 import { loadDevSession } from './dev-session'
 import { KeyVault, type DevVaultSnapshot } from './key-vault'
@@ -62,6 +63,63 @@ describe('dev resource key backup', () => {
     vault.clearMemory()
     vault.setSessionSecrets(crypto.randomUUID(), secrets(), identityId)
     expect(vault.getResourceKey(resourceId, 1)).toEqual(key)
+  })
+
+  it('backs up header keys and serves them via getHeaderKey after clear', async () => {
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const identityId = crypto.randomUUID()
+    const resourceId = crypto.randomUUID()
+    const bodyKey = crypto.getRandomValues(new Uint8Array(32))
+    const headerKey = crypto.getRandomValues(new Uint8Array(32))
+    const session: SessionResponse = {
+      token: 't',
+      identity_id: identityId,
+      device_id: crypto.randomUUID(),
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    }
+
+    vault.setSessionSecrets(session.device_id, secrets(), identityId)
+    await vault.putResourceKey(resourceId, bodyKey, 1, 'body')
+    await vault.putResourceKey(resourceId, headerKey, 1, 'header')
+    persistDevVault(session, vault)
+
+    vault.clearMemory()
+    vault.setSessionSecrets(session.device_id, secrets(), identityId)
+    expect(vault.getResourceKey(resourceId, 1)).toEqual(bodyKey)
+    expect(vault.getHeaderKey(resourceId, 1)).toEqual(headerKey)
+    expect(vault.getLatestResourceKey(resourceId)).toEqual({
+      epoch: 1,
+      key: bodyKey,
+    })
+    expect(vault.getLatestHeaderKey(resourceId)).toEqual({
+      epoch: 1,
+      key: headerKey,
+    })
+    expect(countDevResourceKeyBackup(identityId)).toBe(2)
+  })
+
+  it('restoreDevResourceKeys reloads header purpose slots into the vault', async () => {
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const identityId = crypto.randomUUID()
+    const resourceId = crypto.randomUUID()
+    const headerKey = crypto.getRandomValues(new Uint8Array(32))
+
+    storage.set(
+      'sprout-dev-resource-keys',
+      JSON.stringify({
+        [identityId]: {
+          [`header:${resourceId}:1`]: bytesToBase64(headerKey),
+        },
+      }),
+    )
+
+    vault.setSessionSecrets(crypto.randomUUID(), secrets(), identityId)
+    const restored = await restoreDevResourceKeys(identityId, vault)
+    expect(restored).toBe(1)
+    expect(vault.getHeaderKey(resourceId, 1)).toEqual(headerKey)
+    expect(vault.getLatestHeaderKey(resourceId)?.epoch).toBe(1)
   })
 
   it('merges backup into snapshots synchronously', () => {

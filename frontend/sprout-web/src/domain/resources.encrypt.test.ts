@@ -67,4 +67,50 @@ describe('createEncryptedResource key lifetime', () => {
     expect(keySeenDuringEncrypt).toBeDefined()
     expect(keySeenDuringEncrypt!.some((byte) => byte !== 0)).toBe(true)
   })
+
+  it('awaits header encrypt before finally zeroBytes', async () => {
+    let keySeenDuringEncrypt: number[] | undefined
+    vi.doMock('../security/wasm', async () => {
+      const actual =
+        await vi.importActual<typeof import('../security/wasm')>(
+          '../security/wasm',
+        )
+      return {
+        ...actual,
+        encryptDocument: async (
+          _document: unknown,
+          options: { resourceKey: Uint8Array },
+        ) => {
+          await Promise.resolve()
+          keySeenDuringEncrypt = [...options.resourceKey]
+          return {
+            key_id: 'k',
+            algorithm: 'test',
+            nonce_b64: 'n',
+            ciphertext_b64: 'c',
+          }
+        },
+      }
+    })
+
+    const { createEncryptedResourceHeader } = await import('./resources')
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const resourceId = crypto.randomUUID()
+    vault.setSessionSecrets(crypto.randomUUID(), secrets(), crypto.randomUUID())
+
+    await createEncryptedResourceHeader(vault, {
+      projectId: crypto.randomUUID(),
+      resourceId,
+      kind: 'topic',
+      aggregateVersion: 1,
+      document: { schema: 1, name: 'x' },
+    })
+
+    expect(keySeenDuringEncrypt).toBeDefined()
+    expect(keySeenDuringEncrypt!.some((byte) => byte !== 0)).toBe(true)
+    expect(vault.getHeaderKey(resourceId)?.some((byte) => byte !== 0)).toBe(
+      true,
+    )
+  })
 })

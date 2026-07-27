@@ -158,7 +158,10 @@ export class ApiClient {
       }
       throw new ApiError(
         response.status,
-        serverMessage ?? `Request failed with status ${response.status}`,
+        serverMessage ??
+          (response.status === 429
+            ? 'Troppe richieste, riprova tra qualche secondo'
+            : `Request failed with status ${response.status}`),
         payload,
       )
     }
@@ -462,6 +465,23 @@ export class ApiClient {
     })
   }
 
+  updateTopic(
+    projectId: Uuid,
+    topicId: Uuid,
+    body: unknown,
+  ): Promise<{ topic: TopicDto }> {
+    return this.request(`/v1/projects/${projectId}/topics/${topicId}`, {
+      method: 'PUT',
+      body,
+    })
+  }
+
+  deleteTopic(projectId: Uuid, topicId: Uuid): Promise<void> {
+    return this.request(`/v1/projects/${projectId}/topics/${topicId}`, {
+      method: 'DELETE',
+    })
+  }
+
   listTaskLists(
     projectId: Uuid,
     topicId: Uuid,
@@ -482,6 +502,17 @@ export class ApiClient {
     )
   }
 
+  updateTaskList(
+    projectId: Uuid,
+    listId: Uuid,
+    body: unknown,
+  ): Promise<{ task_list: TaskListDto }> {
+    return this.request(`/v1/projects/${projectId}/task-lists/${listId}`, {
+      method: 'PUT',
+      body,
+    })
+  }
+
   listTasks(projectId: Uuid, listId: Uuid): Promise<ListTasksResponse> {
     return this.request(
       `/v1/projects/${projectId}/task-lists/${listId}/tasks`,
@@ -493,6 +524,18 @@ export class ApiClient {
       method: 'POST',
       body,
     })
+  }
+
+  listTaskAssignments(
+    projectId: Uuid,
+    taskId: Uuid,
+  ): Promise<{
+    assignments: AssignmentDto[]
+    active_assignment_id: Uuid | null
+  }> {
+    return this.request(
+      `/v1/projects/${projectId}/tasks/${taskId}/assignments`,
+    )
   }
 
   assignTask(
@@ -510,6 +553,21 @@ export class ApiClient {
     return this.request(
       `/v1/projects/${projectId}/tasks/${taskId}/assignments`,
       { method: 'POST', body: input },
+    )
+  }
+
+  revokeTaskAssignment(
+    projectId: Uuid,
+    taskId: Uuid,
+    assignmentId: Uuid,
+    input: {
+      rotations: ResourceEpochRotationDto[]
+      idempotency_key: Uuid
+    },
+  ): Promise<{ assignment: AssignmentDto }> {
+    return this.request(
+      `/v1/projects/${projectId}/tasks/${taskId}/assignments/${assignmentId}`,
+      { method: 'DELETE', body: input },
     )
   }
 

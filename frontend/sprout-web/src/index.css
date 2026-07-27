@@ -12,9 +12,20 @@
   --sprout-soft: #e4eee5;
   --leaf: #72a05f;
   --danger: #a24032;
+  --danger-vivid: #ef4444;
   --danger-soft: #f9e8e4;
   --warning: #8a5a24;
   --warning-soft: #f7eddd;
+  --priority-low: #9ca3af;
+  --priority-normal: #eab308;
+  --priority-high: var(--danger-vivid);
+  --priority-low-fg: var(--priority-low);
+  --priority-low-bg: var(--surface-hover);
+  --priority-low-border: var(--border-neutral);
+  --priority-normal-fg: var(--priority-normal);
+  --priority-normal-bg: #fefce8;
+  --priority-high-fg: var(--priority-high);
+  --priority-high-bg: #fef2f2;
   --sans:
     "Helvetica Neue", Helvetica, -apple-system, BlinkMacSystemFont, "Segoe UI",
     Arial, sans-serif;
@@ -25,6 +36,22 @@
   --surface-main: #fcfcfc;
   --surface-panel: #f5f4f2;
   --surface-card: #ffffff;
+  --surface-sidebar-control: color-mix(
+    in srgb,
+    var(--surface-interactive-subtle) 5%,
+    var(--surface-main)
+  );
+  --surface-sidebar-control-hover: color-mix(
+    in srgb,
+    var(--surface-interactive-subtle) 9%,
+    var(--surface-main)
+  );
+  --surface-sidebar-control-active: color-mix(
+    in srgb,
+    var(--surface-interactive-subtle) 18%,
+    var(--surface-main)
+  );
+  --border-sidebar-control: var(--border-subtle-faint);
   --border-neutral: #ebebeb;
   --text-primary: #374151;
   --text-muted: #9ca3af;
@@ -40,7 +67,8 @@
   --radius-avatar: 50%;
   --border-width-tactical: 1px;
   --shadow-card: 0 1px 2px rgb(0 0 0 / 3%);
-  --board-column-width: 17.5rem;
+  --board-column-width: 20rem;
+  --task-create-panel-width: min(46rem, calc(100vw - 3rem));
 
   /* Interactive / board semantic tokens */
   --text-board: #37352f;
@@ -72,10 +100,117 @@
   --overlay-detail: rgb(28 25 23 / 25%);
   --shadow-popover: 0 8px 24px rgb(15 23 42 / 10%);
   --shadow-drawer: -8px 0 32px rgb(28 25 23 / 10%);
+  --task-create-surface: #ffffff;
+  --task-create-comment-bg: #f2f2f2;
   --surface-interactive-subtle: rgb(55 53 47 / 6%);
+  --surface-timeline-header: var(--surface-panel);
+  --surface-timeline-header-alt: var(--surface-panel);
+  --surface-timeline-cell: color-mix(
+    in srgb,
+    var(--surface-interactive-subtle) 48%,
+    var(--surface-main)
+  );
+  --surface-timeline-cell-alt: color-mix(
+    in srgb,
+    var(--surface-interactive-subtle) 28%,
+    var(--surface-main)
+  );
+  --surface-timeline-card: color-mix(
+    in srgb,
+    var(--surface-timeline-cell) 14%,
+    var(--surface-card)
+  );
+  --surface-timeline-card-hover: color-mix(
+    in srgb,
+    var(--surface-hover-soft) 42%,
+    var(--surface-timeline-card)
+  );
+  --surface-timeline-card-selected: color-mix(
+    in srgb,
+    var(--surface-active) 48%,
+    var(--surface-timeline-card)
+  );
+  --shadow-timeline-card:
+    0 1px 2px color-mix(in srgb, var(--text-primary) 5%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--border-neutral) 58%, transparent);
+  --shadow-timeline-card-hover:
+    0 2px 4px color-mix(in srgb, var(--text-primary) 7%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--border-neutral) 72%, transparent);
+  --surface-timeline-label: var(--surface-main);
   --on-accent: #fff;
   --surface-limitations: #fefce8;
   --surface-limitations-border: #f0e4cf;
+
+  /* Shared icon palette */
+  --palette-1: #a9b0b7;
+  --palette-2: #939eb0;
+  --palette-3: #5f70d1;
+  --palette-4: #27b6d0;
+  --palette-5: #4fb787;
+  --palette-6: #f1c40f;
+  --palette-7: #f29c4f;
+  --palette-8: #d2a3a1;
+  --palette-9: #f25e5c;
+  --avatar-on-light: #ffffff;
+  --avatar-on-dark: #374151;
+  --avatar-on-neutral: #5c6370;
+  --avatar-tint-base: #ffffff;
+  --avatar-shade-base: #111111;
+
+  /* Avatar tokens — pale bg/fg for cards; icon-bg/icon-fg for sidebar circles */
+  --avatar-member-bg: color-mix(in srgb, var(--palette-3) 16%, var(--avatar-tint-base));
+  --avatar-member-fg: color-mix(in srgb, var(--palette-3) 72%, var(--avatar-shade-base));
+  --avatar-member-icon-bg: var(--palette-3);
+  --avatar-member-icon-fg: var(--avatar-on-light);
+  --avatar-generali-bg: color-mix(in srgb, var(--palette-2) 16%, var(--avatar-tint-base));
+  --avatar-generali-fg: color-mix(in srgb, var(--palette-2) 72%, var(--avatar-shade-base));
+  --avatar-generali-icon-bg: var(--palette-2);
+  --avatar-generali-icon-fg: var(--avatar-on-light);
+  --avatar-topic-purple-bg: color-mix(in srgb, var(--palette-3) 16%, var(--avatar-tint-base));
+  --avatar-topic-purple-fg: color-mix(in srgb, var(--palette-3) 72%, var(--avatar-shade-base));
+  --avatar-topic-purple-icon-bg: var(--palette-3);
+  --avatar-topic-purple-icon-fg: var(--avatar-on-light);
+  --avatar-topic-cyan-bg: color-mix(in srgb, var(--palette-4) 16%, var(--avatar-tint-base));
+  --avatar-topic-cyan-fg: color-mix(in srgb, var(--palette-4) 72%, var(--avatar-shade-base));
+  --avatar-topic-cyan-icon-bg: var(--palette-4);
+  --avatar-topic-cyan-icon-fg: var(--avatar-on-light);
+  --avatar-topic-green-bg: color-mix(in srgb, var(--palette-5) 16%, var(--avatar-tint-base));
+  --avatar-topic-green-fg: color-mix(in srgb, var(--palette-5) 72%, var(--avatar-shade-base));
+  --avatar-topic-green-icon-bg: var(--palette-5);
+  --avatar-topic-green-icon-fg: var(--avatar-on-light);
+  --avatar-topic-orange-bg: color-mix(in srgb, var(--palette-7) 16%, var(--avatar-tint-base));
+  --avatar-topic-orange-fg: color-mix(in srgb, var(--palette-7) 72%, var(--avatar-shade-base));
+  --avatar-topic-orange-icon-bg: var(--palette-7);
+  --avatar-topic-orange-icon-fg: var(--avatar-on-light);
+  --avatar-column-bg: color-mix(in srgb, var(--palette-1) 55%, var(--avatar-tint-base));
+  --avatar-column-fg: var(--avatar-on-neutral);
+  --avatar-column-white-bg: color-mix(in srgb, var(--palette-1) 16%, var(--avatar-tint-base));
+  --avatar-column-white-icon-bg: var(--palette-1);
+  --avatar-column-white-icon-fg: var(--avatar-on-light);
+  --avatar-column-slate-bg: color-mix(in srgb, var(--palette-2) 16%, var(--avatar-tint-base));
+  --avatar-column-slate-icon-bg: var(--palette-2);
+  --avatar-column-slate-icon-fg: var(--avatar-on-light);
+  --avatar-column-blue-bg: color-mix(in srgb, var(--palette-3) 16%, var(--avatar-tint-base));
+  --avatar-column-blue-icon-bg: var(--palette-3);
+  --avatar-column-blue-icon-fg: var(--avatar-on-light);
+  --avatar-column-sand-bg: color-mix(in srgb, var(--palette-4) 16%, var(--avatar-tint-base));
+  --avatar-column-sand-icon-bg: var(--palette-4);
+  --avatar-column-sand-icon-fg: var(--avatar-on-light);
+  --avatar-column-emerald-bg: color-mix(in srgb, var(--palette-5) 16%, var(--avatar-tint-base));
+  --avatar-column-emerald-icon-bg: var(--palette-5);
+  --avatar-column-emerald-icon-fg: var(--avatar-on-light);
+  --avatar-column-violet-bg: color-mix(in srgb, var(--palette-6) 16%, var(--avatar-tint-base));
+  --avatar-column-violet-icon-bg: var(--palette-6);
+  --avatar-column-violet-icon-fg: var(--avatar-on-dark);
+  --avatar-column-peach-bg: color-mix(in srgb, var(--palette-7) 16%, var(--avatar-tint-base));
+  --avatar-column-peach-icon-bg: var(--palette-7);
+  --avatar-column-peach-icon-fg: var(--avatar-on-light);
+  --avatar-column-mauve-bg: color-mix(in srgb, var(--palette-8) 16%, var(--avatar-tint-base));
+  --avatar-column-mauve-icon-bg: var(--palette-8);
+  --avatar-column-mauve-icon-fg: var(--avatar-on-dark);
+  --avatar-column-rose-bg: color-mix(in srgb, var(--palette-9) 16%, var(--avatar-tint-base));
+  --avatar-column-rose-icon-bg: var(--palette-9);
+  --avatar-column-rose-icon-fg: var(--avatar-on-light);
 
   color: var(--ink);
   background: var(--canvas);
@@ -173,14 +308,27 @@ ul {
   --sprout-soft: #2a3d2f;
   --leaf: #86b872;
   --danger: #f87171;
+  --danger-vivid: #ef4444;
   --danger-soft: #3d2420;
   --warning: #fbbf24;
   --warning-soft: #3d3020;
+  --priority-low: #9ca3af;
+  --priority-normal: #eab308;
+  --priority-high: var(--danger-vivid);
+  --priority-low-fg: var(--priority-low);
+  --priority-low-bg: var(--surface-hover);
+  --priority-low-border: var(--border-neutral);
+  --priority-normal-fg: var(--priority-normal);
+  --priority-normal-bg: #3d3520;
+  --priority-high-fg: var(--priority-high);
+  --priority-high-bg: #3d2020;
 
   --surface-sidebar: #252525;
   --surface-main: #1e1e1e;
   --surface-panel: #2d2d2d;
-  --surface-card: #333333;
+  --surface-card: #3d3d3d;
+  --task-create-surface: #2d2d2d;
+  --task-create-comment-bg: #383838;
   --border-neutral: #404040;
   --text-primary: #e5e5e5;
   --text-muted: #9ca3af;
@@ -219,8 +367,71 @@ ul {
   --shadow-popover: 0 8px 24px rgb(0 0 0 / 35%);
   --shadow-drawer: -8px 0 32px rgb(0 0 0 / 35%);
   --surface-interactive-subtle: rgb(255 255 255 / 6%);
+  --surface-timeline-header: var(--surface-card);
+  --surface-timeline-header-alt: color-mix(
+    in srgb,
+    var(--surface-interactive-subtle) 5%,
+    var(--surface-card)
+  );
+  --surface-timeline-label: var(--surface-main);
+  --surface-timeline-cell: color-mix(
+    in srgb,
+    var(--surface-interactive-subtle) 48%,
+    var(--surface-main)
+  );
+  --surface-timeline-cell-alt: color-mix(
+    in srgb,
+    var(--surface-interactive-subtle) 28%,
+    var(--surface-main)
+  );
+  --surface-timeline-card: color-mix(
+    in srgb,
+    var(--surface-interactive-subtle) 11%,
+    var(--surface-card)
+  );
+  --surface-timeline-card-hover: color-mix(
+    in srgb,
+    var(--surface-hover) 38%,
+    var(--surface-timeline-card)
+  );
+  --surface-timeline-card-selected: color-mix(
+    in srgb,
+    var(--surface-active) 52%,
+    var(--surface-timeline-card)
+  );
+  --shadow-timeline-card:
+    0 1px 3px color-mix(in srgb, var(--surface-main) 48%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--border-subtle-medium) 70%, transparent);
+  --shadow-timeline-card-hover:
+    0 2px 5px color-mix(in srgb, var(--surface-main) 62%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--border-subtle-medium) 88%, transparent);
   --surface-limitations: #3d3520;
   --surface-limitations-border: #4a4030;
+
+  --avatar-tint-base: #1e1e1e;
+  --avatar-shade-base: #f5f5f5;
+  --avatar-member-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
+  --avatar-member-fg: color-mix(in srgb, var(--palette-1) 68%, var(--avatar-shade-base));
+  --avatar-generali-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+  --avatar-generali-fg: color-mix(in srgb, var(--palette-5) 68%, var(--avatar-shade-base));
+  --avatar-topic-purple-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+  --avatar-topic-purple-fg: color-mix(in srgb, var(--palette-5) 68%, var(--avatar-shade-base));
+  --avatar-topic-cyan-bg: color-mix(in srgb, var(--palette-6) 24%, var(--avatar-tint-base));
+  --avatar-topic-cyan-fg: color-mix(in srgb, var(--palette-6) 68%, var(--avatar-shade-base));
+  --avatar-topic-green-bg: color-mix(in srgb, var(--palette-2) 24%, var(--avatar-tint-base));
+  --avatar-topic-green-fg: color-mix(in srgb, var(--palette-2) 68%, var(--avatar-shade-base));
+  --avatar-topic-orange-bg: color-mix(in srgb, var(--palette-3) 24%, var(--avatar-tint-base));
+  --avatar-topic-orange-fg: color-mix(in srgb, var(--palette-3) 68%, var(--avatar-shade-base));
+  --avatar-column-bg: color-mix(in srgb, var(--palette-7) 18%, var(--avatar-tint-base));
+  --avatar-column-fg: color-mix(in srgb, var(--palette-7) 55%, var(--avatar-shade-base));
+  --avatar-column-blue-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
+  --avatar-column-violet-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+  --avatar-column-rose-bg: color-mix(in srgb, var(--palette-3) 24%, var(--avatar-tint-base));
+  --avatar-column-emerald-bg: color-mix(in srgb, var(--palette-2) 24%, var(--avatar-tint-base));
+  --avatar-column-sand-bg: color-mix(in srgb, var(--palette-6) 24%, var(--avatar-tint-base));
+  --avatar-column-slate-bg: color-mix(in srgb, var(--palette-7) 18%, var(--avatar-tint-base));
+  --avatar-column-peach-bg: color-mix(in srgb, var(--palette-4) 24%, var(--avatar-tint-base));
+  --avatar-column-mauve-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
 }
 
 [data-style='tactical'] {
@@ -245,7 +456,9 @@ ul {
   --surface-sidebar: #181818;
   --surface-main: #141414;
   --surface-panel: #1a1a1a;
-  --surface-card: #1f1f1f;
+  --surface-card: #2d2d2d;
+  --task-create-surface: #1a1a1a;
+  --task-create-comment-bg: #2a2a2a;
   --border-neutral: #2a2a2a;
   --surface-hover: #252525;
   --surface-hover-soft: #222222;
@@ -262,6 +475,31 @@ ul {
   --overlay-detail: rgb(0 0 0 / 60%);
   --surface-limitations: #2d2818;
   --surface-limitations-border: #383020;
+
+  --avatar-tint-base: #141414;
+  --avatar-shade-base: #f5f5f5;
+  --avatar-member-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
+  --avatar-member-fg: color-mix(in srgb, var(--palette-1) 68%, var(--avatar-shade-base));
+  --avatar-generali-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+  --avatar-generali-fg: color-mix(in srgb, var(--palette-5) 68%, var(--avatar-shade-base));
+  --avatar-topic-purple-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+  --avatar-topic-purple-fg: color-mix(in srgb, var(--palette-5) 68%, var(--avatar-shade-base));
+  --avatar-topic-cyan-bg: color-mix(in srgb, var(--palette-6) 24%, var(--avatar-tint-base));
+  --avatar-topic-cyan-fg: color-mix(in srgb, var(--palette-6) 68%, var(--avatar-shade-base));
+  --avatar-topic-green-bg: color-mix(in srgb, var(--palette-2) 24%, var(--avatar-tint-base));
+  --avatar-topic-green-fg: color-mix(in srgb, var(--palette-2) 68%, var(--avatar-shade-base));
+  --avatar-topic-orange-bg: color-mix(in srgb, var(--palette-3) 24%, var(--avatar-tint-base));
+  --avatar-topic-orange-fg: color-mix(in srgb, var(--palette-3) 68%, var(--avatar-shade-base));
+  --avatar-column-bg: color-mix(in srgb, var(--palette-7) 18%, var(--avatar-tint-base));
+  --avatar-column-fg: color-mix(in srgb, var(--palette-7) 55%, var(--avatar-shade-base));
+  --avatar-column-blue-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
+  --avatar-column-violet-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+  --avatar-column-rose-bg: color-mix(in srgb, var(--palette-3) 24%, var(--avatar-tint-base));
+  --avatar-column-emerald-bg: color-mix(in srgb, var(--palette-2) 24%, var(--avatar-tint-base));
+  --avatar-column-sand-bg: color-mix(in srgb, var(--palette-6) 24%, var(--avatar-tint-base));
+  --avatar-column-slate-bg: color-mix(in srgb, var(--palette-7) 18%, var(--avatar-tint-base));
+  --avatar-column-peach-bg: color-mix(in srgb, var(--palette-4) 24%, var(--avatar-tint-base));
+  --avatar-column-mauve-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
 }
 
 @media (prefers-color-scheme: dark) {
@@ -279,14 +517,27 @@ ul {
     --sprout-soft: #2a3d2f;
     --leaf: #86b872;
     --danger: #f87171;
+    --danger-vivid: #ef4444;
     --danger-soft: #3d2420;
     --warning: #fbbf24;
     --warning-soft: #3d3020;
+    --priority-low: #9ca3af;
+    --priority-normal: #eab308;
+    --priority-high: var(--danger-vivid);
+    --priority-low-fg: var(--priority-low);
+    --priority-low-bg: var(--surface-hover);
+    --priority-low-border: var(--border-neutral);
+    --priority-normal-fg: var(--priority-normal);
+    --priority-normal-bg: #3d3520;
+    --priority-high-fg: var(--priority-high);
+    --priority-high-bg: #3d2020;
 
     --surface-sidebar: #252525;
     --surface-main: #1e1e1e;
     --surface-panel: #2d2d2d;
-    --surface-card: #333333;
+    --surface-card: #3d3d3d;
+    --task-create-surface: #2d2d2d;
+  --task-create-comment-bg: #383838;
     --border-neutral: #404040;
     --text-primary: #e5e5e5;
     --text-muted: #9ca3af;
@@ -325,8 +576,71 @@ ul {
     --shadow-popover: 0 8px 24px rgb(0 0 0 / 35%);
     --shadow-drawer: -8px 0 32px rgb(0 0 0 / 35%);
     --surface-interactive-subtle: rgb(255 255 255 / 6%);
+    --surface-timeline-header: var(--surface-card);
+    --surface-timeline-header-alt: color-mix(
+      in srgb,
+      var(--surface-interactive-subtle) 5%,
+      var(--surface-card)
+    );
+    --surface-timeline-label: var(--surface-main);
+    --surface-timeline-cell: color-mix(
+      in srgb,
+      var(--surface-interactive-subtle) 48%,
+      var(--surface-main)
+    );
+    --surface-timeline-cell-alt: color-mix(
+      in srgb,
+      var(--surface-interactive-subtle) 28%,
+      var(--surface-main)
+    );
+    --surface-timeline-card: color-mix(
+      in srgb,
+      var(--surface-interactive-subtle) 11%,
+      var(--surface-card)
+    );
+    --surface-timeline-card-hover: color-mix(
+      in srgb,
+      var(--surface-hover) 38%,
+      var(--surface-timeline-card)
+    );
+    --surface-timeline-card-selected: color-mix(
+      in srgb,
+      var(--surface-active) 52%,
+      var(--surface-timeline-card)
+    );
+    --shadow-timeline-card:
+      0 1px 3px color-mix(in srgb, var(--surface-main) 48%, transparent),
+      0 0 0 1px color-mix(in srgb, var(--border-subtle-medium) 70%, transparent);
+    --shadow-timeline-card-hover:
+      0 2px 5px color-mix(in srgb, var(--surface-main) 62%, transparent),
+      0 0 0 1px color-mix(in srgb, var(--border-subtle-medium) 88%, transparent);
     --surface-limitations: #3d3520;
     --surface-limitations-border: #4a4030;
+
+    --avatar-tint-base: #1e1e1e;
+    --avatar-shade-base: #f5f5f5;
+    --avatar-member-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
+    --avatar-member-fg: color-mix(in srgb, var(--palette-1) 68%, var(--avatar-shade-base));
+    --avatar-generali-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+    --avatar-generali-fg: color-mix(in srgb, var(--palette-5) 68%, var(--avatar-shade-base));
+    --avatar-topic-purple-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+    --avatar-topic-purple-fg: color-mix(in srgb, var(--palette-5) 68%, var(--avatar-shade-base));
+    --avatar-topic-cyan-bg: color-mix(in srgb, var(--palette-6) 24%, var(--avatar-tint-base));
+    --avatar-topic-cyan-fg: color-mix(in srgb, var(--palette-6) 68%, var(--avatar-shade-base));
+    --avatar-topic-green-bg: color-mix(in srgb, var(--palette-2) 24%, var(--avatar-tint-base));
+    --avatar-topic-green-fg: color-mix(in srgb, var(--palette-2) 68%, var(--avatar-shade-base));
+    --avatar-topic-orange-bg: color-mix(in srgb, var(--palette-3) 24%, var(--avatar-tint-base));
+    --avatar-topic-orange-fg: color-mix(in srgb, var(--palette-3) 68%, var(--avatar-shade-base));
+    --avatar-column-bg: color-mix(in srgb, var(--palette-7) 18%, var(--avatar-tint-base));
+    --avatar-column-fg: color-mix(in srgb, var(--palette-7) 55%, var(--avatar-shade-base));
+    --avatar-column-blue-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
+    --avatar-column-violet-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+    --avatar-column-rose-bg: color-mix(in srgb, var(--palette-3) 24%, var(--avatar-tint-base));
+    --avatar-column-emerald-bg: color-mix(in srgb, var(--palette-2) 24%, var(--avatar-tint-base));
+    --avatar-column-sand-bg: color-mix(in srgb, var(--palette-6) 24%, var(--avatar-tint-base));
+    --avatar-column-slate-bg: color-mix(in srgb, var(--palette-7) 18%, var(--avatar-tint-base));
+    --avatar-column-peach-bg: color-mix(in srgb, var(--palette-4) 24%, var(--avatar-tint-base));
+    --avatar-column-mauve-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
   }
 
   :root:not([data-theme='light'])[data-style='tactical'] {
@@ -338,7 +652,7 @@ ul {
     --surface-sidebar: #181818;
     --surface-main: #141414;
     --surface-panel: #1a1a1a;
-    --surface-card: #1f1f1f;
+    --surface-card: #2d2d2d;
     --border-neutral: #2a2a2a;
     --surface-hover: #252525;
     --surface-hover-soft: #222222;
@@ -355,5 +669,30 @@ ul {
     --overlay-detail: rgb(0 0 0 / 60%);
     --surface-limitations: #2d2818;
     --surface-limitations-border: #383020;
+
+    --avatar-tint-base: #141414;
+    --avatar-shade-base: #f5f5f5;
+    --avatar-member-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
+    --avatar-member-fg: color-mix(in srgb, var(--palette-1) 68%, var(--avatar-shade-base));
+    --avatar-generali-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+    --avatar-generali-fg: color-mix(in srgb, var(--palette-5) 68%, var(--avatar-shade-base));
+    --avatar-topic-purple-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+    --avatar-topic-purple-fg: color-mix(in srgb, var(--palette-5) 68%, var(--avatar-shade-base));
+    --avatar-topic-cyan-bg: color-mix(in srgb, var(--palette-6) 24%, var(--avatar-tint-base));
+    --avatar-topic-cyan-fg: color-mix(in srgb, var(--palette-6) 68%, var(--avatar-shade-base));
+    --avatar-topic-green-bg: color-mix(in srgb, var(--palette-2) 24%, var(--avatar-tint-base));
+    --avatar-topic-green-fg: color-mix(in srgb, var(--palette-2) 68%, var(--avatar-shade-base));
+    --avatar-topic-orange-bg: color-mix(in srgb, var(--palette-3) 24%, var(--avatar-tint-base));
+    --avatar-topic-orange-fg: color-mix(in srgb, var(--palette-3) 68%, var(--avatar-shade-base));
+    --avatar-column-bg: color-mix(in srgb, var(--palette-7) 18%, var(--avatar-tint-base));
+    --avatar-column-fg: color-mix(in srgb, var(--palette-7) 55%, var(--avatar-shade-base));
+    --avatar-column-blue-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
+    --avatar-column-violet-bg: color-mix(in srgb, var(--palette-5) 24%, var(--avatar-tint-base));
+    --avatar-column-rose-bg: color-mix(in srgb, var(--palette-3) 24%, var(--avatar-tint-base));
+    --avatar-column-emerald-bg: color-mix(in srgb, var(--palette-2) 24%, var(--avatar-tint-base));
+    --avatar-column-sand-bg: color-mix(in srgb, var(--palette-6) 24%, var(--avatar-tint-base));
+    --avatar-column-slate-bg: color-mix(in srgb, var(--palette-7) 18%, var(--avatar-tint-base));
+    --avatar-column-peach-bg: color-mix(in srgb, var(--palette-4) 24%, var(--avatar-tint-base));
+    --avatar-column-mauve-bg: color-mix(in srgb, var(--palette-1) 24%, var(--avatar-tint-base));
   }
 }

@@ -194,7 +194,7 @@ Task domain:
 - `GET /v1/projects/{project_id}/task-lists/{list_id}/tasks`
 - `POST /v1/projects/{project_id}/tasks`
 - `GET|PUT|DELETE /v1/projects/{project_id}/tasks/{task_id}`
-- `POST /v1/projects/{project_id}/tasks/{task_id}/{complete,copy}`
+- `POST /v1/projects/{project_id}/tasks/{task_id}/{complete,copy,move}`
 - `GET|POST /v1/projects/{project_id}/tasks/{task_id}/assignments`
 - `DELETE /v1/projects/{project_id}/tasks/{task_id}/assignments/{assignment_id}`
 - `POST /v1/projects/{project_id}/tasks/{task_id}/complete-assignment`

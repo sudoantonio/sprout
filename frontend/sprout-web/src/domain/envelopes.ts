@@ -538,7 +538,10 @@ export const importResourceKeyEnvelopes = async (
         SIGNATURE_CONTEXT,
       )
       if (!valid) {
-        throw new Error('Resource-key envelope signatures are invalid')
+        // Skip this envelope; do not abort the batch. A single bad/legacy
+        // envelope must not block importing sibling header keys needed for
+        // task assignment after DEV reload.
+        continue
       }
       const unwrapped = await unwrapResourceKeyForRecipient(
         encryptedKey,
@@ -561,13 +564,23 @@ export const importResourceKeyEnvelopes = async (
         },
       )
       unwrappedKey = unwrapped.resourceKey
-      await vault.putResourceKey(
-        envelope.resource_id,
-        unwrappedKey,
-        envelope.epoch,
-        envelope.key_purpose ?? 'body',
-      )
-      imported += 1
+      // putResourceKey copies, but keep an explicit working copy so the finally
+      // zero cannot race with any listener that re-reads the unwrap buffer.
+      const storedKey = unwrappedKey.slice()
+      try {
+        await vault.putResourceKey(
+          envelope.resource_id,
+          storedKey,
+          envelope.epoch,
+          envelope.key_purpose ?? 'body',
+        )
+        imported += 1
+      } finally {
+        zeroBytes(storedKey)
+      }
+    } catch {
+      // Same as invalid signature: keep importing remaining envelopes.
+      continue
     } finally {
       zeroBytes(
         encryptedKey,

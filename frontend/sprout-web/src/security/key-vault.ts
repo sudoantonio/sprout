@@ -60,6 +60,40 @@ const peekDevBackupKey = (
   return undefined
 }
 
+/** Highest live epoch in DEV backup for a purpose+resource (any identity). */
+const peekLatestDevBackupKey = (
+  identityId: Uuid | undefined,
+  resourceId: Uuid,
+  purpose: ResourceKeyPurpose,
+): { epoch: number; key: Uint8Array } | undefined => {
+  if (!import.meta.env.DEV) return undefined
+  const tree = readDevBackupTree()
+  const prefix = `${purpose}:${resourceId}:`
+  const identityOrder = identityId
+    ? [identityId, ...Object.keys(tree).filter((id) => id !== identityId)]
+    : Object.keys(tree)
+
+  let latest: { epoch: number; key: Uint8Array } | undefined
+  for (const id of identityOrder) {
+    const slots = tree[id]
+    if (!slots) continue
+    for (const [slot, value] of Object.entries(slots)) {
+      if (!slot.startsWith(prefix)) continue
+      const epoch = Number(slot.slice(prefix.length))
+      if (!Number.isSafeInteger(epoch) || epoch < 1) continue
+      if (latest && epoch <= latest.epoch) continue
+      try {
+        const bytes = base64ToBytes(value)
+        if (bytes.length === 0 || bytes.every((byte) => byte === 0)) continue
+        latest = { epoch, key: bytes }
+      } catch {
+        // skip corrupt slot
+      }
+    }
+  }
+  return latest
+}
+
 export interface SerializedDeviceSecrets {
   keyVersion: number
   suiteVersion: number
@@ -352,7 +386,7 @@ export class KeyVault {
     const existing = this.#resourceKeys.get(slot)
     // All-zero entries are clearMemory leftovers — treat as missing so DEV
     // backup (or a later restore) can supply a live key.
-    if (existing && !isAllZeroKey(existing)) return existing
+    if (existing && !isAllZeroKey(existing)) return existing.slice()
     if (existing) {
       this.#resourceKeys.delete(slot)
     }
@@ -364,7 +398,8 @@ export class KeyVault {
     )
     if (fromBackup) {
       this.#resourceKeys.set(slot, fromBackup)
-      return fromBackup
+      // Return a copy so callers that zeroBytes cannot wipe the vault slot.
+      return fromBackup.slice()
     }
     return undefined
   }
@@ -372,7 +407,7 @@ export class KeyVault {
   getHeaderKey(resourceId: Uuid, epoch = 1): Uint8Array | undefined {
     const slot = resourceKeySlot(resourceId, epoch, 'header')
     const existing = this.#resourceKeys.get(slot)
-    if (existing && !isAllZeroKey(existing)) return existing
+    if (existing && !isAllZeroKey(existing)) return existing.slice()
     if (existing) {
       this.#resourceKeys.delete(slot)
     }
@@ -384,7 +419,7 @@ export class KeyVault {
     )
     if (fromBackup) {
       this.#resourceKeys.set(slot, fromBackup)
-      return fromBackup
+      return fromBackup.slice()
     }
     return undefined
   }
@@ -396,6 +431,10 @@ export class KeyVault {
     let latest: { epoch: number; key: Uint8Array } | undefined
     for (const [slot, key] of this.#resourceKeys) {
       if (!slot.startsWith(prefix)) continue
+      if (isAllZeroKey(key)) {
+        this.#resourceKeys.delete(slot)
+        continue
+      }
       const epoch = Number(slot.slice(prefix.length))
       if (
         Number.isSafeInteger(epoch) &&
@@ -405,7 +444,53 @@ export class KeyVault {
         latest = { epoch, key }
       }
     }
-    return latest
+    if (latest) return { epoch: latest.epoch, key: latest.key.slice() }
+    // Mirror getResourceKey: after reload, body keys may live only in DEV backup.
+    const fromBackup = peekLatestDevBackupKey(
+      this.#identityId,
+      resourceId,
+      'body',
+    )
+    if (!fromBackup) return undefined
+    this.#resourceKeys.set(
+      resourceKeySlot(resourceId, fromBackup.epoch, 'body'),
+      fromBackup.key,
+    )
+    return { epoch: fromBackup.epoch, key: fromBackup.key.slice() }
+  }
+
+  getLatestHeaderKey(
+    resourceId: Uuid,
+  ): { epoch: number; key: Uint8Array } | undefined {
+    const prefix = `header:${resourceId}:`
+    let latest: { epoch: number; key: Uint8Array } | undefined
+    for (const [slot, key] of this.#resourceKeys) {
+      if (!slot.startsWith(prefix)) continue
+      if (isAllZeroKey(key)) {
+        this.#resourceKeys.delete(slot)
+        continue
+      }
+      const epoch = Number(slot.slice(prefix.length))
+      if (
+        Number.isSafeInteger(epoch) &&
+        epoch > 0 &&
+        (!latest || epoch > latest.epoch)
+      ) {
+        latest = { epoch, key }
+      }
+    }
+    if (latest) return { epoch: latest.epoch, key: latest.key.slice() }
+    const fromBackup = peekLatestDevBackupKey(
+      this.#identityId,
+      resourceId,
+      'header',
+    )
+    if (!fromBackup) return undefined
+    this.#resourceKeys.set(
+      resourceKeySlot(resourceId, fromBackup.epoch, 'header'),
+      fromBackup.key,
+    )
+    return { epoch: fromBackup.epoch, key: fromBackup.key.slice() }
   }
 
   async putResourceKey(

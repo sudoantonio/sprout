@@ -191,6 +191,13 @@ export interface TopicDto {
   deleted_at: IsoDateTime | null
 }
 
+export interface UpdateEncryptedResourceRequest {
+  expected_payload_version: number
+  key_epoch: number
+  payload: EncryptedPayloadDto
+  idempotency_key: Uuid
+}
+
 export interface TaskListDto {
   id: Uuid
   project_id: Uuid

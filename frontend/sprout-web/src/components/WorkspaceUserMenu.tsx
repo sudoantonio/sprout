@@ -13,6 +13,7 @@ import { createPortal } from 'react-dom'
 import type { AppearanceOption } from '../theme'
 import type { ProjectItem } from '../store/app-store'
 import type { AppScreen } from '../store/app-store'
+import { BoardProjectSwitcher } from './BoardProjectSwitcher'
 import {
   AlertTriangleIcon,
   CheckIcon,
@@ -20,14 +21,13 @@ import {
   ChevronUpIcon,
   ClipboardListIcon,
   ClockIcon,
-  FolderIcon,
   LayoutGridIcon,
   LockIcon,
   LogOutIcon,
   PaletteIcon,
   PaperclipIcon,
-  PlusIcon,
   RefreshCwIcon,
+  SearchIcon,
   SlidersIcon,
   UsersIcon,
 } from './icons'
@@ -55,12 +55,10 @@ const displayLabelFor = (label: string): string => {
   return trimmed
 }
 
-const initialsFor = (label: string): string => {
+const initialFor = (label: string): string => {
   const display = displayLabelFor(label)
-  const parts = display.split(/\s+/).filter(Boolean)
-  if (parts.length === 0) return '?'
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()
-  return `${parts[0][0] ?? ''}${parts[1][0] ?? ''}`.toUpperCase()
+  if (!display) return '?'
+  return display[0].toUpperCase()
 }
 
 export interface WorkspaceUserMenuProps {
@@ -77,11 +75,16 @@ export interface WorkspaceUserMenuProps {
   onLogout(): void
   appearance: AppearanceOption
   onAppearanceChange(appearance: AppearanceOption): void
-  variant?: 'sidebar' | 'compact' | 'overview'
+  variant?: 'sidebar' | 'compact' | 'overview' | 'tab'
 }
 
-type WorkspaceUserPanelProps = Omit<WorkspaceUserMenuProps, 'variant' | 'userLabel'> & {
+type WorkspaceUserPanelProps = Omit<
+  WorkspaceUserMenuProps,
+  'variant' | 'userLabel'
+> & {
   onClose?(): void
+  allowProjectCreate?: boolean
+  showNavSearch?: boolean
 }
 
 const appearanceOptions: Array<{ value: AppearanceOption; label: string }> = [
@@ -109,8 +112,11 @@ const WorkspaceUserPanel = ({
   appearance,
   onAppearanceChange,
   onClose,
+  allowProjectCreate = true,
+  showNavSearch = false,
 }: WorkspaceUserPanelProps) => {
   const [appearanceOpen, setAppearanceOpen] = useState(false)
+  const [navQuery, setNavQuery] = useState('')
 
   const navigate = (screen: AppScreen) => {
     onNavigate(screen)
@@ -122,56 +128,53 @@ const WorkspaceUserPanel = ({
     setAppearanceOpen(false)
   }
 
+  const normalizedQuery = navQuery.trim().toLocaleLowerCase()
+  const visibleMenuItems = normalizedQuery
+    ? menuItems.filter((item) =>
+        item.label.toLocaleLowerCase().includes(normalizedQuery),
+      )
+    : menuItems
+
   return (
     <>
       <div className="workspace-user-popover-section">
         <p className="workspace-user-popover-heading">Progetto</p>
-        <label className="workspace-user-field workspace-user-field--with-icon">
-          <FolderIcon className="workspace-user-field-icon" aria-hidden />
-          <span className="sr-only">Progetto attivo</span>
-          <select
-            value={selectedProjectId ?? ''}
-            onChange={(event) => onSelectProject(event.target.value)}
-          >
-            <option value="" disabled>
-              Seleziona progetto
-            </option>
-            {projects.map((project) => (
-              <option key={project.wire.id} value={project.wire.id}>
-                {project.document?.name ??
-                  `Locked ${project.wire.id.slice(0, 8)}`}
-              </option>
-            ))}
-          </select>
-        </label>
-        <details className="workspace-user-create">
-          <summary>
-            <PlusIcon className="workspace-user-summary-icon" aria-hidden />
-            Nuovo progetto cifrato
-          </summary>
-          <form
-            onSubmit={(event) => {
-              void onCreateProject(event)
-              onClose?.()
-            }}
-          >
-            <input
-              required
-              placeholder="Nome privato"
-              value={projectName}
-              onChange={(event) => onProjectNameChange(event.target.value)}
-            />
-            <button type="submit" className="secondary-button">
-              Crea
-            </button>
-          </form>
-        </details>
+        <BoardProjectSwitcher
+          projects={projects}
+          selectedProjectId={selectedProjectId}
+          projectName={projectName}
+          onProjectNameChange={onProjectNameChange}
+          onSelectProject={(projectId) => {
+            onSelectProject(projectId)
+            onClose?.()
+          }}
+          onCreateProject={(event) => {
+            void onCreateProject(event)
+            onClose?.()
+          }}
+          allowCreate={allowProjectCreate}
+        />
       </div>
 
+      {showNavSearch ? (
+        <label className="workspace-settings-search">
+          <SearchIcon className="workspace-settings-search-icon" aria-hidden />
+          <span className="sr-only">Cerca nel menu</span>
+          <input
+            type="search"
+            value={navQuery}
+            placeholder="Cerca"
+            onChange={(event) => setNavQuery(event.target.value)}
+          />
+        </label>
+      ) : null}
+
       <div className="workspace-user-popover-section">
-        <p className="workspace-user-popover-heading">Workspace</p>
+        {!showNavSearch ? (
+          <p className="workspace-user-popover-heading">Workspace</p>
+        ) : null}
         <ul className="workspace-user-nav" role="none">
-          {menuItems.map((item) => {
+          {visibleMenuItems.map((item) => {
             const Icon = item.icon
             return (
               <li key={item.id} role="none">
@@ -262,10 +265,6 @@ const WorkspaceUserPanel = ({
       </div>
 
       <div className="workspace-user-popover-footer">
-        <p className="workspace-user-encrypted">
-          <LockIcon />
-          <span>Cifrato end-to-end</span>
-        </p>
         <button
           type="button"
           role="menuitem"
@@ -310,7 +309,7 @@ export const WorkspaceUserMenu = ({
   const triggerRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const menuId = useId()
-  const usePortaledPopover = variant === 'sidebar'
+  const usePortaledPopover = variant === 'sidebar' || variant === 'tab'
 
   useLayoutEffect(() => {
     if (!open || !usePortaledPopover || !rootRef.current || !triggerRef.current) {
@@ -322,10 +321,18 @@ export const WorkspaceUserMenu = ({
 
       const menuRect = rootRef.current.getBoundingClientRect()
       const triggerRect = triggerRef.current.getBoundingClientRect()
-      const width = popoverWidthFor(menuRect.left)
+      const width = popoverWidthFor(
+        variant === 'tab'
+          ? Math.max(16, triggerRect.right - Math.min(272, window.innerWidth - 32))
+          : menuRect.left,
+      )
+      const left =
+        variant === 'tab'
+          ? Math.max(16, Math.min(triggerRect.right - width, window.innerWidth - width - 16))
+          : menuRect.left
 
       setPortaledPopoverStyle({
-        left: menuRect.left,
+        left,
         bottom: window.innerHeight - triggerRect.top + POPOVER_GAP_PX,
         width,
         maxHeight: Math.max(
@@ -345,7 +352,7 @@ export const WorkspaceUserMenu = ({
       window.removeEventListener('resize', updatePosition)
       window.removeEventListener('scroll', updatePosition, true)
     }
-  }, [open, usePortaledPopover])
+  }, [open, usePortaledPopover, variant])
 
   useEffect(() => {
     if (!open || variant === 'overview') return
@@ -390,22 +397,33 @@ export const WorkspaceUserMenu = ({
         className="workspace-user-menu workspace-user-menu--overview"
         ref={rootRef}
       >
+        <button
+          type="button"
+          className="settings-back workspace-settings-back"
+          onClick={() => onNavigate('tasks')}
+        >
+          ← back
+        </button>
         <div className="workspace-user-panel" aria-label="Account e impostazioni">
-          <WorkspaceUserPanel {...panelProps} />
+          <WorkspaceUserPanel
+            {...panelProps}
+            allowProjectCreate={false}
+            showNavSearch
+          />
         </div>
       </div>
     )
   }
 
+  const menuClassName =
+    variant === 'sidebar'
+      ? 'workspace-user-menu workspace-user-menu--sidebar'
+      : variant === 'tab'
+        ? 'workspace-user-menu workspace-user-menu--tab'
+        : 'workspace-user-menu workspace-user-menu--compact'
+
   return (
-    <div
-      className={
-        variant === 'sidebar'
-          ? 'workspace-user-menu workspace-user-menu--sidebar'
-          : 'workspace-user-menu workspace-user-menu--compact'
-      }
-      ref={rootRef}
-    >
+    <div className={menuClassName} ref={rootRef}>
       <button
         ref={triggerRef}
         type="button"
@@ -413,13 +431,26 @@ export const WorkspaceUserMenu = ({
         aria-expanded={open}
         aria-haspopup="menu"
         aria-controls={menuId}
+        aria-label={
+          variant === 'tab' ? displayLabelFor(userLabel) : undefined
+        }
         onClick={() => setOpen((value) => !value)}
       >
         <span className="workspace-user-avatar" aria-hidden>
-          {initialsFor(userLabel)}
+          {initialFor(userLabel)}
         </span>
-        <span className="workspace-user-label">{displayLabelFor(userLabel)}</span>
-        <ChevronUpIcon className={open ? 'workspace-user-chevron open' : 'workspace-user-chevron'} />
+        {variant !== 'tab' && (
+          <>
+            <span className="workspace-user-label">
+              {displayLabelFor(userLabel)}
+            </span>
+            <ChevronUpIcon
+              className={
+                open ? 'workspace-user-chevron open' : 'workspace-user-chevron'
+              }
+            />
+          </>
+        )}
       </button>
 
       {open &&

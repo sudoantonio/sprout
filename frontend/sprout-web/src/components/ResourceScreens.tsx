@@ -68,219 +68,300 @@ export const ProjectPeopleScreen = ({
   const [prefix, setPrefix] = useState('')
 
   return (
-    <section className="content-screen">
-      <div className="content-screen-actions">
-        <button
-          className="secondary-button inline-button"
-          type="button"
-          onClick={() => void onRefresh()}
-        >
-          Refresh invitations
-        </button>
-      </div>
-      <div className="resource-grid">
-        <form
-          className="panel-form"
-          onSubmit={(event) => {
-            event.preventDefault()
-            void onInvite({
-              email,
-              name,
-              phone: phone || undefined,
-              role,
-            }).then(() => {
-              setEmail('')
-              setName('')
-              setPhone('')
-            })
-          }}
-        >
-          <h3>Invite a participant</h3>
-          <p>
-            Email remains visible for delivery. Name and phone are encrypted
-            locally before leaving this device.
-          </p>
-          <label>
-            Email
-            <input
-              type="email"
-              required
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-            />
-          </label>
-          <label>
-            Name
-            <input
-              required
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-            />
-          </label>
-          <label>
-            Phone
-            <input
-              type="tel"
-              value={phone}
-              onChange={(event) => setPhone(event.target.value)}
-            />
-          </label>
-          <label>
-            Role
-            <select
-              value={role}
-              onChange={(event) =>
-                setRole(event.target.value as 'admin' | 'member' | 'guest')
-              }
-            >
-              <option value="member">Member</option>
-              <option value="guest">Guest</option>
-              <option value="admin">Admin</option>
-            </select>
-          </label>
-          <button className="primary-button" type="submit">
-            Encrypt and invite
-          </button>
-        </form>
+    <section className="content-screen settings-screen">
+      <div className="settings-stack">
+        <section className="settings-section">
+          <div className="settings-section-heading">
+            <h3 className="settings-section-title">Inviti</h3>
+            <p className="settings-section-subtitle">
+              Ricarica lo stato degli inviti del progetto.
+            </p>
+          </div>
+          <div className="settings-group">
+            <div className="settings-row settings-row--action">
+              <div className="settings-row-copy">
+                <strong>Aggiorna inviti</strong>
+              </div>
+              <button
+                className="secondary-button inline-button"
+                type="button"
+                onClick={() => void onRefresh()}
+              >
+                Refresh invitations
+              </button>
+            </div>
+          </div>
+        </section>
 
-        <form
-          className="panel-form"
-          onSubmit={(event) => {
-            event.preventDefault()
-            void onAccept({
-              projectId: acceptProjectId,
-              invitationId,
-              token,
-            })
-          }}
-        >
-          <h3>Accept an invitation</h3>
-          <label>
-            Project ID
-            <input
-              required
-              pattern="[0-9a-fA-F-]{36}"
-              value={acceptProjectId}
-              onChange={(event) => setAcceptProjectId(event.target.value)}
-            />
-          </label>
-          <label>
-            Invitation ID
-            <input
-              required
-              pattern="[0-9a-fA-F-]{36}"
-              value={invitationId}
-              onChange={(event) => setInvitationId(event.target.value)}
-            />
-          </label>
-          <label>
-            Email token
-            <input
-              required
-              minLength={64}
-              maxLength={64}
-              value={token}
-              onChange={(event) => setToken(event.target.value)}
-            />
-          </label>
-          <button className="secondary-button" type="submit">
-            Accept
-          </button>
-        </form>
+        <section className="settings-section">
+          <div className="settings-section-heading">
+            <h3 className="settings-section-title">Invite a participant</h3>
+            <p className="settings-section-subtitle">
+              Email remains visible for delivery. Name and phone are encrypted
+              locally before leaving this device.
+            </p>
+          </div>
+          <form
+            className="settings-group"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void onInvite({
+                email,
+                name,
+                phone: phone || undefined,
+                role,
+              }).then(() => {
+                setEmail('')
+                setName('')
+                setPhone('')
+              })
+            }}
+          >
+            <div className="settings-group-body">
+              <label className="settings-field">
+                <span>Email</span>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                />
+              </label>
+              <label className="settings-field">
+                <span>Name</span>
+                <input
+                  required
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                />
+              </label>
+              <label className="settings-field">
+                <span>Phone</span>
+                <input
+                  type="tel"
+                  value={phone}
+                  onChange={(event) => setPhone(event.target.value)}
+                />
+              </label>
+              <label className="settings-field">
+                <span>Role</span>
+                <select
+                  value={role}
+                  onChange={(event) =>
+                    setRole(event.target.value as 'admin' | 'member' | 'guest')
+                  }
+                >
+                  <option value="member">Member</option>
+                  <option value="guest">Guest</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </label>
+              <div className="settings-group-actions">
+                <button className="primary-button" type="submit">
+                  Encrypt and invite
+                </button>
+              </div>
+            </div>
+          </form>
+        </section>
 
-        <form
-          className="panel-form"
-          onSubmit={(event) => {
-            event.preventDefault()
-            void onSuggest(prefix)
-          }}
-        >
-          <h3>Known participants</h3>
-          <label>
-            Identity handle prefix
-            <input
-              maxLength={128}
-              value={prefix}
-              onChange={(event) => setPrefix(event.target.value)}
-            />
-          </label>
-          <button className="secondary-button" type="submit">
-            Rank shared participants
-          </button>
-          <ul className="archive-list">
-            {suggestions.map((suggestion) => (
-              <li key={suggestion.identity_id}>
-                <div>
-                  <strong>{suggestion.identity_handle}</strong>
-                  <small>{suggestion.identity_id}</small>
-                </div>
-                <span>{suggestion.shared_project_count} shared projects</span>
-              </li>
-            ))}
-          </ul>
-        </form>
-      </div>
+        <section className="settings-section">
+          <div className="settings-section-heading">
+            <h3 className="settings-section-title">Accept an invitation</h3>
+            <p className="settings-section-subtitle">
+              Inserisci gli identificativi ricevuti per accettare l’invito.
+            </p>
+          </div>
+          <form
+            className="settings-group"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void onAccept({
+                projectId: acceptProjectId,
+                invitationId,
+                token,
+              })
+            }}
+          >
+            <div className="settings-group-body">
+              <label className="settings-field">
+                <span>Project ID</span>
+                <input
+                  required
+                  pattern="[0-9a-fA-F-]{36}"
+                  value={acceptProjectId}
+                  onChange={(event) => setAcceptProjectId(event.target.value)}
+                />
+              </label>
+              <label className="settings-field">
+                <span>Invitation ID</span>
+                <input
+                  required
+                  pattern="[0-9a-fA-F-]{36}"
+                  value={invitationId}
+                  onChange={(event) => setInvitationId(event.target.value)}
+                />
+              </label>
+              <label className="settings-field">
+                <span>Email token</span>
+                <input
+                  required
+                  minLength={64}
+                  maxLength={64}
+                  value={token}
+                  onChange={(event) => setToken(event.target.value)}
+                />
+              </label>
+              <div className="settings-group-actions">
+                <button className="secondary-button" type="submit">
+                  Accept
+                </button>
+              </div>
+            </div>
+          </form>
+        </section>
 
-      <ul className="archive-list">
-        {invitations.map((invitation) => (
-          <li key={invitation.id}>
-            <div>
-              <strong>{invitation.role}</strong>
-              <small>{invitation.id}</small>
-              {invitation.accepted_by_identity_id && (
-                <small>{invitation.accepted_by_identity_id}</small>
+        <section className="settings-section">
+          <div className="settings-section-heading">
+            <h3 className="settings-section-title">Known participants</h3>
+            <p className="settings-section-subtitle">
+              Cerca partecipanti già conosciuti tramite il prefisso dell’handle.
+            </p>
+          </div>
+          <form
+            className="settings-group"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void onSuggest(prefix)
+            }}
+          >
+            <div className="settings-group-body">
+              <label className="settings-field">
+                <span>Identity handle prefix</span>
+                <input
+                  maxLength={128}
+                  value={prefix}
+                  onChange={(event) => setPrefix(event.target.value)}
+                />
+              </label>
+              <div className="settings-group-actions">
+                <button className="secondary-button" type="submit">
+                  Rank shared participants
+                </button>
+              </div>
+              {suggestions.length > 0 && (
+                <ul className="settings-list settings-list--inset">
+                  {suggestions.map((suggestion) => (
+                    <li key={suggestion.identity_id}>
+                      <div className="settings-row-copy">
+                        <strong>{suggestion.identity_handle}</strong>
+                        <p>{suggestion.identity_id}</p>
+                      </div>
+                      <span className="settings-row-meta">
+                        {suggestion.shared_project_count} shared projects
+                      </span>
+                    </li>
+                  ))}
+                </ul>
               )}
             </div>
-            <div>
-              <span>{invitation.state}</span>
-              {invitation.keys_shared ? (
-                <small>Encrypted access shared</small>
-              ) : (
-                invitation.state === 'accepted' &&
-                invitation.accepted_by_identity_id && (
-                  <button
-                    className="secondary-button inline-button"
-                    type="button"
-                    onClick={() =>
-                      void onShare(invitation.accepted_by_identity_id as Uuid)
-                    }
-                  >
-                    Share encrypted project
-                  </button>
-                )
-              )}
-            </div>
-          </li>
-        ))}
-      </ul>
+          </form>
+        </section>
 
-      <h3 className="content-section-title">Managed topic access</h3>
-      <ul className="archive-list">
-        {managedGrants.map(({ topicName, resourceId, grant }) => (
-          <li key={grant.id}>
-            <div>
-              <strong>{topicName}</strong>
-              <small>{grant.user_id}</small>
-              <small>
-                {grant.access_level} · {grant.access_scope}
-              </small>
-            </div>
-            <button
-              className="secondary-button inline-button"
-              type="button"
-              onClick={() =>
-                void onRevoke({
-                  resourceId,
-                  grantId: grant.id,
-                  userId: grant.user_id,
-                })
-              }
-            >
-              Revoke and rotate keys
-            </button>
-          </li>
-        ))}
-      </ul>
+        <section className="settings-section">
+          <div className="settings-section-heading">
+            <h3 className="settings-section-title">Invitations</h3>
+            <p className="settings-section-subtitle">
+              Stato degli inviti e condivisione delle chiavi cifrate.
+            </p>
+          </div>
+          <div className="settings-group">
+            {invitations.length === 0 ? (
+              <div className="settings-group-empty">Nessun invito.</div>
+            ) : (
+              <ul className="settings-list">
+                {invitations.map((invitation) => (
+                  <li key={invitation.id}>
+                    <div className="settings-row-copy">
+                      <strong>{invitation.role}</strong>
+                      <p>{invitation.id}</p>
+                      {invitation.accepted_by_identity_id && (
+                        <p>{invitation.accepted_by_identity_id}</p>
+                      )}
+                    </div>
+                    <div className="settings-row-aside">
+                      <span className="settings-row-meta">
+                        {invitation.state}
+                      </span>
+                      {invitation.keys_shared ? (
+                        <span className="settings-row-meta">
+                          Encrypted access shared
+                        </span>
+                      ) : (
+                        invitation.state === 'accepted' &&
+                        invitation.accepted_by_identity_id && (
+                          <button
+                            className="secondary-button inline-button"
+                            type="button"
+                            onClick={() =>
+                              void onShare(
+                                invitation.accepted_by_identity_id as Uuid,
+                              )
+                            }
+                          >
+                            Share encrypted project
+                          </button>
+                        )
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+
+        <section className="settings-section">
+          <div className="settings-section-heading">
+            <h3 className="settings-section-title">Managed topic access</h3>
+            <p className="settings-section-subtitle">
+              Revoca gli accessi gestiti e ruota le chiavi correlate.
+            </p>
+          </div>
+          <div className="settings-group">
+            {managedGrants.length === 0 ? (
+              <div className="settings-group-empty">Nessun accesso gestito.</div>
+            ) : (
+              <ul className="settings-list">
+                {managedGrants.map(({ topicName, resourceId, grant }) => (
+                  <li key={grant.id}>
+                    <div className="settings-row-copy">
+                      <strong>{topicName}</strong>
+                      <p>{grant.user_id}</p>
+                      <p>
+                        {grant.access_level} · {grant.access_scope}
+                      </p>
+                    </div>
+                    <button
+                      className="secondary-button inline-button"
+                      type="button"
+                      onClick={() =>
+                        void onRevoke({
+                          resourceId,
+                          grantId: grant.id,
+                          userId: grant.user_id,
+                        })
+                      }
+                    >
+                      Revoke and rotate keys
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+      </div>
     </section>
   )
 }

@@ -43,6 +43,12 @@ export const PlusIcon = (props: IconProps) => (
   </svg>
 )
 
+export const MinusIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M5 12h14" />
+  </svg>
+)
+
 export const ChevronIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <path d="m9 6 6 6-6 6" />
@@ -150,6 +156,51 @@ export const UsersIcon = (props: IconProps) => (
   </svg>
 )
 
+export const AgentIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M12 8V4H8" />
+    <path d="M12 8V4h4" />
+    <path d="M17 8v1a4 4 0 0 1-8 0V8" />
+    <rect x="4" y="12" width="16" height="10" rx="2" />
+    <path d="M9 16h.01" />
+    <path d="M15 16h.01" />
+    <path d="M9 20h6" />
+  </svg>
+)
+
+export const UserIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+    <circle cx="12" cy="7" r="4" />
+  </svg>
+)
+
+const sidebarNavIconProps = {
+  viewBox: '0 0 24 24',
+  width: 20,
+  height: 20,
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 1.5,
+  strokeLinecap: 'round',
+  strokeLinejoin: 'round',
+  'aria-hidden': true,
+} as const
+
+export const SidebarHomeIcon = (props: IconProps) => (
+  <svg {...sidebarNavIconProps} {...props}>
+    <path d="M20 10 12 5 4 10 12 15 20 10Z" />
+    <path d="M20 14 12 19 4 14" />
+  </svg>
+)
+
+export const SidebarUserIcon = (props: IconProps) => (
+  <svg {...sidebarNavIconProps} {...props}>
+    <circle cx="12" cy="9" r="2.75" />
+    <path d="M7 19.25c.85-2.35 2.75-3.75 5-3.75s4.15 1.4 5 3.75" />
+  </svg>
+)
+
 export const SlidersIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <path d="M4 21v-7" />
@@ -190,6 +241,13 @@ export const ClockIcon = (props: IconProps) => (
   </svg>
 )
 
+export const FlagIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M5 21V4" />
+    <path d="M5 4h12l-2.5 3L17 10H5" />
+  </svg>
+)
+
 export const AlertTriangleIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
@@ -225,5 +283,41 @@ export const PaletteIcon = (props: IconProps) => (
 export const CheckIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <path d="m5 12 4 4 10-10" />
+  </svg>
+)
+
+export const XIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M18 6 6 18" />
+    <path d="m6 6 12 12" />
+  </svg>
+)
+
+export const CircleIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <circle cx="12" cy="12" r="9" />
+  </svg>
+)
+
+export const PencilIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+  </svg>
+)
+
+/** Open / expand into detail view. */
+export const ExpandDetailIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M15 3h6v6" />
+    <path d="M9 21H3v-6" />
+    <path d="M21 3l-7 7" />
+    <path d="M3 21l7-7" />
+  </svg>
+)
+
+export const StarIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M12 2.5 14.6 9H21.5L16 13.4 18.1 20.5 12 16.3 5.9 20.5 8 13.4 2.5 9H9.4Z" />
   </svg>
 )
