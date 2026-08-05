@@ -57,7 +57,7 @@ fn accepted_response(
     let include_dev_fields = config.deployment_environment == DeploymentEnvironment::Development;
     AcceptedResponse {
         accepted: true,
-        identity_id: include_dev_fields.then(|| identity_id).flatten(),
+        identity_id: include_dev_fields.then_some(identity_id).flatten(),
         dev_verification_token: include_dev_fields
             .then(|| token.map(str::to_owned))
             .flatten(),
