@@ -12,7 +12,12 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use super::webauthn::{DeviceSessionRequest, SessionResponse, create_device_session, decode_b64};
-use crate::{AppState, auth::set_database_context, config::Config, error::AppError};
+use crate::{
+    AppState,
+    auth::set_database_context,
+    config::{Config, DeploymentEnvironment},
+    error::AppError,
+};
 
 const SIGNUP_KIND: &str = "signup_verification";
 const RECOVERY_KIND: &str = "account_recovery";
@@ -38,6 +43,25 @@ impl fmt::Debug for SignupStartRequest {
 #[derive(Serialize)]
 pub struct AcceptedResponse {
     accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dev_verification_token: Option<String>,
+}
+
+fn accepted_response(
+    config: &Config,
+    identity_id: Option<Uuid>,
+    token: Option<&str>,
+) -> AcceptedResponse {
+    let include_dev_fields = config.deployment_environment == DeploymentEnvironment::Development;
+    AcceptedResponse {
+        accepted: true,
+        identity_id: include_dev_fields.then_some(identity_id).flatten(),
+        dev_verification_token: include_dev_fields
+            .then(|| token.map(str::to_owned))
+            .flatten(),
+    }
 }
 
 pub async fn verification_start(
@@ -50,6 +74,55 @@ pub async fn verification_start(
         decode_b64(&request.encrypted_profile_b64, "invalid encrypted profile")?;
     if encrypted_profile.is_empty() {
         return Err(AppError::BadRequest("encrypted profile is empty"));
+    }
+    if state.config.deployment_environment == DeploymentEnvironment::Development {
+        if let Some(existing_id) = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT i.id
+            FROM identities i
+            INNER JOIN identity_emails e ON e.identity_id = i.id
+            WHERE i.identity_handle = $1
+              AND e.normalized_email = $2
+              AND i.status = 'pending'
+            "#,
+        )
+        .bind(&handle)
+        .bind(&normalized_email)
+        .fetch_optional(&state.pool)
+        .await?
+        {
+            return refresh_signup_verification(
+                &state,
+                existing_id,
+                &normalized_email,
+                encrypted_profile,
+            )
+            .await;
+        }
+        if let Some(existing_id) = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT i.id
+            FROM identities i
+            INNER JOIN identity_emails e ON e.identity_id = i.id
+            WHERE i.identity_handle = $1
+              AND e.normalized_email = $2
+              AND i.status = 'active'
+            "#,
+        )
+        .bind(&handle)
+        .bind(&normalized_email)
+        .fetch_optional(&state.pool)
+        .await?
+        {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(AcceptedResponse {
+                    accepted: true,
+                    identity_id: Some(existing_id),
+                    dev_verification_token: None,
+                }),
+            ));
+        }
     }
     let identity_id = Uuid::new_v4();
     let token = new_token();
@@ -112,7 +185,83 @@ pub async fn verification_start(
     transaction.commit().await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(AcceptedResponse { accepted: true }),
+        Json(accepted_response(
+            &state.config,
+            Some(identity_id),
+            Some(&token),
+        )),
+    ))
+}
+
+async fn refresh_signup_verification(
+    state: &AppState,
+    identity_id: Uuid,
+    normalized_email: &str,
+    encrypted_profile: Vec<u8>,
+) -> Result<(StatusCode, Json<AcceptedResponse>), AppError> {
+    let token = new_token();
+    let token_hash = hash_token(&token);
+    let expires_at = Utc::now()
+        + Duration::from_std(state.config.email_verification_ttl)
+            .map_err(|_| AppError::Internal)?;
+    let payload = EmailTokenPayload {
+        identity_id,
+        token: &token,
+    };
+    let mut transaction = state.pool.begin().await?;
+    set_database_context(&mut transaction, identity_id, None, None).await?;
+    sqlx::query(
+        r#"
+        UPDATE identities
+        SET encrypted_profile = $2
+        WHERE id = $1 AND status = 'pending'
+        "#,
+    )
+    .bind(identity_id)
+    .bind(encrypted_profile)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE email_verification_tokens
+        SET consumed_at = clock_timestamp()
+        WHERE identity_id = $1 AND consumed_at IS NULL
+        "#,
+    )
+    .bind(identity_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO email_verification_tokens (
+            identity_id, token_hash, expires_at
+        )
+        VALUES ($1, $2, $3)
+        "#,
+    )
+    .bind(identity_id)
+    .bind(token_hash)
+    .bind(expires_at)
+    .execute(&mut *transaction)
+    .await?;
+    enqueue_email(
+        &mut transaction,
+        &state.config,
+        identity_id,
+        SIGNUP_KIND,
+        normalized_email,
+        &token_hash,
+        &payload,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(accepted_response(
+            &state.config,
+            Some(identity_id),
+            Some(&token),
+        )),
     ))
 }
 
@@ -148,6 +297,18 @@ pub async fn verification_finish(
     .await?
     .is_some();
     if !consumed {
+        let already_active = sqlx::query_scalar::<_, bool>(
+            "SELECT status = 'active' FROM identities WHERE id = $1",
+        )
+        .bind(request.identity_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .unwrap_or(false);
+        if already_active {
+            return Err(AppError::BadRequest(
+                "account is already verified; use passkey sign-in or account recovery",
+            ));
+        }
         return Err(AppError::BadRequest(
             "verification token is invalid or expired",
         ));
@@ -279,7 +440,11 @@ pub async fn recovery_start(
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok((
         StatusCode::ACCEPTED,
-        Json(AcceptedResponse { accepted: true }),
+        Json(accepted_response(
+            &state.config,
+            identity_id,
+            identity_id.is_some().then_some(token.as_str()),
+        )),
     ))
 }
 
@@ -457,7 +622,7 @@ pub(super) fn normalize_email(value: &str) -> Result<String, AppError> {
     Ok(normalized)
 }
 
-fn normalize_handle(value: &str) -> Result<String, AppError> {
+pub(super) fn normalize_handle(value: &str) -> Result<String, AppError> {
     let normalized = value.trim().to_lowercase();
     if normalized.len() < 3
         || normalized.len() > 128

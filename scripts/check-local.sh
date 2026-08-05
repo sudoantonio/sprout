@@ -21,9 +21,9 @@ if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
   nvm use --silent
 fi
 
-npm --prefix apps/web run lint
-npm --prefix apps/web run test
-npm --prefix apps/web run build
+npm --prefix frontend/sprout-web run lint
+npm --prefix frontend/sprout-web run test
+npm --prefix frontend/sprout-web run build
 
 bash scripts/validate-migrations.sh
 bash scripts/verify-requirements-traceability.sh

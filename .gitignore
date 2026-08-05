@@ -6,10 +6,10 @@
 **/dist/
 
 # Generated WASM package output (source crates remain tracked)
-/apps/web/src/wasm/
-/apps/web/pkg/
-/apps/web/public/wasm/
-/apps/web/.wasm-target/
+/frontend/sprout-web/src/wasm/
+/frontend/sprout-web/pkg/
+/frontend/sprout-web/public/wasm/
+/frontend/sprout-web/.wasm-target/
 /crates/crypto-wasm/pkg/
 
 # Runtime state and local secret material

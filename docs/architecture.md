@@ -41,7 +41,7 @@ flowchart LR
 
 | Component | Responsibility | Must not do |
 | --- | --- | --- |
-| `apps/web` | Passkeys, local decryption, filters, offline queue, conflict UI, export download | Send sensitive plaintext, keys, or local paths to the service |
+| `frontend/sprout-web` | Passkeys, local decryption, filters, offline queue, conflict UI, export download | Send sensitive plaintext, keys, or local paths to the service |
 | `crates/crypto-wasm` | Minimal browser binding to the shared protocol | Log secrets or define a second protocol |
 | `apps/server` | API/worker startup, configuration, health, graceful shutdown | Decrypt content |
 | `crates/api-contract` | Versioned ciphertext/routing DTOs and TypeScript contract generation | Carry semantic plaintext |

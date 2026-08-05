@@ -37,12 +37,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: apps/web/package-lock.json
+          cache-dependency-path: frontend/sprout-web/package-lock.json
       - name: Install frontend lockfile
-        working-directory: apps/web
+        working-directory: frontend/sprout-web
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Audit high and critical npm vulnerabilities
-        working-directory: apps/web
+        working-directory: frontend/sprout-web
         run: npm audit --audit-level=high
       - uses: anchore/sbom-action/download-syft@v0
       - name: Generate SPDX and CycloneDX SBOMs

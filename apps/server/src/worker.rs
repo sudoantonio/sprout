@@ -147,6 +147,7 @@ async fn run_cycle(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn retention_project(
     pool: &PgPool,
     config: &Config,

@@ -17,20 +17,20 @@ RUN rustup target add wasm32-unknown-unknown
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY apps/web/package.json apps/web/package-lock.json ./apps/web/
+COPY frontend/sprout-web/package.json frontend/sprout-web/package-lock.json ./frontend/sprout-web/
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    npm ci --prefix apps/web --no-audit --no-fund
-COPY apps/web ./apps/web
+    npm ci --prefix frontend/sprout-web --no-audit --no-fund
+COPY frontend/sprout-web ./frontend/sprout-web
 
 ARG SOURCE_DATE_EPOCH=0
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
-RUN npm --prefix apps/web run wasm:build \
-    && npm --prefix apps/web run build
+RUN npm --prefix frontend/sprout-web run wasm:build \
+    && npm --prefix frontend/sprout-web run build
 
 FROM nginxinc/nginx-unprivileged:1.29.0-alpine AS runtime
 
 COPY deploy/nginx-sprout.conf /etc/nginx/conf.d/default.conf
 COPY deploy/nginx-security-headers.conf /etc/nginx/sprout-security-headers.conf
-COPY --from=build --chown=101:101 /workspace/apps/web/dist /usr/share/nginx/html
+COPY --from=build --chown=101:101 /workspace/frontend/sprout-web/dist /usr/share/nginx/html
 
 EXPOSE 8080

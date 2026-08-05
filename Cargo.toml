@@ -16,6 +16,7 @@ members = [
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
+authors = ["Francesco Antonio De Luca <https://github.com/francescoantoniodeluca>"]
 
 [profile.release]
 lto = "thin"

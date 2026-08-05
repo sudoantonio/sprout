@@ -9,7 +9,7 @@ This document describes the implemented routes. It is not yet a generated
 OpenAPI contract. The authoritative route registry remains
 `apps/server/src/routes/mod.rs`, request/response types live in
 `crates/api-contract`, and the browser client is in
-`apps/web/src/api/client.ts`.
+`frontend/sprout-web/src/api/client.ts`.
 
 ## One-command validation
 
@@ -194,7 +194,7 @@ Task domain:
 - `GET /v1/projects/{project_id}/task-lists/{list_id}/tasks`
 - `POST /v1/projects/{project_id}/tasks`
 - `GET|PUT|DELETE /v1/projects/{project_id}/tasks/{task_id}`
-- `POST /v1/projects/{project_id}/tasks/{task_id}/{complete,copy}`
+- `POST /v1/projects/{project_id}/tasks/{task_id}/{complete,copy,move}`
 - `GET|POST /v1/projects/{project_id}/tasks/{task_id}/assignments`
 - `DELETE /v1/projects/{project_id}/tasks/{task_id}/assignments/{assignment_id}`
 - `POST /v1/projects/{project_id}/tasks/{task_id}/complete-assignment`

@@ -1,0 +1,49 @@
+{
+  "name": "@sprout/web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "author": "Francesco Antonio De Luca (https://github.com/francescoantoniodeluca)",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "wasm:build": "node scripts/build-wasm.mjs",
+    "test:wasm": "npm run wasm:build && vitest run src/security/wasm.generated.test.ts",
+    "test:wasm:parity": "vitest run src/security/wasm.generated.test.ts",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:pwa": "playwright test --config playwright.pwa.config.ts"
+  },
+  "dependencies": {
+    "chrono-node": "^2.10.1",
+    "emojibase": "^17.0.0",
+    "emojibase-data": "^17.0.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^26.1.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "jsdom": "^29.1.1",
+    "oxlint": "^1.74.0",
+    "typescript": "^6.0.2",
+    "vite": "^8.1.5",
+    "vitest": "^4.1.10"
+  },
+  "optionalDependencies": {
+    "@oxlint/binding-darwin-arm64": "^1.74.0",
+    "@rolldown/binding-darwin-arm64": "^1.2.0"
+  }
+}

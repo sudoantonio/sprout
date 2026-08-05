@@ -116,7 +116,7 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
   cargo audit --deny warnings
 )
 (
-  cd "${repository_root}/apps/web"
+  cd "${repository_root}/frontend/sprout-web"
   npm audit --audit-level=high
 )
 

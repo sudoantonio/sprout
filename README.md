@@ -2,6 +2,8 @@
 
 End-to-end encrypted task platform: a Rust/Axum backend, PostgreSQL metadata store, encrypted filesystem blobs, and a React/TypeScript offline-first PWA with shared Rust/WebAssembly cryptography.
 
+> **Branch `frontend/split`:** il client web è in `frontend/sprout-web/`. Vedi [docs/frontend-split.md](docs/frontend-split.md) per la strategia multi-prodotto.
+
 > **Not production-ready.** The implementation is currently a scaffold. The byte-level cryptographic protocol is not frozen, and no independent cryptographic audit or penetration test is claimed. Production is blocked on the gates in [the protocol specification](docs/crypto-protocol.md) and [operations guide](docs/operations.md).
 
 ## Features
@@ -47,8 +49,9 @@ See also: [threat model](docs/threat-model.md) · [data classification](docs/dat
 ```sh
 git clone https://github.com/abaco-click/sprout.git
 cd sprout
+git checkout frontend/split
 
-npm --prefix apps/web install
+npm --prefix frontend/sprout-web install
 ```
 
 ### 2. Configure environment
@@ -71,8 +74,8 @@ The check script selects the rustup compiler explicitly so a Homebrew Rust insta
 ### 4. Build the web client
 
 ```sh
-npm --prefix apps/web run wasm:build
-npm --prefix apps/web run build
+npm --prefix frontend/sprout-web run wasm:build
+npm --prefix frontend/sprout-web run build
 ```
 
 ### 5. Run the disposable encrypted API journey (Docker)
@@ -87,25 +90,27 @@ docker compose -f compose.validation.yml up \
 ```
 sprout/
 ├── apps/
-│   ├── server/          # Axum API and worker composition
-│   └── web/             # React PWA and offline behavior
+│   └── server/              # Axum API and worker composition
+├── frontend/
+│   └── sprout-web/          # React PWA (Sprout client)
 ├── crates/
-│   ├── domain/          # Domain invariants
-│   ├── application/     # Use cases and authorization
-│   ├── storage-postgres/# Persistence, transactions, RLS, migrations
-│   ├── crypto-protocol/ # Versioned encrypted formats and suite adapters
-│   ├── crypto-wasm/     # Minimal browser bindings
-│   ├── api-contract/    # Shared API DTOs/types
-│   ├── test-support/    # Integration-test infrastructure
-│   └── validation-cli/  # Disposable protocol-backed API validation client
-├── db/migrations/       # PostgreSQL schema migrations
-├── docs/                # Architecture, requirements, ADRs
-├── scripts/             # Local checks and validation scripts
-└── tests/               # System and traceability tests
+│   ├── domain/              # Domain invariants
+│   ├── application/         # Use cases and authorization
+│   ├── storage-postgres/    # Persistence, transactions, RLS, migrations
+│   ├── crypto-protocol/     # Versioned encrypted formats and suite adapters
+│   ├── crypto-wasm/         # Minimal browser bindings
+│   ├── api-contract/        # Shared API DTOs/types
+│   ├── test-support/        # Integration-test infrastructure
+│   └── validation-cli/      # Disposable protocol-backed API validation client
+├── db/migrations/           # PostgreSQL schema migrations
+├── docs/                    # Architecture, requirements, ADRs
+├── scripts/                 # Local checks and validation scripts
+└── tests/                   # System and traceability tests
 ```
 
 ## Documentation
 
+- [Frontend split strategy](docs/frontend-split.md)
 - [Architecture](docs/architecture.md)
 - [Traceable requirements](docs/requirements.md)
 - [Threat model](docs/threat-model.md)
@@ -130,7 +135,15 @@ This project is in early development. Before opening a pull request:
 
 1. Run `bash scripts/check-local.sh` locally.
 2. Ensure new behavior is traceable to a requirement in [docs/requirements.md](docs/requirements.md) when applicable.
-3. Do not commit secrets, `.env` files, or generated WASM artifacts (`apps/web/public/wasm/` is built at CI/deploy time).
+3. Do not commit secrets, `.env` files, or generated WASM artifacts (`frontend/sprout-web/public/wasm/` is built at CI/deploy time).
+
+## Contributors
+
+Sprout was directed and integrated by [Francesco Antonio De Luca](https://github.com/francescoantoniodeluca).
+
+A substantial share of the source code, tests, and technical documentation was generated with **OpenAI ChatGPT**, under human review and integration.
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the full contributor list.
 
 ## License
 
