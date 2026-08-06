@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/social-preview.png" alt="Sprout" width="100%">
+</p>
+
 # Sprout
 
 End-to-end encrypted task platform: a Rust/Axum backend, PostgreSQL metadata store, encrypted filesystem blobs, and a React/TypeScript offline-first PWA with shared Rust/WebAssembly cryptography.
