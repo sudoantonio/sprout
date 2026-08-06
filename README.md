@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/social-preview.png" alt="Sprout" width="100%">
+  <img src=".github/banner.png" alt="Sprout" width="820">
 </p>
 
 # Sprout
