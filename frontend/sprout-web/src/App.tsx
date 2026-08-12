@@ -41,7 +41,6 @@ import { AuthScreen } from './components/AuthScreen'
 import {
   DownloadIcon,
   KeyIcon,
-  LockIcon,
   ShieldIcon,
   WifiOffIcon,
 } from './components/icons'
@@ -1154,7 +1153,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       session: SessionResponse
       requiresAuthorizedDevice: boolean
     }>,
-    phase: 'signin' | 'verify' | 'recover' = 'signin',
+    phase: 'signin' | 'signup' | 'verify' | 'recover' = 'signin',
     successNotice?: string,
   ) => {
     dispatch({ type: 'auth-started' })

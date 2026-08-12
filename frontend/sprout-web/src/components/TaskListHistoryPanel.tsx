@@ -191,7 +191,9 @@ const TaskHistoryDot = ({
   const triggerRef = useRef<HTMLButtonElement>(null)
   const tooltipId = useId()
   const [open, setOpen] = useState(false)
-  const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>()
+  const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  )
   const status = getTaskStatusIndicator(task)
   const assignee = boardMembers.find(
     (member) => member.identityId === task.wire.active_assignee_identity_id,

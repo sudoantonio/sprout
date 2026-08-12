@@ -7,6 +7,7 @@ import {
   useState,
   type CSSProperties,
   type FormEvent,
+  type ReactElement,
 } from 'react'
 import { createPortal } from 'react-dom'
 import type {
@@ -20,7 +21,6 @@ import {
   formatDueDate,
   formatTaskCardDueDate,
   getTaskStatusIndicator,
-  isRecurringTaskOverdue,
   isTaskOverdue,
   sortItemsByTaskUrgency,
   sortTaskListsByUrgency,
@@ -76,7 +76,6 @@ import {
   SidebarHomeIcon,
   FolderIcon,
   PaperclipIcon,
-  PencilIcon,
   PlusIcon,
   RepeatIcon,
   UsersIcon,
@@ -882,7 +881,7 @@ type TaskKind = 'priority' | 'deadline' | 'recurring'
 type TaskKindOption = readonly [
   TaskKind,
   string,
-  (props: React.SVGProps<SVGSVGElement>) => JSX.Element,
+  (props: React.SVGProps<SVGSVGElement>) => ReactElement,
 ]
 
 const TASK_KIND_OPTIONS = [
@@ -2424,7 +2423,7 @@ const TaskDetailPanel = ({
 
 const CreateTaskPanel = ({
   list,
-  anchorRect,
+  anchorRect: _anchorRect,
   boardMembers,
   publishedQuestionnaireVersions,
   onCreateTask,
@@ -2710,7 +2709,7 @@ export const TasksScreen = ({
   boardViewMode,
   selectedTopicId,
   selectedTaskId,
-  currentUserLabel,
+  currentUserLabel: _currentUserLabel,
   publishedQuestionnaireVersions,
   filter,
   loading,
@@ -3489,7 +3488,7 @@ export const TasksScreen = ({
               type="button"
               className="board-mobile-search-close"
               aria-label="Chiudi ricerca"
-              onClick={closeMobileSearch}
+              onClick={() => closeMobileSearch()}
             >
               <XIcon aria-hidden />
             </button>
