@@ -1143,10 +1143,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       )
   }, [api, dispatch, state.session])
 
-  const requireServices = (): Services => {
+  const requireServices = useCallback((): Services => {
     if (!services) throw new Error('Encrypted local storage is still opening')
     return services
-  }
+  }, [services])
 
   const runAuth = async (
     operation: () => Promise<{
@@ -4245,7 +4245,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       attachmentRefreshInFlight.current.set(taskId, refresh)
       return refresh
     },
-    [api, dispatch, state.selectedProjectId],
+    [api, dispatch, requireServices, state.selectedProjectId],
   )
 
   const uploadCompletedAttachment = async (
@@ -5073,38 +5073,22 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     return member?.label ?? `User ${state.session.identity_id.slice(0, 8)}`
   }, [state.boardMembers, state.session])
 
-  const userMenuProps = useMemo(
-    () => ({
-      userLabel,
-      projects: state.projects,
-      selectedProjectId: state.selectedProjectId,
-      currentScreen: state.screen,
-      conflictCount: state.conflicts.length,
-      projectName,
-      onProjectNameChange: setProjectName,
-      onSelectProject: (projectId: string) =>
-        dispatch({ type: 'select-project', projectId }),
-      onCreateProject: (event: FormEvent) => void createProject(event),
-      onNavigate: (screen: AppScreen) =>
-        dispatch({ type: 'set-screen', screen }),
-      onLogout: logout,
-      appearance,
-      onAppearanceChange: setAppearance,
-    }),
-    [
-      userLabel,
-      state.projects,
-      state.selectedProjectId,
-      state.screen,
-      state.conflicts.length,
-      projectName,
-      dispatch,
-      logout,
-      createProject,
-      appearance,
-      setAppearance,
-    ],
-  )
+  const userMenuProps = {
+    userLabel,
+    projects: state.projects,
+    selectedProjectId: state.selectedProjectId,
+    currentScreen: state.screen,
+    conflictCount: state.conflicts.length,
+    projectName,
+    onProjectNameChange: setProjectName,
+    onSelectProject: (projectId: string) =>
+      dispatch({ type: 'select-project', projectId }),
+    onCreateProject: (event: FormEvent) => void createProject(event),
+    onNavigate: (screen: AppScreen) => dispatch({ type: 'set-screen', screen }),
+    onLogout: logout,
+    appearance,
+    onAppearanceChange: setAppearance,
+  }
 
   if (!state.session) {
     return (

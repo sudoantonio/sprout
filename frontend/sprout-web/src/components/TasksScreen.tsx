@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useId,
   useLayoutEffect,
@@ -2912,18 +2913,7 @@ export const TasksScreen = ({
     mobileSearchInputRef.current?.focus()
   }, [mobileSearchOpen, mobileSearchOverlayVisible])
 
-  useEffect(() => {
-    if (!mobileSearchOpen) return
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        closeMobileSearch(false)
-      }
-    }
-    document.addEventListener('keydown', onKeyDown)
-    return () => document.removeEventListener('keydown', onKeyDown)
-  }, [mobileSearchOpen])
-
-  const rememberRecentSearch = (query: string) => {
+  const rememberRecentSearch = useCallback((query: string) => {
     const trimmed = query.trim()
     if (!trimmed) return
     setRecentSearches((previous) => {
@@ -2934,13 +2924,27 @@ export const TasksScreen = ({
       persistRecentSearches(next)
       return next
     })
-  }
+  }, [])
 
-  const closeMobileSearch = (rememberQuery = true) => {
-    if (rememberQuery) rememberRecentSearch(searchQuery)
-    setMobileSearchOpen(false)
-    setSearchQuery('')
-  }
+  const closeMobileSearch = useCallback(
+    (rememberQuery = true) => {
+      if (rememberQuery) rememberRecentSearch(searchQuery)
+      setMobileSearchOpen(false)
+      setSearchQuery('')
+    },
+    [rememberRecentSearch, searchQuery],
+  )
+
+  useEffect(() => {
+    if (!mobileSearchOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeMobileSearch(false)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [closeMobileSearch, mobileSearchOpen])
 
   const isMemberBoard = isMemberBoardFocus(boardFocus)
 

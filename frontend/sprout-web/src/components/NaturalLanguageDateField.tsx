@@ -10,13 +10,6 @@ import {
 
 const pad = (value: number) => String(value).padStart(2, '0')
 
-export const toDatetimeLocalValue = (iso?: string): string => {
-  if (!iso) return ''
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return ''
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
-
 const parseDatetimeLocal = (value: string): { hour: number; minute: number } | null => {
   if (!value) return null
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value)
