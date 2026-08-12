@@ -2427,7 +2427,8 @@ SELECT set_config(
 CREATE ROLE sprout_behavior_rls NOLOGIN;
 GRANT USAGE ON SCHEMA public, sprout_private TO sprout_behavior_rls;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO sprout_behavior_rls;
-GRANT UPDATE ON resource_nodes TO sprout_behavior_rls;
+GRANT INSERT, UPDATE, DELETE ON resource_nodes TO sprout_behavior_rls;
+GRANT INSERT, DELETE ON resource_closure TO sprout_behavior_rls;
 SET LOCAL ROLE sprout_behavior_rls;
 
 DO $test$
@@ -2447,6 +2448,10 @@ DO $test$
 DECLARE
     visible_count integer;
     updated_count integer;
+    inserted_count integer;
+    deleted_count integer;
+    unauthorized_inserted boolean := false;
+    direct_delete_succeeded boolean := false;
 BEGIN
     SELECT count(*) INTO visible_count
     FROM resource_nodes
@@ -2465,6 +2470,85 @@ BEGIN
         RAISE EXCEPTION
             'T-LLR-10.2 direct SQL update crossed project RLS: changed % rows',
             updated_count;
+    END IF;
+
+    INSERT INTO resource_nodes (
+        id, project_id, parent_id, node_kind,
+        encrypted_metadata, created_by_identity_id
+    ) VALUES (
+        '40000000-0000-0000-0000-000000000090',
+        '30000000-0000-0000-0000-000000000001',
+        '40000000-0000-0000-0000-000000000003',
+        'task', decode('90', 'hex'),
+        '10000000-0000-0000-0000-000000000020'
+    );
+    GET DIAGNOSTICS inserted_count = ROW_COUNT;
+    IF inserted_count <> 1 THEN
+        RAISE EXCEPTION
+            'T-LLR-10.2 authorized direct SQL insert was denied';
+    END IF;
+
+    BEGIN
+        INSERT INTO resource_nodes (
+            id, project_id, parent_id, node_kind,
+            encrypted_metadata, created_by_identity_id
+        ) VALUES (
+            '40000000-0000-0000-0000-000000000091',
+            '30000000-0000-0000-0000-000000000002',
+            '40000000-0000-0000-0000-000000000005',
+            'task', decode('91', 'hex'),
+            '10000000-0000-0000-0000-000000000001'
+        );
+        unauthorized_inserted := true;
+    EXCEPTION
+        WHEN insufficient_privilege OR foreign_key_violation OR check_violation OR raise_exception
+            THEN NULL;
+    END;
+    IF unauthorized_inserted THEN
+        RAISE EXCEPTION
+            'T-LLR-10.2 direct SQL insert crossed project RLS';
+    END IF;
+
+    DELETE FROM resource_nodes
+    WHERE project_id = '30000000-0000-0000-0000-000000000002';
+    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    IF deleted_count <> 0 THEN
+        RAISE EXCEPTION
+            'T-LLR-10.2 direct SQL delete crossed project RLS: removed % rows',
+            deleted_count;
+    END IF;
+
+    BEGIN
+        DELETE FROM resource_nodes
+        WHERE id = '40000000-0000-0000-0000-000000000090';
+        direct_delete_succeeded := true;
+    EXCEPTION
+        WHEN insufficient_privilege THEN NULL;
+    END;
+    IF direct_delete_succeeded THEN
+        RAISE EXCEPTION
+            'T-LLR-10.2 direct SQL delete bypassed retention-only purge';
+    END IF;
+END;
+$test$;
+
+RESET ROLE;
+
+CREATE ROLE sprout_behavior_service NOLOGIN BYPASSRLS;
+GRANT USAGE ON SCHEMA public TO sprout_behavior_service;
+GRANT SELECT ON resource_nodes TO sprout_behavior_service;
+SET LOCAL ROLE sprout_behavior_service;
+
+DO $test$
+DECLARE
+    cross_project_count integer;
+BEGIN
+    SELECT count(*) INTO cross_project_count
+    FROM resource_nodes
+    WHERE project_id = '30000000-0000-0000-0000-000000000002';
+    IF cross_project_count = 0 THEN
+        RAISE EXCEPTION
+            'T-LLR-10.2 provisioned BYPASSRLS service role could not read worker data';
     END IF;
 END;
 $test$;
