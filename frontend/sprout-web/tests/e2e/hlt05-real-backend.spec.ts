@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { expect, test } from '@playwright/test'
 
@@ -25,12 +26,17 @@ interface Hlt05Evidence {
 
 const evidencePath =
   process.env.HLT05_EVIDENCE_PATH ?? '/evidence/hlt05.json'
+const evidencePathWasConfigured = Boolean(process.env.HLT05_EVIDENCE_PATH)
 
 test('HLT-05 real backend preserves provenance across offline sync and second-device read', async ({
   browser,
   browserName,
 }) => {
   test.skip(browserName !== 'chromium', 'OPFS staging is exercised in Chromium')
+  test.skip(
+    !evidencePathWasConfigured && !existsSync(evidencePath),
+    'Requires backend-generated HLT-05 evidence',
+  )
   const evidence = JSON.parse(
     await readFile(evidencePath, 'utf8'),
   ) as Hlt05Evidence

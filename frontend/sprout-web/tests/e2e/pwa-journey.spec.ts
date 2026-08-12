@@ -106,7 +106,7 @@ test('HLT-09 upgrades a signed queue, works offline, and catches up', async ({
   await page.unroute('**/assets/*.js')
   await page.reload()
   await expect(
-    page.getByRole('heading', { name: /sign in with a passkey/i }),
+    page.getByText('Workspace cifrato, solo sui tuoi device.'),
   ).toBeVisible()
 
   const upgraded = await page.evaluate(async () => {
@@ -159,7 +159,7 @@ test('HLT-09 upgrades a signed queue, works offline, and catches up', async ({
   // Reload once under SW control so generated assets enter the shell cache.
   await page.reload()
   await expect(
-    page.getByRole('heading', { name: /sign in with a passkey/i }),
+    page.getByText('Workspace cifrato, solo sui tuoi device.'),
   ).toBeVisible()
   await expect
     .poll(() =>
@@ -182,7 +182,7 @@ test('HLT-09 upgrades a signed queue, works offline, and catches up', async ({
   await context.setOffline(true)
   await page.reload({ waitUntil: 'domcontentloaded' })
   await expect(
-    page.getByRole('heading', { name: /sign in with a passkey/i }),
+    page.getByText('Workspace cifrato, solo sui tuoi device.'),
   ).toBeVisible()
 
   let pushed = 0

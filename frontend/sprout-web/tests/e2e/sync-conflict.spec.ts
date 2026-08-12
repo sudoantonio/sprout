@@ -16,10 +16,10 @@ test('T-LLR-07.4 two browser contexts expose independent offline conflict surfac
     await alicePage.goto('/')
     await bobPage.goto('/')
     await expect(
-      alicePage.getByRole('heading', { name: /sign in with a passkey/i }),
+      alicePage.getByRole('heading', { name: 'Crea account' }),
     ).toBeVisible()
     await expect(
-      bobPage.getByRole('heading', { name: /sign in with a passkey/i }),
+      bobPage.getByRole('heading', { name: 'Crea account' }),
     ).toBeVisible()
 
     const aliceStorage = await alicePage.evaluate(() => ({

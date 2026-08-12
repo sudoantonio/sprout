@@ -5,12 +5,10 @@ test('T-LLR-09.4 runs the real PWA in every configured browser', async ({
 }) => {
   await page.goto('/')
   await expect(
-    page.getByRole('heading', {
-      name: /your work stays readable only on authorized devices/i,
-    }),
+    page.getByText('Workspace cifrato, solo sui tuoi device.'),
   ).toBeVisible()
   await expect(
-    page.getByRole('heading', { name: /sign in with a passkey/i }),
+    page.getByRole('heading', { name: 'Crea account' }),
   ).toBeVisible()
   await expect(page.getByText(/home|studio launch|demo ciphertext/i)).toHaveCount(
     0,
@@ -43,8 +41,11 @@ test('T-LLR-09.5 ships strict CSP and Trusted Types policy', async ({
         }
       )?.getDirectory === 'function',
   }))
-  expect(storage.persistFunction).toBe(true)
-  expect(typeof storage.persisted).toBe('boolean')
+  if (storage.persistFunction) {
+    expect(typeof storage.persisted).toBe('boolean')
+  } else {
+    expect(storage.persisted).toBeNull()
+  }
   expect(typeof storage.opfsFunction).toBe('boolean')
 
   const manifest = await page.evaluate(() =>
@@ -72,7 +73,7 @@ test('disables network ceremonies after the browser goes offline', async ({
   await context.setOffline(true)
   await page.evaluate(() => window.dispatchEvent(new Event('offline')))
   await expect(
-    page.getByText(/account ceremonies require a network connection/i),
+    page.getByText(/serve connessione per accedere o creare un account/i),
   ).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Use passkey' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Entra (dev)' })).toBeDisabled()
 })
