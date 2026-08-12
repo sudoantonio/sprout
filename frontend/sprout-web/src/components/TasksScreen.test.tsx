@@ -6,8 +6,10 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import type { DecryptedTask } from '../domain/models'
+import { startOfWeek } from '../domain/timeline'
 import type {
   BoardMember,
   ProjectItem,
@@ -21,6 +23,13 @@ const topicId = crypto.randomUUID()
 const listId = crypto.randomUUID()
 const memberId = crypto.randomUUID()
 const otherMemberId = crypto.randomUUID()
+
+const timelineDueAt = (dayOffset: number, hour: number): string => {
+  const dueAt = startOfWeek(new Date())
+  dueAt.setDate(dueAt.getDate() + dayOffset)
+  dueAt.setHours(hour, 0, 0, 0)
+  return dueAt.toISOString()
+}
 
 const project: ProjectItem = {
   wire: {
@@ -201,9 +210,11 @@ describe('board shell', () => {
     expect(screen.getByText('Admin Minerva')).toBeTruthy()
     expect(screen.getByRole('button', { name: /Progetto: Project/i })).toBeTruthy()
 
-    await user.click(screen.getByRole('button', { name: /Nuova categoria/i }))
-    await user.type(screen.getByLabelText('Topic name'), 'Ospiti')
-    await user.click(screen.getByRole('button', { name: /^Crea$/i }))
+    await user.click(
+      sidebar().getByRole('button', { name: /Nuova categoria/i }),
+    )
+    await user.type(sidebar().getByLabelText('Topic name'), 'Ospiti')
+    await user.click(sidebar().getByRole('button', { name: /^Crea$/i }))
     expect(onCreateTopic).toHaveBeenCalledWith('Ospiti')
   })
 
@@ -243,15 +254,21 @@ describe('board shell', () => {
   it('creates a project from the sidebar toolbar switcher', async () => {
     const user = userEvent.setup()
     const onCreateProject = vi.fn()
-    render(
-      <TasksScreen
-        {...baseProps}
-        userMenu={{
-          ...baseProps.userMenu,
-          onCreateProject,
-        }}
-      />,
-    )
+    const ProjectCreationHarness = () => {
+      const [projectName, setProjectName] = useState('')
+      return (
+        <TasksScreen
+          {...baseProps}
+          userMenu={{
+            ...baseProps.userMenu,
+            projectName,
+            onProjectNameChange: setProjectName,
+            onCreateProject,
+          }}
+        />
+      )
+    }
+    render(<ProjectCreationHarness />)
 
     await user.click(screen.getByRole('button', { name: /Progetto: Project/i }))
     await user.click(screen.getByRole('menuitem', { name: /Nuovo progetto/i }))
@@ -303,9 +320,9 @@ describe('board shell', () => {
   it('shows the board and timeline switch next to the filter', () => {
     render(<TasksScreen {...baseProps} />)
 
-    expect(screen.getByRole('group', { name: 'Vista board' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Board/i })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Timeline/i })).toBeTruthy()
+    const viewSwitch = within(screen.getByRole('group', { name: 'Vista board' }))
+    expect(viewSwitch.getByRole('button', { name: /Board/i })).toBeTruthy()
+    expect(viewSwitch.getByRole('button', { name: /Timeline/i })).toBeTruthy()
   })
 
   it('switches to timeline view and hides kanban columns', async () => {
@@ -313,9 +330,9 @@ describe('board shell', () => {
     const onBoardViewModeChange = vi.fn()
     const deadlineTask = makeTask('Scadenza', listId, memberId, {
       kind: 'deadline',
-      dueAt: '2026-07-22T14:00:00.000Z',
+      dueAt: timelineDueAt(2, 14),
     })
-    render(
+    const { rerender } = render(
       <TasksScreen
         {...baseProps}
         tasks={[deadlineTask]}
@@ -323,10 +340,15 @@ describe('board shell', () => {
       />,
     )
 
-    await user.click(screen.getByRole('button', { name: /^Timeline$/i }))
+    await user.click(
+      within(screen.getByRole('group', { name: 'Vista board' })).getByRole(
+        'button',
+        { name: /^Timeline$/i },
+      ),
+    )
     expect(onBoardViewModeChange).toHaveBeenCalledWith('timeline')
 
-    render(
+    rerender(
       <TasksScreen
         {...baseProps}
         tasks={[deadlineTask]}
@@ -344,7 +366,7 @@ describe('board shell', () => {
     const priorityTask = makeTask('Priorità', listId, memberId)
     const deadlineTask = makeTask('Scadenza', listId, memberId, {
       kind: 'deadline',
-      dueAt: '2026-07-22T14:00:00.000Z',
+      dueAt: timelineDueAt(2, 14),
     })
 
     render(
@@ -362,11 +384,11 @@ describe('board shell', () => {
   it('keeps timeline tasks scoped to member focus', () => {
     const memberTask = makeTask('Member due', listId, memberId, {
       kind: 'deadline',
-      dueAt: '2026-07-22T14:00:00.000Z',
+      dueAt: timelineDueAt(2, 14),
     })
     const otherTask = makeTask('Other due', otherList.wire.id, otherMemberId, {
       kind: 'deadline',
-      dueAt: '2026-07-22T15:00:00.000Z',
+      dueAt: timelineDueAt(2, 15),
     })
 
     render(
@@ -389,15 +411,13 @@ describe('board shell', () => {
     expect(
       screen.getByRole('complementary', { name: 'Board navigation' }),
     ).toHaveAttribute('aria-expanded', 'true')
-    expect(screen.getByText('Nuova categoria')).toBeTruthy()
+    expect(sidebar().getByText('Nuova categoria')).toBeTruthy()
 
     await user.click(screen.getByRole('button', { name: /Riduci sidebar/i }))
     expect(
       screen.getByRole('complementary', { name: 'Board navigation' }),
     ).toHaveAttribute('aria-expanded', 'false')
-    await waitFor(() => {
-      expect(screen.getByText('Nuova categoria')).toBeTruthy()
-    })
+    expect(sidebar().queryByText('Nuova categoria')).toBeNull()
     expect(sidebar().getByRole('button', { name: /Generali/i })).toBeTruthy()
     expect(
       screen.getByRole('button', { name: /Espandi sidebar/i }),
@@ -407,7 +427,7 @@ describe('board shell', () => {
     expect(
       screen.getByRole('complementary', { name: 'Board navigation' }),
     ).toHaveAttribute('aria-expanded', 'true')
-    expect(screen.getByText('Nuova categoria')).toBeTruthy()
+    expect(sidebar().getByText('Nuova categoria')).toBeTruthy()
   })
 
   it('shows member columns when selecting a member', () => {
@@ -595,10 +615,11 @@ describe('board shell', () => {
     await user.click(
       within(dialog).getByRole('menuitemradio', { name: 'Checklist · v1' }),
     )
-    await user.upload(
-      within(dialog).getByLabelText('Allega file'),
-      file,
+    const attachmentInput = dialog.querySelector<HTMLInputElement>(
+      'input[type="file"]',
     )
+    expect(attachmentInput).not.toBeNull()
+    await user.upload(attachmentInput!, file)
     await user.click(within(dialog).getByRole('button', { name: /^Crea$/i }))
 
     expect(onCreateTask).toHaveBeenCalledWith(
@@ -658,7 +679,10 @@ describe('board shell', () => {
             source_attachment_id: null,
             assignment_id: null,
             encrypted_metadata: null,
-            state: { state: 'available' },
+            state: {
+              state: 'available',
+              uploaded_at: '2026-07-18T12:00:00.000Z',
+            },
             created_at: '2026-07-18T12:00:00.000Z',
           },
         ]}
@@ -762,7 +786,11 @@ describe('board shell', () => {
     await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
 
     const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
-    await user.upload(within(dialog).getByLabelText('Allega file'), file)
+    const attachmentInput = dialog.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    )
+    expect(attachmentInput).not.toBeNull()
+    await user.upload(attachmentInput!, file)
     expect(within(dialog).getByRole('button', { name: 'brief.pdf' })).toBeTruthy()
 
     await user.click(within(dialog).getByRole('button', { name: 'brief.pdf' }))
@@ -938,7 +966,7 @@ describe('board shell', () => {
     await user.type(input, 'Annullato{Escape}')
 
     expect(onRenameTopic).not.toHaveBeenCalled()
-    expect(screen.getByRole('button', { name: /Impianti/i })).toBeTruthy()
+    expect(sidebar().getByRole('button', { name: /Impianti/i })).toBeTruthy()
   })
 
   it('sorts favorite topics to the top of the sidebar', () => {
@@ -1047,13 +1075,19 @@ describe('board shell', () => {
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(
-      within(column).getByRole('button', { name: 'Modifica Elena Russo' }),
+      within(column).getByRole('button', {
+        name: 'Apri dettaglio di Elena Russo',
+      }),
+    )
+    const history = screen.getByRole('region', { name: 'Storico Elena Russo' })
+    await user.click(
+      within(history).getByRole('button', { name: 'Modifica Elena Russo' }),
     )
 
     const input = screen.getByLabelText('Modifica nome task list')
     expect(input).toHaveValue('Elena Russo')
     expect(
-      within(column).getByRole('button', { name: 'Conferma modifiche task list' }),
+      within(history).getByRole('button', { name: 'Conferma modifiche task list' }),
     ).toBeTruthy()
   })
 
@@ -1064,7 +1098,13 @@ describe('board shell', () => {
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(
-      within(column).getByRole('button', { name: 'Modifica Elena Russo' }),
+      within(column).getByRole('button', {
+        name: 'Apri dettaglio di Elena Russo',
+      }),
+    )
+    const history = screen.getByRole('region', { name: 'Storico Elena Russo' })
+    await user.click(
+      within(history).getByRole('button', { name: 'Modifica Elena Russo' }),
     )
 
     const input = screen.getByLabelText('Modifica nome task list')
@@ -1072,12 +1112,12 @@ describe('board shell', () => {
     await user.type(input, 'Pomeriggio')
 
     await user.click(
-      within(column).getByRole('button', { name: 'Scegli icona task list' }),
+      within(history).getByRole('button', { name: 'Scegli icona task list' }),
     )
     await user.click(screen.getByRole('option', { name: 'Rosa' }))
 
     await user.click(
-      within(column).getByRole('button', { name: 'Conferma modifiche task list' }),
+      within(history).getByRole('button', { name: 'Conferma modifiche task list' }),
     )
 
     await waitFor(() => {
@@ -1095,7 +1135,13 @@ describe('board shell', () => {
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(
-      within(column).getByRole('button', { name: 'Modifica Elena Russo' }),
+      within(column).getByRole('button', {
+        name: 'Apri dettaglio di Elena Russo',
+      }),
+    )
+    const history = screen.getByRole('region', { name: 'Storico Elena Russo' })
+    await user.click(
+      within(history).getByRole('button', { name: 'Modifica Elena Russo' }),
     )
 
     const input = screen.getByLabelText('Modifica nome task list')
@@ -1103,6 +1149,9 @@ describe('board shell', () => {
     await user.type(input, 'Annullato{Escape}')
 
     expect(onUpdateTaskList).not.toHaveBeenCalled()
-    expect(screen.getByRole('listitem', { name: 'Elena Russo' })).toBeTruthy()
+    expect(within(history).getByRole('heading', { name: 'Elena Russo' })).toBeTruthy()
+    expect(
+      within(history).getByRole('button', { name: 'Modifica Elena Russo' }),
+    ).toBeTruthy()
   })
 })

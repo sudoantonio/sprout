@@ -23,6 +23,12 @@ import {
 
 const now = new Date('2026-07-18T12:00:00.000Z')
 
+const completedState = (): TaskDto['state'] => ({
+  state: 'completed',
+  completed_by: crypto.randomUUID(),
+  completed_at: now.toISOString(),
+})
+
 const wire = (state: TaskDto['state']): TaskDto => ({
   id: crypto.randomUUID(),
   project_id: crypto.randomUUID(),
@@ -316,7 +322,7 @@ describe('recurring completion semantics', () => {
 
 describe('getTaskStatusIndicator', () => {
   it('marks completed tasks', () => {
-    const completed = task({ state: 'completed' })
+    const completed = task(completedState())
     expect(getTaskStatusIndicator(completed, now)).toEqual({
       variant: 'completed',
       label: 'Completata',
@@ -399,7 +405,9 @@ describe('getTaskDueProgress', () => {
     delete priority.document.due_at
     expect(getTaskDueProgress(priority, now)).toBeUndefined()
 
-    expect(getTaskDueProgress(task({ state: 'completed' }, now.toISOString()), now)).toBeUndefined()
+    expect(
+      getTaskDueProgress(task(completedState(), now.toISOString()), now),
+    ).toBeUndefined()
   })
 
   it('returns 1 when overdue or at due moment', () => {
@@ -414,9 +422,11 @@ describe('getTaskDueProgress', () => {
 
   it('interpolates linearly across the seven-day window', () => {
     const dueSoon = task({ state: 'open' }, '2026-07-22T09:00:00.000Z')
+    dueSoon.wire.created_at = '2026-07-01T00:00:00.000Z'
     expect(getTaskDueProgress(dueSoon, now)).toBeCloseTo(3.125 / 7, 5)
 
     const dueToday = task({ state: 'open' }, '2026-07-18T18:00:00.000Z')
+    dueToday.wire.created_at = '2026-07-01T00:00:00.000Z'
     expect(getTaskDueProgress(dueToday, now)).toBeCloseTo(6.75 / 7, 5)
   })
 
@@ -650,4 +660,3 @@ describe('task list urgency ordering', () => {
     ])
   })
 })
-
