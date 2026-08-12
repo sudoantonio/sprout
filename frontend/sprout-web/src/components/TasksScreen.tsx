@@ -3355,6 +3355,16 @@ export const TasksScreen = ({
             ? 'Il progetto selezionato non è stato caricato. Attendi qualche secondo e ricarica la pagina se il problema persiste.'
             : 'Create or select an encrypted project to load its resources.'}
         </p>
+        {!hasSelectedProject && (
+          <BoardProjectSwitcher
+            projects={userMenu.projects}
+            selectedProjectId={userMenu.selectedProjectId}
+            projectName={userMenu.projectName}
+            onProjectNameChange={userMenu.onProjectNameChange}
+            onSelectProject={userMenu.onSelectProject}
+            onCreateProject={userMenu.onCreateProject}
+          />
+        )}
       </section>
     )
   }

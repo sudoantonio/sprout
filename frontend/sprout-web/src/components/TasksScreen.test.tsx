@@ -198,6 +198,38 @@ describe('board shell', () => {
   const sidebar = () =>
     within(screen.getByRole('complementary', { name: 'Board navigation' }))
 
+  it('creates the first project from the empty state', async () => {
+    const user = userEvent.setup()
+    const onCreateProject = vi.fn()
+    const ProjectCreationHarness = () => {
+      const [projectName, setProjectName] = useState('')
+      return (
+        <TasksScreen
+          {...baseProps}
+          project={undefined}
+          userMenu={{
+            ...baseProps.userMenu,
+            projects: [],
+            selectedProjectId: undefined,
+            projectName,
+            onProjectNameChange: setProjectName,
+            onCreateProject,
+          }}
+        />
+      )
+    }
+    render(<ProjectCreationHarness />)
+
+    await user.click(
+      screen.getByRole('button', { name: /Progetto: Seleziona progetto/i }),
+    )
+    await user.click(screen.getByRole('menuitem', { name: /Nuovo progetto/i }))
+    await user.type(screen.getByLabelText('Nome nuovo progetto'), 'Primo')
+    await user.click(screen.getByRole('button', { name: /^Crea$/i }))
+
+    expect(onCreateProject).toHaveBeenCalled()
+  })
+
   it('shows generali, members, topics, and creates a topic', async () => {
     const user = userEvent.setup()
     const onCreateTopic = vi.fn().mockResolvedValue(undefined)
