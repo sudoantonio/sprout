@@ -505,7 +505,7 @@ pub async fn participant_suggestions(
     )
     .bind(project_id)
     .bind(&request.prefix)
-    .bind(i64::from(request.limit))
+    .bind(i32::from(request.limit))
     .fetch_all(&mut *transaction)
     .await?;
     transaction.commit().await?;
