@@ -43,6 +43,9 @@ import {
   resolveTaskListIconColorFromStored,
   TASK_LIST_ICON_COLORS,
   type DecryptedTask,
+  type DecryptedInfoDocument,
+  type InfoDocumentContent,
+  type InfoFileBlock,
   type TaskCreationInput,
   type TaskDocument,
   type TaskFilter,
@@ -128,6 +131,28 @@ export interface TasksScreenProps {
       color?: TaskListColumnColor
       icon?: TaskListIcon
     },
+  ): Promise<void>
+  onLoadTaskListInfo(list: TaskListItem): Promise<DecryptedInfoDocument[]>
+  onCreateTaskListInfoDocument(
+    list: TaskListItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onUpdateInfoDocument(
+    document: DecryptedInfoDocument,
+    content: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onUploadInfoDocumentFile(
+    document: DecryptedInfoDocument,
+    file: File,
+  ): Promise<InfoFileBlock>
+  onReadInfoDocumentFile(
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
+  ): Promise<Blob>
+  onDownloadInfoDocumentFile(
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
   ): Promise<void>
   onCreateTask(input: TaskCreationInput, listId: Uuid): Promise<void>
   onUpdateTask(
@@ -2725,6 +2750,12 @@ export const TasksScreen = ({
   onDeleteTopic,
   onCreateList,
   onUpdateTaskList,
+  onLoadTaskListInfo,
+  onCreateTaskListInfoDocument,
+  onUpdateInfoDocument,
+  onUploadInfoDocumentFile,
+  onReadInfoDocumentFile,
+  onDownloadInfoDocumentFile,
   onCreateTask,
   onUpdateTask,
   onAssignTask,
@@ -3953,6 +3984,12 @@ export const TasksScreen = ({
                 return next
               })
             }}
+            onLoadInfo={onLoadTaskListInfo}
+            onCreateInfoDocument={onCreateTaskListInfoDocument}
+            onUpdateInfoDocument={onUpdateInfoDocument}
+            onUploadInfoFile={onUploadInfoDocumentFile}
+            onReadInfoFile={onReadInfoDocumentFile}
+            onDownloadInfoFile={onDownloadInfoDocumentFile}
             onSelectTask={(id) => {
               closeListHistory()
               onSelectTask(id)

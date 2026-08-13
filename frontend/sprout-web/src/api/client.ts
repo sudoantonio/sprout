@@ -2,11 +2,14 @@ import type {
   AssignmentDto,
   AttachmentDto,
   CreateAttachmentResponse,
+  CreateInfoDocumentFileRequest,
+  CreateInfoDocumentRequest,
   CreatePretaskTemplateAttachmentRequest,
   CreateQuestionnaireVersionRequest,
   CreateTaskCompletedAttachmentRequest,
   CreateTaskRequiredAttachmentRequest,
   ListAttachmentsResponse,
+  ListInfoDocumentsResponse,
   DeviceKeyPackageView,
   DeviceSessionRequest,
   EmailStartResponse,
@@ -18,6 +21,7 @@ import type {
   ListPresetsResponse,
   MaterializationChoiceDto,
   MaterializePresetResponse,
+  InfoDocumentResponse,
   ListRetentionArchivesResponse,
   ListRetentionWarningsResponse,
   ListTaskListsResponse,
@@ -55,6 +59,7 @@ import type {
   TopicDto,
   Uuid,
   UpdateQuestionnaireDraftRequest,
+  UpdateInfoDocumentRequest,
   UpsertQuestionnaireDraftRequest,
   WebAuthnChallenge,
 } from './contracts'
@@ -513,6 +518,64 @@ export class ApiClient {
     })
   }
 
+  listTaskListInfoDocuments(
+    projectId: Uuid,
+    listId: Uuid,
+  ): Promise<ListInfoDocumentsResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/task-lists/${listId}/info-documents`,
+    )
+  }
+
+  listTopicInfoDocuments(
+    projectId: Uuid,
+    topicId: Uuid,
+  ): Promise<ListInfoDocumentsResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/topics/${topicId}/info-documents`,
+    )
+  }
+
+  createTaskListInfoDocument(
+    projectId: Uuid,
+    listId: Uuid,
+    body: CreateInfoDocumentRequest,
+  ): Promise<InfoDocumentResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/task-lists/${listId}/info-documents`,
+      { method: 'POST', body },
+    )
+  }
+
+  createTopicInfoDocument(
+    projectId: Uuid,
+    topicId: Uuid,
+    body: CreateInfoDocumentRequest,
+  ): Promise<InfoDocumentResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/topics/${topicId}/info-documents`,
+      { method: 'POST', body },
+    )
+  }
+
+  updateInfoDocument(
+    projectId: Uuid,
+    documentId: Uuid,
+    body: UpdateInfoDocumentRequest,
+  ): Promise<InfoDocumentResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/info-documents/${documentId}`,
+      { method: 'PUT', body },
+    )
+  }
+
+  deleteInfoDocument(projectId: Uuid, documentId: Uuid): Promise<void> {
+    return this.request(
+      `/v1/projects/${projectId}/info-documents/${documentId}`,
+      { method: 'DELETE' },
+    )
+  }
+
   listTasks(projectId: Uuid, listId: Uuid): Promise<ListTasksResponse> {
     return this.request(
       `/v1/projects/${projectId}/task-lists/${listId}/tasks`,
@@ -861,6 +924,17 @@ export class ApiClient {
   ): Promise<CreateAttachmentResponse> {
     return this.request(
       `/v1/projects/${projectId}/tasks/${taskId}/completed-attachments`,
+      { method: 'POST', body },
+    )
+  }
+
+  declareInfoDocumentFile(
+    projectId: Uuid,
+    documentId: Uuid,
+    body: CreateInfoDocumentFileRequest,
+  ): Promise<CreateAttachmentResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/info-documents/${documentId}/files`,
       { method: 'POST', body },
     )
   }

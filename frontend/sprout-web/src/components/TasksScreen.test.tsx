@@ -8,7 +8,7 @@ import {
 import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
-import type { DecryptedTask } from '../domain/models'
+import type { DecryptedInfoDocument, DecryptedTask } from '../domain/models'
 import { startOfWeek } from '../domain/timeline'
 import type {
   BoardMember,
@@ -89,6 +89,32 @@ const otherList: TaskListItem = {
   document: { schema: 1, name: 'Mattina' },
 }
 
+const infoRoot: DecryptedInfoDocument = {
+  wire: {
+    id: crypto.randomUUID(),
+    project_id: projectId,
+    topic_id: null,
+    task_list_id: listId,
+    parent_document_id: null,
+    resource_node_id: taskList.wire.resource_node_id,
+    payload: taskList.wire.payload!,
+    key_epoch: 1,
+    payload_version: 1,
+    created_at: '2026-07-18T12:00:00.000Z',
+    updated_at: '2026-07-18T12:00:00.000Z',
+  },
+  document: {
+    schema: 1,
+    blocks: [
+      {
+        id: crypto.randomUUID(),
+        type: 'text',
+        markdown: '# Informazioni\nhttps://sprout.test',
+      },
+    ],
+  },
+}
+
 const members: BoardMember[] = [
   { identityId: memberId, label: 'Elena Russo' },
   { identityId: otherMemberId, label: 'Lucia Bianchi' },
@@ -167,6 +193,19 @@ const baseProps = {
   onDeleteTopic: vi.fn().mockResolvedValue(undefined),
   onCreateList: vi.fn().mockResolvedValue(undefined),
   onUpdateTaskList: vi.fn().mockResolvedValue(undefined),
+  onLoadTaskListInfo: vi.fn().mockResolvedValue([infoRoot]),
+  onCreateTaskListInfoDocument: vi.fn().mockResolvedValue(infoRoot),
+  onUpdateInfoDocument: vi.fn().mockResolvedValue(infoRoot),
+  onUploadInfoDocumentFile: vi.fn().mockResolvedValue({
+    id: crypto.randomUUID(),
+    type: 'file',
+    blob_id: crypto.randomUUID(),
+    file_name: 'documento.pdf',
+    content_type: 'application/pdf',
+    plaintext_size: 10,
+  }),
+  onReadInfoDocumentFile: vi.fn().mockResolvedValue(new Blob(['file'])),
+  onDownloadInfoDocumentFile: vi.fn().mockResolvedValue(undefined),
   onCreateTask: vi.fn().mockResolvedValue(undefined),
   onUpdateTask: vi.fn().mockResolvedValue(undefined),
   onAssignTask: vi.fn().mockResolvedValue(undefined),
@@ -1185,5 +1224,44 @@ describe('board shell', () => {
     expect(
       within(history).getByRole('button', { name: 'Modifica Elena Russo' }),
     ).toBeTruthy()
+  })
+
+  it('switches from task history to encrypted task-list info', async () => {
+    const user = userEvent.setup()
+    const onLoadTaskListInfo = vi.fn().mockResolvedValue([infoRoot])
+    const onUpdateInfoDocument = vi.fn().mockImplementation(
+      async (document: DecryptedInfoDocument, content) => ({
+        ...document,
+        document: content,
+      }),
+    )
+    render(
+      <TasksScreen
+        {...baseProps}
+        onLoadTaskListInfo={onLoadTaskListInfo}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const column = screen.getByRole('listitem', { name: 'Elena Russo' })
+    await user.click(
+      within(column).getByRole('button', {
+        name: 'Apri dettaglio di Elena Russo',
+      }),
+    )
+    await user.click(screen.getByRole('tab', { name: 'Info' }))
+
+    await waitFor(() => {
+      expect(onLoadTaskListInfo).toHaveBeenCalledWith(taskList)
+    })
+    expect(
+      await screen.findByRole('link', { name: 'https://sprout.test' }),
+    ).toHaveAttribute('href', 'https://sprout.test')
+
+    await user.click(screen.getByRole('button', { name: /Testo/i }))
+    await user.type(screen.getByLabelText('Testo info in Markdown'), '\nDettagli')
+    await user.click(screen.getByRole('button', { name: 'Salva' }))
+
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalled())
   })
 })
