@@ -240,18 +240,23 @@ export const configureCryptoModuleForTests = (
   modulePromise = undefined
 }
 
-const kindCode = (kind: ResourceKind): number =>
+const RESOURCE_PAYLOAD_CONTENT_KIND = 1
+
+// Builds before the content-kind boundary was corrected wrote the application
+// resource kind into this byte. Values 2-4 happened to be accepted as other
+// protocol content kinds, so keep a read-only fallback for those payloads.
+const legacyContentKind = (kind: ResourceKind): number | undefined =>
   (
     {
-      project: 1,
+      project: undefined,
       topic: 2,
       'task-list': 3,
       task: 4,
-      preset: 5,
-      recurrence: 6,
-      questionnaire: 7,
-      attachment: 8,
-    } satisfies Record<ResourceKind, number>
+      preset: undefined,
+      recurrence: undefined,
+      questionnaire: undefined,
+      attachment: undefined,
+    } satisfies Record<ResourceKind, number | undefined>
   )[kind]
 
 export const resourceAad = (
@@ -269,7 +274,7 @@ const canonicalHeader = (
   module: SproutCryptoModule,
   resourceId: Uuid,
   keyId: Uuid,
-  kind: ResourceKind,
+  contentKind: number,
   aggregateVersion: number,
   previousHash: Uint8Array,
   aad: Uint8Array,
@@ -277,7 +282,7 @@ const canonicalHeader = (
   module.canonicalHeader(
     1,
     1,
-    kindCode(kind),
+    contentKind,
     uuidToBytes(resourceId),
     uuidToBytes(keyId),
     BigInt(
@@ -316,7 +321,7 @@ export const encryptDocument = async <T>(
     module,
     options.resourceId,
     options.keyId,
-    options.kind,
+    RESOURCE_PAYLOAD_CONTENT_KIND,
     options.aggregateVersion,
     previousHash,
     aad,
@@ -400,18 +405,21 @@ export const encryptDocument = async <T>(
   }
 }
 
-export const decryptDocument = async <T>(
+type DocumentDecryptionOptions = {
+  projectId: Uuid
+  resourceId: Uuid
+  kind: ResourceKind
+  aggregateVersion: number
+  keyEpoch: number
+  previousHash?: Uint8Array
+  resourceKey: Uint8Array
+  hybridRecipient?: HybridDocumentDecryptionRecipient
+}
+
+const decryptDocumentWithContentKind = async <T>(
   encrypted: EncryptedPayloadDto,
-  options: {
-    projectId: Uuid
-    resourceId: Uuid
-    kind: ResourceKind
-    aggregateVersion: number
-    keyEpoch: number
-    previousHash?: Uint8Array
-    resourceKey: Uint8Array
-    hybridRecipient?: HybridDocumentDecryptionRecipient
-  },
+  options: DocumentDecryptionOptions,
+  contentKind: number,
 ): Promise<T> => {
   if (
     encrypted.version !== 1 ||
@@ -432,7 +440,7 @@ export const decryptDocument = async <T>(
     module,
     options.resourceId,
     encrypted.key_id,
-    options.kind,
+    contentKind,
     options.aggregateVersion,
     previousHash,
     aad,
@@ -498,6 +506,31 @@ export const decryptDocument = async <T>(
       header,
       aad,
     )
+  }
+}
+
+export const decryptDocument = async <T>(
+  encrypted: EncryptedPayloadDto,
+  options: DocumentDecryptionOptions,
+): Promise<T> => {
+  try {
+    return await decryptDocumentWithContentKind<T>(
+      encrypted,
+      options,
+      RESOURCE_PAYLOAD_CONTENT_KIND,
+    )
+  } catch (error) {
+    const legacy = legacyContentKind(options.kind)
+    if (legacy === undefined) throw error
+    try {
+      return await decryptDocumentWithContentKind<T>(
+        encrypted,
+        options,
+        legacy,
+      )
+    } catch {
+      throw error
+    }
   }
 }
 
