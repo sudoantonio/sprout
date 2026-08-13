@@ -121,7 +121,7 @@ pub async fn update_document(
         actor,
         project_id,
         current.resource_node_id,
-        ResourceAccess::Write,
+        ResourceAccess::EditInfo,
     )
     .await?;
     let payload = opaque_payload(&request.payload)?;
@@ -183,7 +183,7 @@ pub async fn delete_document(
         actor,
         project_id,
         current.resource_node_id,
-        ResourceAccess::Write,
+        ResourceAccess::EditInfo,
     )
     .await?;
     let mut transaction = begin(&state, actor, project_id).await?;
@@ -276,7 +276,7 @@ async fn create_document(
         actor,
         project_id,
         resource_node_id,
-        ResourceAccess::Write,
+        ResourceAccess::EditInfo,
     )
     .await?;
     let payload = opaque_payload(&request.payload)?;

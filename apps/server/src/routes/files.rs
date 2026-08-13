@@ -449,7 +449,7 @@ pub async fn create_info_document_file(
         actor,
         project_id,
         resource_node_id,
-        ResourceAccess::Write,
+        ResourceAccess::EditInfo,
     )
     .await?;
     create_attachment(
@@ -831,6 +831,16 @@ async fn load_authorized_file(
             let task_id = row.task_id.ok_or(AppError::Internal)?;
             let assignment_id = row.assignment_id.ok_or(AppError::Internal)?;
             require_exact_active_assignee(state, actor, project_id, task_id, assignment_id).await?;
+        }
+        FileAuthorization::Upload if row.attachment_kind == "info_document" => {
+            require_resource_access(
+                &state.pool,
+                actor,
+                project_id,
+                row.resource_node_id,
+                ResourceAccess::EditInfo,
+            )
+            .await?;
         }
         FileAuthorization::Upload => {
             require_resource_access(

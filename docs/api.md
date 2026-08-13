@@ -242,6 +242,10 @@ versions, epochs, tombstones, and one opaque payload per document. Markdown,
 URLs, filenames, MIME types, block order, and child labels stay inside the
 client-encrypted payload. The payload is protected by the container resource
 key and binds both the document UUID and container kind into canonical AAD.
+Info is collaborative: every caller with `full` body visibility on the
+associated topic or task list may read and edit its Info documents and files.
+This does not grant generic write access to the associated resource;
+`container_only` remains header-only and cannot access Info content.
 
 The validation image exposes matching helpers:
 

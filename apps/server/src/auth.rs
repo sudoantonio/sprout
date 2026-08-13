@@ -165,6 +165,9 @@ pub async fn require_project_access(
 pub enum ResourceAccess {
     ViewHeader,
     Read,
+    /// Edit encrypted Info content. Info is collaborative for every caller
+    /// with full body visibility, regardless of the resource access level.
+    EditInfo,
     Write,
     Manage,
 }
@@ -243,7 +246,7 @@ fn authorization_facts_allow(facts: AuthorizationFacts<'_>, access: ResourceAcce
         ResourceAccess::ViewHeader => {
             facts.owner_or_admin || facts.creator || facts.explicit_access.is_some()
         }
-        ResourceAccess::Read => {
+        ResourceAccess::Read | ResourceAccess::EditInfo => {
             facts.owner_or_admin
                 || facts.creator
                 || (facts.access_scope == Some("full") && facts.explicit_access.is_some())
@@ -425,7 +428,25 @@ mod tests {
         };
         assert!(authorization_facts_allow(facts, ResourceAccess::ViewHeader));
         assert!(!authorization_facts_allow(facts, ResourceAccess::Read));
+        assert!(!authorization_facts_allow(facts, ResourceAccess::EditInfo));
         assert!(!authorization_facts_allow(facts, ResourceAccess::Manage));
+    }
+
+    #[test]
+    fn info_edit_follows_full_body_visibility_not_generic_write() {
+        for access_level in ["view", "comment", "edit", "manage"] {
+            let facts = AuthorizationFacts {
+                owner_or_admin: false,
+                creator: false,
+                explicit_access: Some(access_level),
+                access_scope: Some("full"),
+            };
+            assert!(authorization_facts_allow(facts, ResourceAccess::EditInfo));
+            assert_eq!(
+                authorization_facts_allow(facts, ResourceAccess::Write),
+                matches!(access_level, "edit" | "manage")
+            );
+        }
     }
 
     #[test]
