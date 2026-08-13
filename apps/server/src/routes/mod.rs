@@ -5,6 +5,7 @@ mod domain;
 mod email;
 mod files;
 mod health;
+mod info_documents;
 mod pagination;
 mod permissions;
 mod project_recovery;
@@ -170,6 +171,11 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
                 .delete(task_flows::delete_topic),
         )
         .route(
+            "/v1/projects/{project_id}/topics/{topic_id}/info-documents",
+            get(info_documents::list_topic_documents)
+                .post(info_documents::create_topic_document),
+        )
+        .route(
             "/v1/projects/{project_id}/topics/{topic_id}/task-lists",
             get(task_flows::list_task_lists).post(task_flows::create_task_list),
         )
@@ -178,6 +184,21 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             get(task_flows::get_task_list)
                 .put(task_flows::update_task_list)
                 .delete(task_flows::delete_task_list),
+        )
+        .route(
+            "/v1/projects/{project_id}/task-lists/{list_id}/info-documents",
+            get(info_documents::list_task_list_documents)
+                .post(info_documents::create_task_list_document),
+        )
+        .route(
+            "/v1/projects/{project_id}/info-documents/{document_id}",
+            get(info_documents::get_document)
+                .put(info_documents::update_document)
+                .delete(info_documents::delete_document),
+        )
+        .route(
+            "/v1/projects/{project_id}/info-documents/{document_id}/files",
+            post(files::create_info_document_file),
         )
         .route(
             "/v1/projects/{project_id}/task-lists/{list_id}/tasks",

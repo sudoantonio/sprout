@@ -192,6 +192,9 @@ Task domain:
 - `GET|POST /v1/projects/{project_id}/topics/{topic_id}/task-lists`
 - `GET|PUT|DELETE /v1/projects/{project_id}/task-lists/{list_id}`
 - `GET /v1/projects/{project_id}/task-lists/{list_id}/tasks`
+- `GET|POST /v1/projects/{project_id}/topics/{topic_id}/info-documents`
+- `GET|POST /v1/projects/{project_id}/task-lists/{list_id}/info-documents`
+- `GET|PUT|DELETE /v1/projects/{project_id}/info-documents/{document_id}`
 - `POST /v1/projects/{project_id}/tasks`
 - `GET|PUT|DELETE /v1/projects/{project_id}/tasks/{task_id}`
 - `POST /v1/projects/{project_id}/tasks/{task_id}/{complete,copy,move}`
@@ -233,6 +236,13 @@ the permission removal in one transaction. Existing ciphertext keeps its
 original `key_epoch`; a later edit must encrypt under the active epoch and
 submit that epoch with the update.
 
+Info documents form an ordered, recursively nested document tree within a
+topic or task-list resource. PostgreSQL stores only container/parent UUIDs,
+versions, epochs, tombstones, and one opaque payload per document. Markdown,
+URLs, filenames, MIME types, block order, and child labels stay inside the
+client-encrypted payload. The payload is protected by the container resource
+key and binds both the document UUID and container kind into canonical AAD.
+
 The validation image exposes matching helpers:
 
 ```bash
@@ -261,6 +271,7 @@ Files and attachments:
 - `GET|POST /v1/projects/{project_id}/preset-versions/{version_id}/pretasks/{pretask_id}/attachments`
 - `GET|POST /v1/projects/{project_id}/tasks/{task_id}/required-attachments`
 - `GET|POST /v1/projects/{project_id}/tasks/{task_id}/completed-attachments`
+- `POST /v1/projects/{project_id}/info-documents/{document_id}/files`
 - `GET /v1/projects/{project_id}/files/{blob_id}`
 - `GET|PUT /v1/projects/{project_id}/files/{blob_id}/content`
 

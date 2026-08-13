@@ -244,6 +244,64 @@ VALUES (
     decode('01', 'hex')
 );
 
+INSERT INTO info_documents (
+    id, project_id, task_list_id, resource_node_id,
+    encrypted_payload, key_epoch, created_by_identity_id
+)
+VALUES (
+    '51500000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '51000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000003',
+    decode('01', 'hex'), 1,
+    '10000000-0000-0000-0000-000000000001'
+);
+
+INSERT INTO info_documents (
+    id, project_id, task_list_id, parent_document_id, resource_node_id,
+    encrypted_payload, key_epoch, created_by_identity_id
+)
+VALUES (
+    '51500000-0000-0000-0000-000000000002',
+    '30000000-0000-0000-0000-000000000001',
+    '51000000-0000-0000-0000-000000000001',
+    '51500000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000003',
+    decode('02', 'hex'), 1,
+    '10000000-0000-0000-0000-000000000001'
+);
+
+DO $test$
+BEGIN
+    BEGIN
+        INSERT INTO info_documents (
+            id, project_id, task_list_id, resource_node_id,
+            encrypted_payload, key_epoch, created_by_identity_id
+        )
+        VALUES (
+            '51500000-0000-0000-0000-000000000003',
+            '30000000-0000-0000-0000-000000000001',
+            '51000000-0000-0000-0000-000000000001',
+            '40000000-0000-0000-0000-000000000003',
+            decode('03', 'hex'), 1,
+            '10000000-0000-0000-0000-000000000001'
+        );
+        RAISE EXCEPTION 'second active task-list info root unexpectedly succeeded';
+    EXCEPTION
+        WHEN unique_violation THEN NULL;
+    END;
+
+    BEGIN
+        UPDATE info_documents
+        SET resource_node_id = '40000000-0000-0000-0000-000000000002'
+        WHERE id = '51500000-0000-0000-0000-000000000002';
+        RAISE EXCEPTION 'info document escaped its encrypted container';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+END;
+$test$;
+
 INSERT INTO tasks (id, project_id, task_list_id, resource_node_id, encrypted_payload)
 VALUES (
     '52000000-0000-0000-0000-000000000001',

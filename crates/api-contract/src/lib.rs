@@ -509,6 +509,50 @@ pub struct ListTaskListsResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct InfoDocumentDto {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub topic_id: Option<Uuid>,
+    pub task_list_id: Option<Uuid>,
+    pub parent_document_id: Option<Uuid>,
+    pub resource_node_id: Uuid,
+    pub payload: EncryptedPayloadDto,
+    pub key_epoch: u32,
+    pub payload_version: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct CreateInfoDocumentRequest {
+    pub id: Uuid,
+    pub parent_document_id: Option<Uuid>,
+    pub resource_node_id: Uuid,
+    pub key_epoch: u32,
+    pub payload: EncryptedPayloadDto,
+    pub idempotency_key: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct UpdateInfoDocumentRequest {
+    pub expected_payload_version: u64,
+    pub key_epoch: u32,
+    pub payload: EncryptedPayloadDto,
+    pub idempotency_key: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct InfoDocumentResponse {
+    pub document: InfoDocumentDto,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ListInfoDocumentsResponse {
+    /// Parent/child ordering is carried only inside encrypted document payloads.
+    pub documents: Vec<InfoDocumentDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct CreateTaskRequest {
     pub id: Uuid,
     pub list_id: Uuid,
@@ -988,6 +1032,7 @@ pub enum AttachmentKindDto {
     PretaskTemplate,
     TaskRequired,
     TaskCompleted,
+    InfoDocument,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -1066,6 +1111,13 @@ pub struct CreateTaskCompletedAttachmentRequest {
     pub id: Uuid,
     pub assignment_id: Uuid,
     pub required_attachment_id: Option<Uuid>,
+    pub blob: EncryptedBlobDeclarationDto,
+    pub idempotency_key: IdempotencyKeyDto,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct CreateInfoDocumentFileRequest {
+    pub id: Uuid,
     pub blob: EncryptedBlobDeclarationDto,
     pub idempotency_key: IdempotencyKeyDto,
 }

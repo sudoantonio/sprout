@@ -884,6 +884,11 @@ async fn load_ciphertext_records(
         WHERE project_id = $1 AND resource_node_id = $2
 
         UNION ALL
+        SELECT 'info_document.encrypted_payload', id, encrypted_payload
+        FROM info_documents
+        WHERE project_id = $1 AND resource_node_id = $2
+
+        UNION ALL
         SELECT 'sync_event.encrypted_payload', id, encrypted_payload
         FROM sync_events
         WHERE project_id = $1 AND resource_node_id = $2
