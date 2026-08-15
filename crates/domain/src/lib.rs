@@ -3,6 +3,7 @@
 //! The server only stores routing metadata and opaque encrypted payloads.  This
 //! crate deliberately has no persistence or transport concerns.
 
+pub mod agents;
 pub mod attachments;
 pub mod encrypted;
 pub mod identity;
@@ -15,6 +16,7 @@ pub mod retention;
 pub mod sync;
 pub mod tasks;
 
+pub use agents::*;
 pub use attachments::*;
 pub use encrypted::*;
 pub use identity::*;

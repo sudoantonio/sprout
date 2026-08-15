@@ -79,6 +79,14 @@ entity_id!(RequiredAttachmentId);
 entity_id!(CompletedAttachmentId);
 entity_id!(DeviceId);
 entity_id!(SyncEventId);
+entity_id!(AgentId);
+entity_id!(ResponsibilityId);
+entity_id!(LocalGoalId);
+entity_id!(LanguageTaskId);
+entity_id!(InvocationId);
+entity_id!(ProxyThreadId);
+entity_id!(ProxyRequestId);
+entity_id!(InterrogationId);
 
 #[derive(Clone, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
