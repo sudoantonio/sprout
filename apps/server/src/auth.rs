@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::FromRequestParts,
-    http::{header::AUTHORIZATION, request::Parts},
+    http::{Method, header::AUTHORIZATION, request::Parts},
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -16,6 +16,9 @@ pub struct AuthSession {
     pub identity_id: Uuid,
     pub device_id: Uuid,
     pub session_id: Uuid,
+    /// Agent sessions are normal Sprout sessions, but their mutating surface is
+    /// fail-closed. Product effects must pass through the governed agent API.
+    pub is_agent: bool,
 }
 
 impl FromRequestParts<Arc<AppState>> for AuthSession {
@@ -31,7 +34,11 @@ impl FromRequestParts<Arc<AppState>> for AuthSession {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .ok_or(AppError::Unauthorized)?;
-        authenticate_token(&state.pool, token).await
+        let actor = authenticate_token(&state.pool, token).await?;
+        if actor.is_agent && !agent_request_allowed(&parts.method, parts.uri.path()) {
+            return Err(AppError::Forbidden);
+        }
+        Ok(actor)
     }
 }
 
@@ -43,15 +50,22 @@ pub(crate) async fn authenticate_token(
     let token_hash = Sha256::digest(token.as_bytes()).to_vec();
     let mut transaction = pool.begin().await?;
     set_database_context(&mut transaction, identity_id, None, None).await?;
-    let row = sqlx::query_as::<_, (Uuid, Uuid)>(
+    let row = sqlx::query_as::<_, (Uuid, Uuid, String)>(
         r#"
-        SELECT identity_id, device_id
-        FROM sessions
-        WHERE id = $1
-          AND identity_id = $2
-          AND token_hash = $3
-          AND revoked_at IS NULL
-          AND expires_at > clock_timestamp()
+        SELECT session.identity_id, session.device_id, identity.principal_kind
+        FROM sessions session
+        JOIN identities identity ON identity.id = session.identity_id
+        JOIN devices device
+          ON device.identity_id = session.identity_id
+         AND device.id = session.device_id
+        WHERE session.id = $1
+          AND session.identity_id = $2
+          AND session.token_hash = $3
+          AND session.revoked_at IS NULL
+          AND session.expires_at > clock_timestamp()
+          AND identity.status = 'active'
+          AND device.trust_state = 'trusted'
+          AND device.retired_at IS NULL
         "#,
     )
     .bind(session_id)
@@ -72,7 +86,52 @@ pub(crate) async fn authenticate_token(
         identity_id: row.0,
         device_id: row.1,
         session_id,
+        is_agent: row.2 == "agent",
     })
+}
+
+fn agent_request_allowed(method: &Method, path: &str) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD) {
+        return true;
+    }
+    if *method == Method::POST && path == "/v1/sync/pull" {
+        return true;
+    }
+    let segments: Vec<_> = path.trim_matches('/').split('/').collect();
+    matches!(
+        (method, segments.as_slice()),
+        (&Method::POST, ["v1", "devices", _, "key-packages"])
+            | (&Method::DELETE, ["v1", "devices", _, "key-packages", _])
+            | (
+                &Method::PUT,
+                ["v1", "projects", _, "agents", _, "runner", "activate"]
+            )
+            | (
+                &Method::POST,
+                ["v1", "projects", _, "agents", _, "runner", "claim"]
+            )
+            | (
+                &Method::POST,
+                ["v1", "projects", _, "agents", _, "invocations", _, "submit"]
+            )
+            | (
+                &Method::POST,
+                ["v1", "projects", _, "agents", _, "invocations", _, "fail"]
+            )
+            | (
+                &Method::POST,
+                [
+                    "v1",
+                    "projects",
+                    _,
+                    "agents",
+                    _,
+                    "effects",
+                    _,
+                    "apply-info-document"
+                ]
+            )
+    )
 }
 
 fn parse_token_claims(token: &str) -> Result<(Uuid, Uuid), AppError> {
@@ -537,5 +596,26 @@ mod tests {
             );
             assert_eq!(resource_download, download);
         }
+    }
+
+    #[test]
+    fn agent_sessions_are_fail_closed_outside_the_runner_protocol() {
+        assert!(agent_request_allowed(
+            &Method::POST,
+            "/v1/projects/p/agents/a/runner/claim"
+        ));
+        assert!(agent_request_allowed(
+            &Method::POST,
+            "/v1/devices/d/key-packages"
+        ));
+        assert!(agent_request_allowed(&Method::GET, "/v1/projects/p/topics"));
+        assert!(!agent_request_allowed(
+            &Method::POST,
+            "/v1/projects/p/tasks"
+        ));
+        assert!(!agent_request_allowed(
+            &Method::PUT,
+            "/v1/projects/p/info-documents/d"
+        ));
     }
 }

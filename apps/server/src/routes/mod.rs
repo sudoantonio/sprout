@@ -1,3 +1,4 @@
+mod agents;
 mod assignments;
 mod dev_auth;
 mod device_keys;
@@ -75,6 +76,39 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             get(device_keys::transparency),
         )
         .route("/v1/projects", get(projects::list).post(projects::create))
+        .route("/v1/projects/{project_id}/agents", post(agents::provision))
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/runner/activate",
+            axum::routing::put(agents::activate_runner),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/responsibilities/{responsibility_id}",
+            axum::routing::put(agents::record_responsibility),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/local-goal",
+            axum::routing::put(agents::record_local_goal),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/invocations",
+            post(agents::queue_invocation),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/runner/claim",
+            post(agents::claim_invocation),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/invocations/{invocation_id}/submit",
+            post(agents::submit_invocation),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/invocations/{invocation_id}/fail",
+            post(agents::fail_invocation),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/effects/{effect_id}/apply-info-document",
+            post(agents::apply_info_effect),
+        )
         .route("/v1/projects/{project_id}", get(projects::get_project))
         .route(
             "/v1/projects/{project_id}/invitations",
