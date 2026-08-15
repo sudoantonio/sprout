@@ -36,11 +36,12 @@ CREATE TABLE governed_agents (
     CONSTRAINT governed_agents_profile_resource_fk
         FOREIGN KEY (project_id, profile_resource_node_id)
         REFERENCES resource_nodes (project_id, id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT governed_agents_epoch_fk
         FOREIGN KEY (project_id, profile_resource_node_id, key_epoch)
         REFERENCES resource_epochs (project_id, resource_node_id, epoch)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
+        ON UPDATE RESTRICT ON DELETE NO ACTION
+        DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT governed_agents_project_id_unique UNIQUE (project_id, id),
     CONSTRAINT governed_agents_principal_unique UNIQUE (principal_identity_id),
     CONSTRAINT governed_agents_distinct_controller
@@ -74,7 +75,7 @@ CREATE TABLE agent_runners (
     CONSTRAINT agent_runners_agent_fk
         FOREIGN KEY (project_id, agent_id)
         REFERENCES governed_agents (project_id, id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT agent_runners_device_fk
         FOREIGN KEY (principal_identity_id, device_id)
         REFERENCES devices (identity_id, id)
@@ -141,7 +142,7 @@ CREATE TABLE agent_local_goal_contracts (
     CONSTRAINT agent_local_goals_agent_fk
         FOREIGN KEY (project_id, agent_id)
         REFERENCES governed_agents (project_id, id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT agent_local_goals_agent_member_fk
         FOREIGN KEY (project_id, agent_identity_id)
         REFERENCES project_memberships (project_id, identity_id)
@@ -188,7 +189,7 @@ CREATE TABLE agent_invocations (
     CONSTRAINT agent_invocations_agent_fk
         FOREIGN KEY (project_id, agent_id)
         REFERENCES governed_agents (project_id, id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT agent_invocations_creator_fk
         FOREIGN KEY (project_id, created_by_identity_id)
         REFERENCES project_memberships (project_id, identity_id)
@@ -244,7 +245,7 @@ CREATE TABLE agent_invocation_sources (
     CONSTRAINT agent_invocation_sources_invocation_fk
         FOREIGN KEY (project_id, invocation_id)
         REFERENCES agent_invocations (project_id, id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT agent_invocation_sources_resource_fk
         FOREIGN KEY (project_id, resource_node_id)
         REFERENCES resource_nodes (project_id, id)
@@ -268,11 +269,11 @@ CREATE TABLE agent_effect_proposals (
     CONSTRAINT agent_effects_invocation_fk
         FOREIGN KEY (project_id, invocation_id)
         REFERENCES agent_invocations (project_id, id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT agent_effects_agent_fk
         FOREIGN KEY (project_id, agent_id)
         REFERENCES governed_agents (project_id, id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT agent_effects_ordinal_unique
         UNIQUE (project_id, invocation_id, ordinal),
     CONSTRAINT agent_effects_hash_unique UNIQUE (project_id, proposal_hash),
@@ -304,11 +305,11 @@ CREATE TABLE agent_audit_log (
     CONSTRAINT agent_audit_agent_fk
         FOREIGN KEY (project_id, agent_id)
         REFERENCES governed_agents (project_id, id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT agent_audit_invocation_fk
         FOREIGN KEY (project_id, invocation_id)
         REFERENCES agent_invocations (project_id, id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT agent_audit_actor_fk
         FOREIGN KEY (actor_identity_id) REFERENCES identities (id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,

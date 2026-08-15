@@ -1,102 +1,133 @@
 # Concrete refinement della specifica agentica Lean
 
-## Stato
+## Stato e sorgente normativa
 
-Questo documento descrive il confine fra la specifica formale R5 e il prodotto
-Sprout corrente. La specifica Lean validata resta la sorgente normativa; il
-codice Rust non ne modifica gli enunciati e non sostituisce le proof obligation
-con decisioni affidate a un modello linguistico.
+La specifica Lean R5 validata è la sorgente normativa. Il kernel Rust e gli
+adapter server implementano un refinement concreto dei suoi gate operativi; non
+modificano gli enunciati e non affidano a un LLM permission, authority,
+governance, provenance o decisioni sui side effect.
 
-Il primo incremento implementato in `crates/domain/src/agents.rs` è un kernel
-deterministico, privo di I/O e indipendente dal provider LLM. Il kernel deve
-essere chiamato prima di persistere o materializzare qualunque proposta del
-modello.
+L'architettura target è un **personal/edge agent runner registrato come normale
+device Sprout**. Il runner è soltanto un execution environment:
 
-## Refinement implementato nel kernel Rust
+- l'agente è un principal distinto con membership ordinaria;
+- il runner usa `devices`, `device_keys`, sessioni, resource key envelope e
+  revocation già esistenti;
+- Sprout non introduce una ACL o una key hierarchy parallela per gli agenti;
+- il server conserva ciphertext e metadati strutturali minimi, mai private key o
+  plaintext utente;
+- ogni effect viene rivalidato dal server contro permission, authority,
+  provenance, audience, key epoch e stato correnti prima della materializzazione.
 
-| Area Lean | Refinement concreto |
+## Confine E2EE e sintesi globale
+
+Prompt, responsibility text, transcript, invocation input/output e contenuto
+utente rimangono `EncryptedPayload`. Il plaintext viene ricostruito soltanto da
+un client amministratore oppure da un runner autorizzato che possiede il normale
+resource key envelope del proprio device. Le API non accettano campi descrittivi
+plaintext nei contratti strutturali; gli oggetti globali e LocalGoal usano schema
+chiuso (`deny_unknown_fields`).
+
+In particolare, il backend **non ricostruisce semanticamente i LocalGoal e non
+invoca un LLM per generare GlobalGoal/GlobalContract**:
+
+1. il client amministratore o un edge runner autorizzato decritta le source;
+2. l'eventuale LLM stateless produce un candidate strutturato entro uno
+   `StructuredLanguageTaskEnvelope`;
+3. il backend riceve il candidate già strutturato;
+4. il backend valida deterministicamente revisioni, unicità della source attiva,
+   provenance, responsibility operativa, grounding, bound, governance conflict
+   e non-amplification;
+5. soltanto dopo i gate il backend persiste candidate, groundings e hash.
+
+Un candidate inviato da runner deve essere collegato a una invocation
+`synthesize_global_contract` conclusa dallo stesso agent/device attivo. Un
+candidate prodotto sul client amministratore non può dichiarare falsamente una
+runner invocation. Il JSON visibile al server contiene soltanto ID, revisioni,
+scope, dependency, action class e bound necessari alla validazione; il contenuto
+semantico rimane nel payload cifrato dell'invocation.
+
+## Refinement implementato
+
+| Area normativa | Refinement concreto |
 | --- | --- |
-| `PrincipalKind`, `GovernedAgentRecord` | agent e controller distinti; controller obbligatoriamente umano |
-| `AuthorityEnvelope`, attenuation | ceiling immutabile per risorse/tool, subset transitivo e intersezione con permission correnti |
-| `StructuredLanguageTaskEnvelope` | schema chiuso, ID groundati, bound input/output/depth/retry e divieto di delegare permission/proof al modello |
-| `ResponsibilityContract` | snapshot revisionato, regole finite per domain/scope/action e controllo amministrativo dello scope |
-| `GoalContract`, `LocalGoalContract` | obligation/work finiti, entry unica, rank decrescenti, owner agent esatto e classificazione completa |
-| responsibility vs LocalGoal | gate separati; la responsibility non concede runtime permission |
-| sintesi globale | ogni work globale deve essere groundato a work locale attivo e autorizzato senza amplificarne owner, action o bound |
-| `UserProxy` | mediation metadata legata allo user, mai principal o soggetto ACL indipendente |
-| proxy execution | envelope, request/thread binding e permission/tool check correnti precedono l'eventuale conferma one-shot |
-| cross-owner | automatico solo con provenance esatta verso obligation locale attiva; altrimenti review se coperto dalla responsibility, oppure reject |
-| interrogation | transcript leggibile solo dal creator e causal delta completamente vuoto |
-| information flow | audience del sink sottoinsieme dell'audience di ogni source |
-| state-grounded invocation | source correntemente leggibili, exposure esatta e flag di memoria persistente nascosta obbligatoriamente falso |
-| audit/provenance | record tipizzati e verifica append-only dello stato operativo |
+| principal e controller | agent e controller distinti; controller umano; identity agent marcata esplicitamente |
+| runner | device `service` ordinario, key package normale, sessione revocabile e allowlist di protocollo fail-closed |
+| authority | envelope finito, attenuation e intersezione con permission correnti |
+| structured LLM task | schema chiuso, ID groundati, bound input/output/depth/retry, tool catalog esplicito |
+| no model memory | ogni invocation dichiara source correnti; claim non contiene memory; hidden persistent memory obbligatoriamente falsa |
+| responsibility | revisioni append-only per controller, scope reale e action class verificati deterministicamente |
+| LocalGoal | un solo goal attivo per agente; revisione esatta; ownership, work e responsibility operativa verificati |
+| global synthesis | candidate esterno già strutturato; source LocalGoal attive; provenance relazionale; grounding e non-amplification |
+| UserProxy | metadata self-only, non principal e non soggetto ACL; permission e responsibility rivalidate |
+| interrogation | transcript cifrato creator-only e causal delta completamente vuoto |
+| information flow | audience del sink sottoinsieme dell'audience corrente di ogni source |
+| side effect | proposal separata; permission, authority, device key, envelope, epoch, audience e optimistic version ricontrollati atomicamente |
+| audit | log hash-chained append-only con actor, device, invocation e provenance; delete ammessa soltanto dal retention purge autorizzato |
 
-Queste verifiche non sono autorizzazioni alternative. Il loro adapter server
-deve continuare a interrogare `require_resource_access`, membership, permission
-gerarchiche, RLS, resource epoch e key envelope già esistenti.
+Le foreign key composite impediscono di associare un'identity a un agent record
+diverso e di usare un LocalGoal/revisione appartenente a un altro agente. Un
+indice parziale garantisce una sola revisione LocalGoal attiva per agente. La
+sintesi seleziona esclusivamente quella revisione attiva e richiede la
+responsibility corrente dello stesso controller.
 
-## Mismatch architetturale bloccante: plaintext e key custody
+Le nuove foreign key sono tutte restrittive (`RESTRICT`/`NO ACTION`): nessuna
+history viene rimossa per cascade implicito. Il normale retention purge calcola
+prima gli ID agentici legati alla risorsa e li elimina esplicitamente in ordine
+referenziale. I trigger append-only accettano soltanto gli ID marcati nella
+stessa transazione con subject e lease retention validi. Il percorso revoca
+sessione e key del runner, ritira il device e rimuove audit, global provenance,
+interrogation, UserProxy collegati, effect, source, invocation, LocalGoal,
+responsibility, runner e agent record prima della risorsa.
 
-La specifica Lean lascia intenzionalmente `EncryptedPayload`, envelope e key
-management come astrazioni dell'ambiente di integrazione. Il prodotto concreto,
-invece, dichiara nel threat model che il server non vede il plaintext e non
-possiede le chiavi delle risorse.
+## Superfici server
 
-Un LLM deve ricevere plaintext per interpretare prompt, task, transcript e
-source. Non è quindi possibile collegare onestamente un provider LLM al worker
-server corrente senza scegliere dove avvengono decrittazione e inferenza.
-Inviare ciphertext al modello non implementa la specifica. Consegnare al server
-le chiavi esistenti indebolirebbe E2EE e violerebbe il threat model.
+Le migrazioni `0023` e `0024` aggiungono agent, runner, responsibility,
+LocalGoal, invocation/source, effect proposal, global contract/source,
+UserProxy, interrogation e audit. Tutte le tabelle hanno RLS; i check
+deterministici applicativi restano necessari anche quando il processo di test
+usa un ruolo PostgreSQL privilegiato.
 
-Prima di introdurre tabelle di invocation, code worker o API di esecuzione deve
-essere scelta e revisionata una delle seguenti architetture:
+Il solo materializer di side effect attualmente esposto è
+`replace_info_document`: applica ciphertext compatibile col wire format Info e
+non decritta il documento. Le normali mutation route restano vietate alle
+sessioni agent; un runner non può usare il proprio bearer token per aggirare il
+dispatcher centralizzato.
 
-1. **Agent runner sul dispositivo del controller.** Il browser/app autorizzato
-   ricostruisce e decritta il context, invoca il provider e invia soltanto output
-   strutturato al validator server. Preserva il modello E2EE, ma l'autonomia
-   schedulata richiede che un device fidato sia online.
-2. **Runner personale/edge separato.** Un daemon controllato dall'utente viene
-   registrato come device Sprout, riceve normali key envelope e mantiene le chiavi
-   fuori dal server. Preserva meglio autonomia ed E2EE, ma introduce un nuovo
-   deployable, provisioning, revocation e protocollo di attestazione.
-3. **Agent device custodito dal servizio.** Ogni agente è un principal/device e
-   riceve key envelope normali, ma il servizio custodisce le sue private key.
-   Consente worker sempre attivi, però rende il servizio capace di leggere le
-   risorse concesse all'agente e richiede una modifica esplicita del threat model,
-   isolamento delle chiavi e nuove procedure operative.
+## Parti non ancora coperte e mismatch precisi
 
-Anche la destinazione del plaintext presso un provider LLM esterno richiede una
-decisione di data classification, retention e consenso. Il divieto di memoria
-cognitiva persistente impone inoltre chiamate stateless: transcript, history e
-provenance possono essere riletti soltanto da Sprout e rivalidati a ogni
-invocation; non può essere usato uno store di memoria del provider.
+Il refinement di persistence/runtime è operativo, ma questi elementi richiedono
+ulteriore prodotto e non sono simulati con placeholder permissivi:
 
-## Parti volutamente non implementate prima della decisione
+- un binario edge runner e un adapter provider LLM concreti; provider, secure key
+  store locale e policy di data processing non sono ancora scelti;
+- classifier e compiler semantici di LocalGoal. Il server valida la struttura ma
+  non finge di poter dimostrare semantic adequacy dal ciphertext;
+- persistence dei certificati di `administratorException` e degli assignment
+  `globalMandate`. Queste origin vengono rifiutate finché il relativo adapter non
+  esiste;
+- materializer deterministici per task, assignment, attachment e comment oltre a
+  Info;
+- tool catalog con adapter, required-effects e side-effect semantics verificati;
+- scheduler autonomo, work/evidence lifecycle, cross-owner review workflow e UI
+  dei gate di governance.
 
-- creazione automatica delle identità/device agent;
-- distribuzione delle resource key agli agent runner;
-- invocazioni reali verso un provider LLM;
-- persistenza/API di prompt, LocalGoal e transcript che presuppongano uno dei
-  modelli di key custody sopra;
-- scheduling autonomo e retry del provider;
-- UI dei gate di governance agentici.
-
-Implementare queste parti scegliendo implicitamente il server come decryptor
-sarebbe un bypass degli invarianti E2EE, non un concrete refinement fedele.
+Queste assenze non concedono authority: i relativi ingressi falliscono chiusi.
+Implementarle richiede adapter concreti ai sistemi Sprout esistenti, non nuove
+ACL o decrittazione server-side.
 
 ## Assumption residue
 
-Il kernel Rust assume che i suoi adapter forniscano fatti correnti e autorevoli:
+Il kernel puro assume che gli adapter forniscano fatti correnti e autorevoli:
 
-- kind dei principal e relazione controller/agent;
-- ancestry delle risorse dal grafo `resource_closure`;
-- permission effettive da `effective_domain_permission` e controlli speciali di
-  assignment;
-- leggibilità plaintext, inclusa disponibilità dell'epoca/chiave E2EE;
+- principal kind e relazione controller/agent;
+- ancestry da `resource_closure`;
+- permission effettive e assignment speciali;
+- active device key e disponibilità del resource key envelope;
+- audience di source e sink;
 - required effects deterministici di ogni tool;
-- audience corrente di source e sink;
-- atomicità e append-only persistence di audit/provenance.
+- atomicità, RLS, retention e append-only persistence.
 
-Queste assumption devono diventare query/transaction concrete dopo la decisione
-sull'execution boundary; non devono essere implementate dall'LLM o accettate dal
-client come booleani autorevoli.
+Gli adapter server implementati risolvono queste assumption per le superfici
+sopra elencate. Nessun booleano dichiarato dal modello o dal client viene
+considerato prova di permission, authority o avvenuta materializzazione.

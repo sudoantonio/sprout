@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json,
@@ -9,12 +13,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sprout_domain::{
-    AgentAvailabilityMode, AgentId, AuthorityEnvelope, EncryptedPayload, GovernedAgent,
-    InformationSource, InvocationId, LocalGoalContract, ModelExposureProjection,
-    ModelInvocationContext, PrincipalKind, ProjectId, ResourceEffect, ResourceId,
-    ResourceOperation, ResponsibilityContract, StructuredLanguageOutput,
-    StructuredLanguageTaskEnvelope, UserId, validate_information_flow,
-    validate_state_grounded_invocation,
+    AgentActionClass, AgentAvailabilityMode, AgentId, AgentInterrogationCausalDelta,
+    AgentInterrogationSession, AuthorityEnvelope, EncryptedPayload, GlobalContractCandidate,
+    GovernedAgent, InformationSource, InterrogationId, InvocationId, LocalGoalContract,
+    LocalGoalOrigin, ModelExposureProjection, ModelInvocationContext, PrincipalKind, ProjectId,
+    ProxyExecution, ProxyRequestId, ProxyThreadId, ResourceEffect, ResourceId, ResourceOperation,
+    ResponsibilityContract, StructuredGlobalSynthesisEnvelope, StructuredGlobalWorkGrounding,
+    StructuredLanguageOutput, StructuredLanguageTaskEnvelope, StructuredLanguageTaskKind, UserId,
+    UserProxy, UserProxyActionPlan, UserProxyOutOfResponsibilityConfirmation,
+    UserProxyPlanningEnvelope, UserProxyRequest, UserProxyThread,
+    responsibility_operationally_covers_local_goal, validate_global_synthesis,
+    validate_information_flow, validate_state_grounded_invocation,
 };
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -341,10 +350,23 @@ pub async fn record_responsibility(
             .contract
             .validate_revision_of(&previous)
             .map_err(agent_validation_error)?;
-    } else if request.contract.supersedes_revision.is_some() {
-        return Err(AppError::BadRequest(
-            "first responsibility revision cannot supersede another revision",
-        ));
+    } else {
+        if request.contract.supersedes_revision.is_some() {
+            return Err(AppError::BadRequest(
+                "first responsibility revision cannot supersede another revision",
+            ));
+        }
+        let existing_for_user = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM agent_responsibility_contracts
+             WHERE project_id = $1 AND user_identity_id = $2)",
+        )
+        .bind(project_id)
+        .bind(Uuid::from(request.contract.user))
+        .fetch_one(&mut *transaction)
+        .await?;
+        if existing_for_user {
+            return Err(AppError::Conflict);
+        }
     }
     sqlx::query(
         r#"
@@ -410,6 +432,14 @@ pub async fn record_local_goal(
         .contract
         .validate()
         .map_err(agent_validation_error)?;
+    if !matches!(
+        request.contract.origin,
+        LocalGoalOrigin::ControllerPrompt {}
+    ) {
+        return Err(AppError::BadRequest(
+            "local-goal origin requires a persisted governance certificate adapter",
+        ));
+    }
     for clause in &request.contract.clauses {
         if !resource_access(
             &state,
@@ -426,12 +456,30 @@ pub async fn record_local_goal(
     let contract_json = canonical_json(&request.contract)?;
     let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
     let mut transaction = begin(&state, actor, project_id).await?;
+    let responsibility = load_current_responsibility(
+        &mut transaction,
+        project_id,
+        Uuid::from(request.contract.controller),
+    )
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    if !responsibility_operationally_covers(
+        &mut transaction,
+        project_id,
+        &responsibility,
+        &request.contract,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden);
+    }
     if request.contract.revision > 1 {
         let previous_json = sqlx::query_scalar::<_, String>(
             r#"
             SELECT contract::text
             FROM agent_local_goal_contracts
             WHERE project_id = $1 AND id = $2 AND revision = $3 AND agent_id = $4
+              AND state = 'active'
             "#,
         )
         .bind(project_id)
@@ -447,6 +495,18 @@ pub async fn record_local_goal(
             .contract
             .validate_revision_of(&previous)
             .map_err(agent_validation_error)?;
+        sqlx::query(
+            "UPDATE agent_local_goal_contracts
+             SET state = 'superseded', terminal_at = clock_timestamp()
+             WHERE project_id = $1 AND id = $2 AND revision = $3
+               AND agent_id = $4 AND state = 'active'",
+        )
+        .bind(project_id)
+        .bind(Uuid::from(request.contract.id))
+        .bind(to_i64(request.contract.revision - 1)?)
+        .bind(agent_id)
+        .execute(&mut *transaction)
+        .await?;
     } else if request.contract.supersedes_revision.is_some() {
         return Err(AppError::BadRequest(
             "first local-goal revision cannot supersede another revision",
@@ -489,6 +549,729 @@ pub async fn record_local_goal(
         id: Uuid::from(request.contract.id),
         revision: request.contract.revision,
         contract_hash_hex: hex::encode(contract_hash),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct RecordGlobalContractRequest {
+    id: Uuid,
+    #[serde(default)]
+    synthesis_invocation_id: Option<InvocationId>,
+    envelope: StructuredGlobalSynthesisEnvelope,
+    candidate: GlobalContractCandidate,
+    groundings: Vec<StructuredGlobalWorkGrounding>,
+}
+
+pub async fn record_global_contract(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path(project_id): Path<Uuid>,
+    Json(request): Json<RecordGlobalContractRequest>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    let synthesizer_agent_id = if actor.is_agent {
+        let invocation_id = request.synthesis_invocation_id.ok_or(AppError::Forbidden)?;
+        Some(
+            validate_synthesis_runner(
+                &state,
+                actor,
+                project_id,
+                invocation_id,
+                &request.envelope.language_task,
+            )
+            .await?,
+        )
+    } else {
+        if request.synthesis_invocation_id.is_some() {
+            return Err(AppError::BadRequest(
+                "administrator-client synthesis must not claim a runner invocation",
+            ));
+        }
+        require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+        None
+    };
+    let mut transaction = begin(&state, actor, project_id).await?;
+    if request.candidate.revision > 1 {
+        let previous_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM agent_global_contracts
+             WHERE project_id = $1 AND id = $2 AND revision = $3)",
+        )
+        .bind(project_id)
+        .bind(request.id)
+        .bind(to_i64(request.candidate.revision - 1)?)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !previous_exists {
+            return Err(AppError::Conflict);
+        }
+    }
+    let mut local_goals = HashMap::new();
+    let mut authorized_sources = HashSet::new();
+    let mut source_records = Vec::new();
+    for source_agent in &request.envelope.source_agents {
+        let contribution = request
+            .candidate
+            .contributions
+            .iter()
+            .find(|contribution| contribution.agent == *source_agent)
+            .ok_or(AppError::BadRequest(
+                "global source agent has no local contribution",
+            ))?;
+        let row = sqlx::query(
+            r#"
+            SELECT local.id, local.contract::text AS contract, agent.id AS agent_id
+            FROM agent_local_goal_contracts local
+            JOIN governed_agents agent
+              ON agent.project_id = local.project_id
+             AND agent.id = local.agent_id
+            WHERE local.project_id = $1
+              AND local.agent_identity_id = $2
+              AND local.revision = $3
+              AND local.state = 'active'
+              AND agent.state = 'active'
+            "#,
+        )
+        .bind(project_id)
+        .bind(Uuid::from(*source_agent))
+        .bind(to_i64(contribution.local_revision)?)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::Conflict)?;
+        let local_goal: LocalGoalContract =
+            serde_json::from_str(row.try_get("contract")?).map_err(|_| AppError::Internal)?;
+        if !local_goal.can_contribute_bottom_up() {
+            return Err(AppError::BadRequest(
+                "global mandates cannot be recycled as bottom-up sources",
+            ));
+        }
+        let responsibility = load_current_responsibility(
+            &mut transaction,
+            project_id,
+            Uuid::from(local_goal.controller),
+        )
+        .await?
+        .ok_or(AppError::Conflict)?;
+        if !responsibility_operationally_covers(
+            &mut transaction,
+            project_id,
+            &responsibility,
+            &local_goal,
+        )
+        .await?
+        {
+            return Err(AppError::Conflict);
+        }
+        authorized_sources.insert(*source_agent);
+        source_records.push((
+            row.try_get::<Uuid, _>("agent_id")?,
+            row.try_get::<Uuid, _>("id")?,
+            contribution.local_revision,
+        ));
+        local_goals.insert(*source_agent, local_goal);
+    }
+    validate_global_synthesis(
+        &request.envelope,
+        &request.candidate,
+        &request.groundings,
+        &local_goals,
+        |local| authorized_sources.contains(&local.agent),
+    )
+    .map_err(agent_validation_error)?;
+    let envelope_json = canonical_json(&request.envelope)?;
+    let candidate_json = canonical_json(&request.candidate)?;
+    let groundings_json = canonical_json(&request.groundings)?;
+    let contract_hash: [u8; 32] = Sha256::digest(
+        canonical_json(&json!({
+            "id": request.id,
+            "envelope": request.envelope,
+            "candidate": request.candidate,
+            "groundings": request.groundings,
+        }))?
+        .as_bytes(),
+    )
+    .into();
+    sqlx::query(
+        r#"
+        INSERT INTO agent_global_contracts (
+            id, project_id, revision, synthesis_envelope, candidate,
+            groundings, synthesis_invocation_id, synthesized_by_agent_id,
+            contract_hash, recorded_by_identity_id
+        ) VALUES (
+            $1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb,
+            $7, $8, $9, $10
+        )
+        "#,
+    )
+    .bind(request.id)
+    .bind(project_id)
+    .bind(to_i64(request.candidate.revision)?)
+    .bind(envelope_json)
+    .bind(candidate_json)
+    .bind(groundings_json)
+    .bind(request.synthesis_invocation_id.map(Uuid::from))
+    .bind(synthesizer_agent_id)
+    .bind(contract_hash.as_slice())
+    .bind(actor.identity_id)
+    .execute(&mut *transaction)
+    .await?;
+    for (agent_id, local_goal_id, local_revision) in source_records {
+        sqlx::query(
+            r#"
+            INSERT INTO agent_global_contract_sources (
+                project_id, global_contract_id, global_revision,
+                agent_id, local_goal_id, local_revision
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(project_id)
+        .bind(request.id)
+        .bind(to_i64(request.candidate.revision)?)
+        .bind(agent_id)
+        .bind(local_goal_id)
+        .bind(to_i64(local_revision)?)
+        .execute(&mut *transaction)
+        .await?;
+        if synthesizer_agent_id.is_none() {
+            append_audit(
+                &mut transaction,
+                actor,
+                project_id,
+                AgentId::from(agent_id),
+                None,
+                "global_contract_recorded",
+                json!({
+                    "global_contract_id": request.id,
+                    "revision": request.candidate.revision,
+                    "local_goal_id": local_goal_id,
+                    "local_revision": local_revision,
+                    "contract_hash": hex::encode(contract_hash),
+                    "synthesis_boundary": "administrator_client",
+                }),
+            )
+            .await?;
+        }
+    }
+    if let Some(agent_id) = synthesizer_agent_id {
+        append_audit(
+            &mut transaction,
+            actor,
+            project_id,
+            AgentId::from(agent_id),
+            request.synthesis_invocation_id,
+            "global_contract_recorded",
+            json!({
+                "global_contract_id": request.id,
+                "revision": request.candidate.revision,
+                "contract_hash": hex::encode(contract_hash),
+                "synthesis_boundary": "authorized_edge_runner",
+            }),
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: request.id,
+        revision: request.candidate.revision,
+        contract_hash_hex: hex::encode(contract_hash),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct RecordInterrogationRequest {
+    id: InterrogationId,
+    transcript_resource_node_id: ResourceId,
+    key_epoch: u32,
+    encrypted_transcript: EncryptedPayload,
+    causal_delta: AgentInterrogationCausalDelta,
+}
+
+#[derive(Serialize)]
+pub struct RecordedInterrogationResponse {
+    id: InterrogationId,
+    target_agent: UserId,
+    created_at: DateTime<Utc>,
+    read_only: bool,
+}
+
+#[derive(Serialize)]
+pub struct InterrogationResponse {
+    id: InterrogationId,
+    target_agent: UserId,
+    transcript_resource_node_id: ResourceId,
+    key_epoch: u32,
+    encrypted_transcript: EncryptedPayload,
+    created_at: DateTime<Utc>,
+}
+
+pub async fn record_interrogation(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RecordInterrogationRequest>,
+) -> Result<Json<RecordedInterrogationResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let agent = load_agent(&state, actor, project_id, agent_id).await?;
+    if agent.controller_id != actor.identity_id.into() {
+        return Err(AppError::Forbidden);
+    }
+    request
+        .causal_delta
+        .validate_read_only()
+        .map_err(agent_validation_error)?;
+    let created_at = Utc::now();
+    let interrogation = AgentInterrogationSession {
+        id: request.id,
+        creator: actor.identity_id.into(),
+        target_agent: agent.principal_id,
+        created_at,
+        via_tool_call: None,
+    };
+    if !interrogation.transcript_readable_by(actor.identity_id.into())
+        || !resource_access(
+            &state,
+            actor,
+            project_id,
+            request.transcript_resource_node_id.into(),
+            ResourceOperation::Read,
+        )
+        .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    let transcript = serialize_ciphertext(&request.encrypted_transcript)?;
+    let delta_json = canonical_json(&request.causal_delta)?;
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let epoch_active = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM resource_epochs
+         WHERE project_id = $1 AND resource_node_id = $2 AND epoch = $3
+           AND retired_at IS NULL)",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(request.transcript_resource_node_id))
+    .bind(to_i32(request.key_epoch)?)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !epoch_active {
+        return Err(AppError::BadRequest("resource key epoch is not active"));
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO agent_interrogations (
+            id, project_id, creator_identity_id, target_agent_id,
+            target_agent_identity_id, transcript_resource_node_id,
+            key_epoch, encrypted_transcript, causal_delta, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+        "#,
+    )
+    .bind(Uuid::from(request.id))
+    .bind(project_id)
+    .bind(actor.identity_id)
+    .bind(agent_id)
+    .bind(Uuid::from(agent.principal_id))
+    .bind(Uuid::from(request.transcript_resource_node_id))
+    .bind(to_i32(request.key_epoch)?)
+    .bind(transcript)
+    .bind(delta_json)
+    .bind(created_at)
+    .execute(&mut *transaction)
+    .await?;
+    append_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        AgentId::from(agent_id),
+        None,
+        "interrogation_recorded",
+        json!({
+            "interrogation_id": request.id,
+            "creator": actor.identity_id,
+            "transcript_resource_node_id": request.transcript_resource_node_id,
+            "key_epoch": request.key_epoch,
+            "causal_delta_empty": true,
+        }),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(RecordedInterrogationResponse {
+        id: request.id,
+        target_agent: agent.principal_id,
+        created_at,
+        read_only: true,
+    }))
+}
+
+pub async fn get_interrogation(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id, interrogation_id)): Path<(Uuid, Uuid, Uuid)>,
+) -> Result<Json<InterrogationResponse>, AppError> {
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let row = sqlx::query(
+        r#"
+        SELECT interrogation.id, interrogation.target_agent_identity_id,
+               interrogation.transcript_resource_node_id,
+               interrogation.key_epoch, interrogation.encrypted_transcript,
+               interrogation.created_at
+        FROM agent_interrogations interrogation
+        WHERE interrogation.project_id = $1
+          AND interrogation.target_agent_id = $2
+          AND interrogation.id = $3
+          AND interrogation.creator_identity_id = $4
+        "#,
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(interrogation_id)
+    .bind(actor.identity_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    transaction.commit().await?;
+    Ok(Json(InterrogationResponse {
+        id: InterrogationId::from(row.try_get::<Uuid, _>("id")?),
+        target_agent: UserId::from(row.try_get::<Uuid, _>("target_agent_identity_id")?),
+        transcript_resource_node_id: ResourceId::from(
+            row.try_get::<Uuid, _>("transcript_resource_node_id")?,
+        ),
+        key_epoch: u32::try_from(row.try_get::<i32, _>("key_epoch")?)
+            .map_err(|_| AppError::Internal)?,
+        encrypted_transcript: deserialize_ciphertext(row.try_get("encrypted_transcript")?)?,
+        created_at: row.try_get("created_at")?,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct CreateProxyThreadRequest {
+    proxy_id: Uuid,
+    thread_id: ProxyThreadId,
+}
+
+#[derive(Serialize)]
+pub struct ProxyThreadResponse {
+    proxy_id: Uuid,
+    thread_id: ProxyThreadId,
+    created_at: DateTime<Utc>,
+}
+
+pub async fn create_proxy_thread(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path(project_id): Path<Uuid>,
+    Json(request): Json<CreateProxyThreadRequest>,
+) -> Result<Json<ProxyThreadResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Member).await?;
+    let created_at = Utc::now();
+    let proxy = UserProxy {
+        id: request.proxy_id,
+        user: actor.identity_id.into(),
+    };
+    let thread = UserProxyThread {
+        id: request.thread_id,
+        proxy_id: request.proxy_id,
+        creator: actor.identity_id.into(),
+        created_at,
+    };
+    if !thread.valid_for(&proxy) || !thread.readable_by(actor.identity_id.into()) {
+        return Err(AppError::Forbidden);
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO user_proxies (id, project_id, user_identity_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (project_id, user_identity_id) DO NOTHING
+        "#,
+    )
+    .bind(request.proxy_id)
+    .bind(project_id)
+    .bind(actor.identity_id)
+    .execute(&mut *transaction)
+    .await?;
+    let actual_proxy_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM user_proxies WHERE project_id = $1 AND user_identity_id = $2",
+    )
+    .bind(project_id)
+    .bind(actor.identity_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if actual_proxy_id != request.proxy_id {
+        return Err(AppError::Conflict);
+    }
+    sqlx::query(
+        "INSERT INTO user_proxy_threads (
+             id, project_id, proxy_id, creator_identity_id, created_at
+         ) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::from(request.thread_id))
+    .bind(project_id)
+    .bind(request.proxy_id)
+    .bind(actor.identity_id)
+    .bind(created_at)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ProxyThreadResponse {
+        proxy_id: request.proxy_id,
+        thread_id: request.thread_id,
+        created_at,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct SubmitProxyRequest {
+    id: ProxyRequestId,
+    encrypted_payload: EncryptedPayload,
+}
+
+#[derive(Serialize)]
+pub struct ProxyRequestResponse {
+    id: ProxyRequestId,
+    thread_id: ProxyThreadId,
+    submitted_at: DateTime<Utc>,
+}
+
+pub async fn submit_proxy_request(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, thread_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<SubmitProxyRequest>,
+) -> Result<Json<ProxyRequestResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let submitted_at = Utc::now();
+    let encrypted_payload = serialize_ciphertext(&request.encrypted_payload)?;
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let owned = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM user_proxy_threads
+         WHERE project_id = $1 AND id = $2 AND creator_identity_id = $3
+           AND closed_at IS NULL)",
+    )
+    .bind(project_id)
+    .bind(thread_id)
+    .bind(actor.identity_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !owned {
+        return Err(AppError::NotFound);
+    }
+    sqlx::query(
+        "INSERT INTO user_proxy_requests (
+             id, project_id, thread_id, user_identity_id,
+             encrypted_payload, submitted_at
+         ) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::from(request.id))
+    .bind(project_id)
+    .bind(thread_id)
+    .bind(actor.identity_id)
+    .bind(encrypted_payload)
+    .bind(submitted_at)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ProxyRequestResponse {
+        id: request.id,
+        thread_id: ProxyThreadId::from(thread_id),
+        submitted_at,
+    }))
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ProxyActionClassification {
+    resource_id: ResourceId,
+    action: AgentActionClass,
+}
+
+#[derive(Deserialize)]
+pub struct RecordProxyPlanRequest {
+    id: Uuid,
+    invocation_id: Option<InvocationId>,
+    envelope: UserProxyPlanningEnvelope,
+    plan: UserProxyActionPlan,
+    action_classification: Vec<ProxyActionClassification>,
+    confirmation: Option<UserProxyOutOfResponsibilityConfirmation>,
+}
+
+#[derive(Serialize)]
+pub struct ProxyPlanResponse {
+    id: Uuid,
+    within_responsibility: bool,
+    confirmation_required: bool,
+    plan_hash_hex: String,
+}
+
+pub async fn record_proxy_plan(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, request_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RecordProxyPlanRequest>,
+) -> Result<Json<ProxyPlanResponse>, AppError> {
+    if actor.is_agent
+        || request.plan.request_id != ProxyRequestId::from(request_id)
+        || request.envelope.request_id != ProxyRequestId::from(request_id)
+        || request.plan.user != actor.identity_id.into()
+    {
+        return Err(AppError::Forbidden);
+    }
+    validate_proxy_action_classification(&request.plan, &request.action_classification)?;
+    if !request.plan.tool_invocations.is_empty() {
+        return Err(AppError::BadRequest(
+            "proxy tools require a registered deterministic security adapter",
+        ));
+    }
+    let mut permission_facts = HashSet::new();
+    for effect in &request.plan.resource_effects {
+        if resource_access(
+            &state,
+            actor,
+            project_id,
+            Uuid::from(effect.resource_id),
+            effect.operation,
+        )
+        .await?
+        {
+            permission_facts.insert((effect.resource_id, effect.operation));
+        }
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let record = sqlx::query(
+        r#"
+        SELECT request.thread_id, request.encrypted_payload, request.submitted_at,
+               thread.proxy_id, thread.created_at AS thread_created_at
+        FROM user_proxy_requests request
+        JOIN user_proxy_threads thread
+          ON thread.project_id = request.project_id AND thread.id = request.thread_id
+        WHERE request.project_id = $1 AND request.id = $2
+          AND request.user_identity_id = $3 AND thread.closed_at IS NULL
+        "#,
+    )
+    .bind(project_id)
+    .bind(request_id)
+    .bind(actor.identity_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let thread_id: Uuid = record.try_get("thread_id")?;
+    let proxy = UserProxy {
+        id: record.try_get("proxy_id")?,
+        user: actor.identity_id.into(),
+    };
+    let thread = UserProxyThread {
+        id: ProxyThreadId::from(thread_id),
+        proxy_id: proxy.id,
+        creator: actor.identity_id.into(),
+        created_at: record.try_get("thread_created_at")?,
+    };
+    let proxy_request = UserProxyRequest {
+        id: ProxyRequestId::from(request_id),
+        thread_id: thread.id,
+        user: actor.identity_id.into(),
+        encrypted_payload: deserialize_ciphertext(record.try_get("encrypted_payload")?)?,
+        submitted_at: record.try_get("submitted_at")?,
+    };
+    let (responsibility, within_responsibility) = load_proxy_responsibility(
+        &mut transaction,
+        project_id,
+        actor.identity_id,
+        &request.action_classification,
+    )
+    .await?;
+    let execution = ProxyExecution {
+        proxy: &proxy,
+        thread: &thread,
+        request: &proxy_request,
+        envelope: &request.envelope,
+        plan: &request.plan,
+        within_responsibility,
+        confirmation: request.confirmation.as_ref(),
+    };
+    execution
+        .validate(
+            |user, effect| {
+                user == actor.identity_id.into()
+                    && permission_facts.contains(&(effect.resource_id, effect.operation))
+            },
+            |_, _| false,
+        )
+        .map_err(agent_validation_error)?;
+    if let Some(invocation_id) = request.invocation_id {
+        let valid_invocation = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM agent_invocations
+             WHERE project_id = $1 AND id = $2 AND status = 'succeeded')",
+        )
+        .bind(project_id)
+        .bind(Uuid::from(invocation_id))
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !valid_invocation {
+            return Err(AppError::Conflict);
+        }
+    }
+    let plan_hash: [u8; 32] = Sha256::digest(
+        canonical_json(&json!({
+            "id": request.id,
+            "request_id": request_id,
+            "invocation_id": request.invocation_id,
+            "envelope": request.envelope,
+            "plan": request.plan,
+            "action_classification": request.action_classification,
+            "responsibility": responsibility.as_ref().map(|contract| (contract.id, contract.revision)),
+            "confirmation": request.confirmation,
+        }))?
+        .as_bytes(),
+    )
+    .into();
+    sqlx::query(
+        r#"
+        INSERT INTO user_proxy_plans (
+            id, project_id, request_id, invocation_id,
+            planning_envelope, action_plan, action_classification,
+            responsibility_id, responsibility_revision, confirmation, plan_hash
+        ) VALUES (
+            $1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb,
+            $8, $9, $10::jsonb, $11
+        )
+        "#,
+    )
+    .bind(request.id)
+    .bind(project_id)
+    .bind(request_id)
+    .bind(request.invocation_id.map(Uuid::from))
+    .bind(canonical_json(&request.envelope)?)
+    .bind(canonical_json(&request.plan)?)
+    .bind(canonical_json(&request.action_classification)?)
+    .bind(
+        responsibility
+            .as_ref()
+            .map(|contract| Uuid::from(contract.id)),
+    )
+    .bind(
+        responsibility
+            .as_ref()
+            .map(|contract| to_i64(contract.revision))
+            .transpose()?,
+    )
+    .bind(
+        request
+            .confirmation
+            .as_ref()
+            .map(canonical_json)
+            .transpose()?,
+    )
+    .bind(plan_hash.as_slice())
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ProxyPlanResponse {
+        id: request.id,
+        within_responsibility,
+        confirmation_required: !within_responsibility,
+        plan_hash_hex: hex::encode(plan_hash),
     }))
 }
 
@@ -1420,6 +2203,160 @@ fn info_payload_bytes(payload: &EncryptedPayload) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(&dto).map_err(|_| AppError::Internal)
 }
 
+fn validate_proxy_action_classification(
+    plan: &UserProxyActionPlan,
+    classifications: &[ProxyActionClassification],
+) -> Result<(), AppError> {
+    if plan.resource_effects.len() != classifications.len()
+        || plan
+            .resource_effects
+            .iter()
+            .zip(classifications)
+            .any(|(effect, classification)| {
+                effect.resource_id != classification.resource_id
+                    || !action_matches_operation(classification.action, effect.operation)
+            })
+    {
+        return Err(AppError::BadRequest(
+            "proxy action classification does not match the deterministic effect footprint",
+        ));
+    }
+    Ok(())
+}
+
+const fn action_matches_operation(action: AgentActionClass, operation: ResourceOperation) -> bool {
+    matches!(
+        (action, operation),
+        (AgentActionClass::CreateTask, ResourceOperation::Write)
+            | (AgentActionClass::ReplaceOwnTask, ResourceOperation::Write)
+            | (AgentActionClass::DeleteOwnTask, ResourceOperation::Manage)
+            | (AgentActionClass::AssignOwnTask, ResourceOperation::Manage)
+            | (AgentActionClass::UnassignOwnTask, ResourceOperation::Manage)
+            | (
+                AgentActionClass::MarkAssignedDone,
+                ResourceOperation::CompleteAssignedTask
+            )
+            | (
+                AgentActionClass::AppendAssignedNote,
+                ResourceOperation::Write
+            )
+            | (
+                AgentActionClass::AddAssignedAttachment,
+                ResourceOperation::Write
+            )
+            | (
+                AgentActionClass::PostComment,
+                ResourceOperation::PostComment
+            )
+    )
+}
+
+async fn load_proxy_responsibility(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    user_identity_id: Uuid,
+    classifications: &[ProxyActionClassification],
+) -> Result<(Option<ResponsibilityContract>, bool), AppError> {
+    if classifications.is_empty() {
+        return Ok((None, true));
+    }
+    let contract_json = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT contract::text
+        FROM agent_responsibility_contracts
+        WHERE project_id = $1 AND user_identity_id = $2
+        ORDER BY revision DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_identity_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(contract_json) = contract_json else {
+        return Ok((None, false));
+    };
+    let contract: ResponsibilityContract =
+        serde_json::from_str(&contract_json).map_err(|_| AppError::Internal)?;
+    let mut covered = true;
+    for classification in classifications {
+        let mut classification_covered = false;
+        for rule in &contract.rules {
+            if !rule.allowed_actions.contains(&classification.action) {
+                continue;
+            }
+            let within_scope = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM resource_closure
+                 WHERE project_id = $1 AND ancestor_id = $2 AND descendant_id = $3)",
+            )
+            .bind(project_id)
+            .bind(Uuid::from(rule.scope))
+            .bind(Uuid::from(classification.resource_id))
+            .fetch_one(&mut **transaction)
+            .await?;
+            if within_scope {
+                classification_covered = true;
+                break;
+            }
+        }
+        covered &= classification_covered;
+    }
+    Ok((Some(contract), covered))
+}
+
+async fn load_current_responsibility(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    user_identity_id: Uuid,
+) -> Result<Option<ResponsibilityContract>, AppError> {
+    let contract_json = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT contract::text
+        FROM agent_responsibility_contracts
+        WHERE project_id = $1 AND user_identity_id = $2
+        ORDER BY revision DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_identity_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    contract_json
+        .map(|value| serde_json::from_str(&value).map_err(|_| AppError::Internal))
+        .transpose()
+}
+
+async fn responsibility_operationally_covers(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    responsibility: &ResponsibilityContract,
+    local_goal: &LocalGoalContract,
+) -> Result<bool, AppError> {
+    let mut active_scopes = HashSet::new();
+    for rule in &responsibility.rules {
+        let within_scope = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM resource_closure
+             WHERE project_id = $1 AND ancestor_id = $2 AND descendant_id = $3)",
+        )
+        .bind(project_id)
+        .bind(Uuid::from(rule.scope))
+        .bind(Uuid::from(local_goal.contract.scope))
+        .fetch_one(&mut **transaction)
+        .await?;
+        if within_scope {
+            active_scopes.insert(rule.scope);
+        }
+    }
+    Ok(responsibility_operationally_covers_local_goal(
+        responsibility,
+        local_goal,
+        |rule_scope, goal_scope| {
+            goal_scope == local_goal.contract.scope && active_scopes.contains(&rule_scope)
+        },
+    ))
+}
+
 #[derive(Clone, Copy)]
 struct RunnerRecord {
     id: Uuid,
@@ -1527,6 +2464,63 @@ async fn authenticated_runner(
         device_id: row.try_get("device_id")?,
         key_version: row.try_get("activated_key_version")?,
     })
+}
+
+async fn validate_synthesis_runner(
+    state: &AppState,
+    actor: AuthSession,
+    project_id: Uuid,
+    invocation_id: InvocationId,
+    expected_task: &StructuredLanguageTaskEnvelope,
+) -> Result<Uuid, AppError> {
+    if expected_task.kind != StructuredLanguageTaskKind::SynthesizeGlobalContract {
+        return Err(AppError::BadRequest(
+            "global candidate requires a synthesis language task",
+        ));
+    }
+    let mut transaction = begin(state, actor, project_id).await?;
+    let row = sqlx::query(
+        r#"
+        SELECT invocation.agent_id, invocation.language_task::text AS language_task
+        FROM agent_invocations invocation
+        JOIN governed_agents agent
+          ON agent.project_id = invocation.project_id
+         AND agent.id = invocation.agent_id
+        JOIN agent_runners runner
+          ON runner.project_id = invocation.project_id
+         AND runner.id = invocation.runner_id
+         AND runner.agent_id = invocation.agent_id
+        JOIN devices device
+          ON device.identity_id = runner.principal_identity_id
+         AND device.id = runner.device_id
+        JOIN device_keys key
+          ON key.identity_id = runner.principal_identity_id
+         AND key.device_id = runner.device_id
+         AND key.key_version = runner.activated_key_version
+        WHERE invocation.project_id = $1 AND invocation.id = $2
+          AND invocation.agent_identity_id = $3
+          AND invocation.status = 'succeeded'
+          AND agent.principal_identity_id = $3 AND agent.state = 'active'
+          AND runner.device_id = $4 AND runner.state = 'active'
+          AND device.device_kind = 'service'
+          AND device.trust_state = 'trusted' AND device.retired_at IS NULL
+          AND key.revoked_at IS NULL
+        "#,
+    )
+    .bind(project_id)
+    .bind(Uuid::from(invocation_id))
+    .bind(actor.identity_id)
+    .bind(actor.device_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    let stored_task: StructuredLanguageTaskEnvelope =
+        serde_json::from_str(row.try_get("language_task")?).map_err(|_| AppError::Internal)?;
+    if stored_task != *expected_task {
+        return Err(AppError::Conflict);
+    }
+    transaction.commit().await?;
+    Ok(row.try_get("agent_id")?)
 }
 
 async fn load_agent(

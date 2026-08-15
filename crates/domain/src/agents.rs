@@ -168,6 +168,7 @@ pub enum StructuredLanguageTaskKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredLanguageTaskEnvelope {
     pub id: LanguageTaskId,
     pub kind: StructuredLanguageTaskKind,
@@ -244,12 +245,14 @@ impl StructuredLanguageTaskEnvelope {
 
 /// Provider output after JSON/schema decoding. It is still only a proposal.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredLanguageOutput {
     pub items: Vec<GroundedOutputItem>,
     pub max_observed_nesting_depth: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GroundedOutputItem {
     pub resource_id: Option<ResourceId>,
     pub principal_id: Option<UserId>,
@@ -258,6 +261,7 @@ pub struct GroundedOutputItem {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponsibilityRule {
     pub domain: u64,
     pub scope: ResourceId,
@@ -265,6 +269,7 @@ pub struct ResponsibilityRule {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponsibilityContract {
     pub id: ResponsibilityId,
     pub revision: u64,
@@ -284,7 +289,10 @@ impl ResponsibilityContract {
         if principal_kind(self.administrator) != Some(PrincipalKind::Administrator) {
             return Err(AgentValidationError::AdministratorRequired);
         }
-        if principal_kind(self.user) != Some(PrincipalKind::User) {
+        if !matches!(
+            principal_kind(self.user),
+            Some(PrincipalKind::User | PrincipalKind::Administrator)
+        ) {
             return Err(AgentValidationError::HumanUserRequired);
         }
         if self.revision == 0 || self.rules.is_empty() {
@@ -325,15 +333,16 @@ pub enum WorkKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FailurePlan {
-    RetrySame,
+    RetrySame {},
     Alternatives { work_spec_ids: Vec<u64> },
     DischargeBy { evidence_rule_id: u64 },
-    FailGoal,
+    FailGoal {},
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractObligation {
     pub id: Uuid,
     pub owner: UserId,
@@ -342,12 +351,14 @@ pub struct ContractObligation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractDependency {
     pub obligation: Uuid,
     pub prerequisite: Uuid,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractWorkSpec {
     pub id: u64,
     pub obligation: Uuid,
@@ -364,6 +375,7 @@ pub struct ContractWorkSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoalContract {
     pub scope: ResourceId,
     pub obligations: Vec<ContractObligation>,
@@ -452,6 +464,7 @@ impl GoalContract {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalGoalClause {
     pub id: u64,
     pub domain: u64,
@@ -460,14 +473,15 @@ pub struct LocalGoalClause {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LocalGoalOrigin {
-    ControllerPrompt,
+    ControllerPrompt {},
     AdministratorException { review_id: Uuid },
     GlobalMandate { global_revision: u64 },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalGoalContract {
     pub id: LocalGoalId,
     pub revision: u64,
@@ -572,7 +586,29 @@ pub fn responsibility_covers_local_goal(
     })
 }
 
+/// Operational bottom-up gate from R5.37. Organizational domains remain
+/// metadata: they cannot widen the concrete resource scope or action classes.
+pub fn responsibility_operationally_covers_local_goal(
+    responsibility: &ResponsibilityContract,
+    local_goal: &LocalGoalContract,
+    resource_within_scope: impl Fn(ResourceId, ResourceId) -> bool,
+) -> bool {
+    if responsibility.user != local_goal.controller || local_goal.validate().is_err() {
+        return false;
+    }
+    local_goal.contract.work_specs.iter().all(|work| {
+        responsibility.rules.iter().any(|rule| {
+            resource_within_scope(rule.scope, local_goal.contract.scope)
+                && work
+                    .allowed_actions
+                    .iter()
+                    .all(|action| rule.allowed_actions.contains(action))
+        })
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalLocalContribution {
     pub agent: UserId,
     pub local_revision: u64,
@@ -581,6 +617,7 @@ pub struct GlobalLocalContribution {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredGlobalWorkGrounding {
     pub global_work_spec_id: u64,
     pub source_agent: UserId,
@@ -589,6 +626,7 @@ pub struct StructuredGlobalWorkGrounding {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalContractCandidate {
     pub revision: u64,
     pub contract: GoalContract,
@@ -597,6 +635,7 @@ pub struct GlobalContractCandidate {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredGlobalSynthesisEnvelope {
     pub language_task: StructuredLanguageTaskEnvelope,
     pub source_agents: Vec<UserId>,
@@ -606,8 +645,9 @@ pub struct StructuredGlobalSynthesisEnvelope {
     pub max_conflicts: u32,
 }
 
-/// Validates the automatic bottom-up path. Semantic quality can be evaluated
-/// separately; activation relies only on structural grounding and governance.
+/// Validates the automatic bottom-up path for a candidate synthesized on an
+/// authorized plaintext-holding client/runner. This function performs no
+/// semantic synthesis and sees only the minimum structural contract metadata.
 pub fn validate_global_synthesis(
     envelope: &StructuredGlobalSynthesisEnvelope,
     candidate: &GlobalContractCandidate,
@@ -619,6 +659,12 @@ pub fn validate_global_synthesis(
     if envelope.language_task.kind != StructuredLanguageTaskKind::SynthesizeGlobalContract {
         return Err(AgentValidationError::WrongLanguageTaskKind);
     }
+    ensure_unique(&envelope.source_agents, "global source agent")?;
+    ensure_unique_by(
+        &candidate.contributions,
+        |contribution| contribution.agent,
+        "global contribution agent",
+    )?;
     candidate.contract.validate()?;
     if candidate.revision == 0
         || candidate.contract.obligations.len() > envelope.max_global_obligations as usize
@@ -1335,6 +1381,7 @@ mod tests {
 
     fn local_goal(agent: UserId, controller: UserId) -> LocalGoalContract {
         let obligation = Uuid::now_v7();
+        let scope = ResourceId::new();
         LocalGoalContract {
             id: LocalGoalId::new(),
             revision: 1,
@@ -1342,7 +1389,7 @@ mod tests {
             controller,
             encrypted_prompt: payload(),
             contract: GoalContract {
-                scope: ResourceId::new(),
+                scope,
                 obligations: vec![ContractObligation {
                     id: obligation,
                     owner: agent,
@@ -1362,16 +1409,16 @@ mod tests {
                     generation_rank: 0,
                     is_entry: true,
                     continuations: Vec::new(),
-                    failure_plan: FailurePlan::FailGoal,
+                    failure_plan: FailurePlan::FailGoal {},
                 }],
             },
             clauses: vec![LocalGoalClause {
                 id: 1,
                 domain: 7,
-                scope: ResourceId::new(),
+                scope,
                 work_spec_ids: vec![1],
             }],
-            origin: LocalGoalOrigin::ControllerPrompt,
+            origin: LocalGoalOrigin::ControllerPrompt {},
             supersedes_revision: None,
         }
     }
@@ -1608,10 +1655,20 @@ mod tests {
             &local,
             |parent, child| parent == child,
         ));
+        assert!(responsibility_operationally_covers_local_goal(
+            &responsibility,
+            &local,
+            |parent, child| parent == child,
+        ));
 
         let mut insufficient = responsibility;
         insufficient.rules[0].allowed_actions = vec![AgentActionClass::PostComment];
         assert!(!responsibility_covers_local_goal(
+            &insufficient,
+            &local,
+            |parent, child| parent == child,
+        ));
+        assert!(!responsibility_operationally_covers_local_goal(
             &insufficient,
             &local,
             |parent, child| parent == child,

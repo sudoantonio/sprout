@@ -90,6 +90,30 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             axum::routing::put(agents::record_local_goal),
         )
         .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/interrogations",
+            post(agents::record_interrogation),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/interrogations/{interrogation_id}",
+            get(agents::get_interrogation),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-global-contracts",
+            post(agents::record_global_contract),
+        )
+        .route(
+            "/v1/projects/{project_id}/user-proxy/threads",
+            post(agents::create_proxy_thread),
+        )
+        .route(
+            "/v1/projects/{project_id}/user-proxy/threads/{thread_id}/requests",
+            post(agents::submit_proxy_request),
+        )
+        .route(
+            "/v1/projects/{project_id}/user-proxy/requests/{request_id}/plan",
+            post(agents::record_proxy_plan),
+        )
+        .route(
             "/v1/projects/{project_id}/agents/{agent_id}/invocations",
             post(agents::queue_invocation),
         )
