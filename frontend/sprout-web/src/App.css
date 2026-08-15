@@ -5866,13 +5866,14 @@ span.task-create-pill-btn {
   color: var(--text-board);
   font-size: 0.975rem;
   line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 
 .tasklist-info-markdown h1,
 .tasklist-info-markdown h2,
-.tasklist-info-markdown h3,
-.tasklist-info-markdown p {
-  margin: 0;
+.tasklist-info-markdown h3 {
+  scroll-margin-top: 1rem;
+  line-height: 1.25;
 }
 
 .tasklist-info-markdown h1 {
@@ -5887,20 +5888,191 @@ span.task-create-pill-btn {
   font-size: 1.15rem;
 }
 
+.tasklist-info-markdown > :first-child {
+  margin-top: 0;
+}
+
+.tasklist-info-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.tasklist-info-markdown p,
+.tasklist-info-markdown ul,
+.tasklist-info-markdown ol,
+.tasklist-info-markdown blockquote,
+.tasklist-info-markdown pre,
+.tasklist-info-table-scroll {
+  margin-block: 0.8rem;
+}
+
 .tasklist-info-markdown a {
   color: var(--accent-action);
   text-decoration-thickness: 0.08em;
   text-underline-offset: 0.14em;
 }
 
-.tasklist-info-blank {
-  height: 0.8rem;
+.tasklist-info-markdown a:hover {
+  color: var(--accent-action-hover);
 }
 
-.tasklist-info-list-item {
-  display: flex;
-  gap: 0.55rem;
-  padding-left: 0.35rem;
+.tasklist-info-markdown ul,
+.tasklist-info-markdown ol {
+  padding-left: 1.65rem;
+}
+
+.tasklist-info-markdown li + li {
+  margin-top: 0.25rem;
+}
+
+.tasklist-info-markdown li > ul,
+.tasklist-info-markdown li > ol {
+  margin-block: 0.3rem;
+}
+
+.tasklist-info-markdown li > p {
+  margin-block: 0.3rem;
+}
+
+.tasklist-info-markdown input[type='checkbox'] {
+  margin: 0 0.45rem 0 0;
+  accent-color: var(--accent-action);
+}
+
+.tasklist-info-markdown blockquote {
+  border-left: 0.22rem solid var(--border-subtle-medium);
+  padding-left: 0.9rem;
+  color: var(--text-secondary);
+}
+
+.tasklist-info-markdown blockquote blockquote {
+  border-left-color: var(--accent-focus);
+}
+
+.tasklist-info-markdown code {
+  border-radius: 0.3rem;
+  background: var(--surface-hover);
+  padding: 0.12rem 0.32rem;
+  color: var(--text-board);
+  font-family: var(--mono);
+  font-size: 0.88em;
+}
+
+.tasklist-info-markdown pre {
+  overflow: auto;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--surface-hover) 72%, var(--surface-card));
+  padding: 0.9rem 1rem;
+  tab-size: 2;
+}
+
+.tasklist-info-markdown pre code {
+  display: block;
+  min-width: max-content;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  font-size: 0.84rem;
+  line-height: 1.55;
+}
+
+.tasklist-info-markdown .hljs-comment,
+.tasklist-info-markdown .hljs-quote {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.tasklist-info-markdown .hljs-keyword,
+.tasklist-info-markdown .hljs-selector-tag,
+.tasklist-info-markdown .hljs-subst {
+  color: var(--danger);
+}
+
+.tasklist-info-markdown .hljs-string,
+.tasklist-info-markdown .hljs-doctag,
+.tasklist-info-markdown .hljs-regexp,
+.tasklist-info-markdown .hljs-addition {
+  color: var(--sprout);
+}
+
+.tasklist-info-markdown .hljs-title,
+.tasklist-info-markdown .hljs-section,
+.tasklist-info-markdown .hljs-name,
+.tasklist-info-markdown .hljs-type,
+.tasklist-info-markdown .hljs-built_in {
+  color: var(--accent-action);
+}
+
+.tasklist-info-markdown .hljs-number,
+.tasklist-info-markdown .hljs-literal,
+.tasklist-info-markdown .hljs-symbol,
+.tasklist-info-markdown .hljs-bullet {
+  color: var(--warning);
+}
+
+.tasklist-info-markdown .hljs-attr,
+.tasklist-info-markdown .hljs-variable,
+.tasklist-info-markdown .hljs-template-variable {
+  color: color-mix(in srgb, var(--accent-action) 68%, var(--warning));
+}
+
+.tasklist-info-markdown .hljs-deletion {
+  color: var(--danger);
+  text-decoration: line-through;
+}
+
+.tasklist-info-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-card);
+}
+
+.tasklist-info-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface-card);
+  font-size: 0.9rem;
+}
+
+.tasklist-info-markdown th,
+.tasklist-info-markdown td {
+  border-bottom: 1px solid var(--border-neutral);
+  padding: 0.55rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.tasklist-info-markdown th {
+  background: var(--surface-hover);
+  font-weight: 700;
+}
+
+.tasklist-info-markdown tr:last-child td {
+  border-bottom: 0;
+}
+
+.tasklist-info-markdown img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin-block: 0.8rem;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-card);
+  background: var(--surface-hover);
+}
+
+.tasklist-info-remote-image-fallback {
+  display: grid;
+  min-height: 5rem;
+  place-items: center;
+  margin-block: 0.8rem;
+  border: 1px dashed var(--border-subtle-medium);
+  border-radius: var(--radius-card);
+  background: var(--surface-hover);
+  padding: 1rem;
+  color: var(--text-muted);
+  text-align: center;
 }
 
 .tasklist-info-files,

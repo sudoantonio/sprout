@@ -129,16 +129,24 @@ drag-and-drop o riordinamento visuale.
 
 ## Markdown e riconoscimento dei link
 
-L'editor conserva il testo sorgente e offre una preview Markdown leggera. Sono
-renderizzati esplicitamente:
+L'editor conserva il testo sorgente e la preview usa CommonMark con le
+estensioni GitHub Flavored Markdown. Sono supportati:
 
-- heading `#`, `##` e `###`;
-- liste non ordinate con `-` o `*`;
-- paragrafi;
-- righe vuote.
+- heading con anchor interni deterministici;
+- paragrafi, soft newline e hard break con due spazi finali;
+- escape Markdown;
+- enfasi, grassetto e testo barrato;
+- liste ordinate e non ordinate annidate, incluse numerazioni iniziali diverse
+  da `1` e task list;
+- blockquote annidati con Markdown interno;
+- tabelle responsive con Markdown nelle celle;
+- link inline, reference link e URL automatici;
+- immagini Markdown remote HTTPS con alt text, title, lazy loading e fallback;
+- inline code, incluso contenuto delimitato da più backtick;
+- fenced code block completi con syntax highlighting.
 
-Non è un parser Markdown completo: enfasi, tabelle, code block, checklist e
-altre estensioni non ricevono oggi una formattazione specifica.
+L'HTML contenuto nel Markdown non viene interpretato: resta disabilitato per
+non introdurre script, iframe o markup arbitrario nella superficie E2EE.
 
 I link non sono un tipo di dato server. Vengono riconosciuti esclusivamente nel
 client all'interno del testo cifrato:
@@ -149,8 +157,13 @@ client all'interno del testo cifrato:
 - lo schema è limitato a HTTP e HTTPS;
 - il link si apre in una nuova tab con `noopener` e `noreferrer`.
 
-I link usano il colore accent della UI. File e immagini usano il trattamento
-visuale warning/arancione già definito dal design della vista.
+I link usano il colore accent della UI. File e immagini allegate usano il
+trattamento visuale warning/arancione già definito dal design della vista.
+Le immagini inserite tramite sintassi Markdown vengono renderizzate nel flusso
+del documento; la CSP consente soltanto origini HTTPS oltre a `self`, `data:` e
+`blob:`. La richiesta usa `Referrer-Policy: no-referrer`, ma il server remoto
+può comunque osservare l'indirizzo di rete del dispositivo: un'immagine
+allegata e cifrata resta quindi preferibile per contenuti sensibili.
 
 Il riconoscimento resta client-side per evitare che il backend apprenda quali
 stringhe sono URL.
@@ -400,7 +413,12 @@ offline generica delle task.
 La feature dispone attualmente di verifiche per:
 
 - riconoscimento di link HTTP/HTTPS quotati e non quotati;
-- parsing della struttura Markdown leggera;
+- immagini remote con title, alt, lazy loading e fallback;
+- GFM: URL automatici, tabelle, barrato e reference link;
+- heading/anchor, hard break, newline ed escape;
+- liste ordinate/non ordinate annidate e numerazione iniziale;
+- blockquote annidati e Markdown interno;
+- inline code con backtick e code block JavaScript completo con highlighting;
 - contesto di cifratura del documento Info;
 - apertura della tab Info, caricamento, rendering link e salvataggio testo nel
   test component React;
@@ -419,8 +437,8 @@ concorrenza tra due utenti.
 
 1. **UI solo task list.** Le route topic sono implementate, ma non esiste ancora
    la relativa vista frontend.
-2. **Editor Markdown ridotto.** Viene modificato e renderizzato soltanto il
-   primo blocco testo; il parser non copre tutto CommonMark.
+2. **Un solo blocco testo modificabile.** Il renderer copre CommonMark/GFM, ma
+   l'editor modifica soltanto il primo blocco testo del documento.
 3. **Ordine visuale raggruppato.** File e documenti sono mostrati in sezioni
    separate, non intercalati nel testo secondo l'ordine completo dei blocchi.
 4. **Operazioni composte non atomiche.** Upload file e creazione figlio

@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Uuid } from '../api/contracts'
-import { linkifyInfoText, parseInfoMarkdown } from '../domain/info-documents'
 import type {
   DecryptedInfoDocument,
   InfoDocumentContent,
@@ -8,6 +7,7 @@ import type {
 } from '../domain/models'
 import type { TaskListItem } from '../store/app-store'
 import { FolderIcon, PaperclipIcon, PencilIcon } from './icons'
+import { InfoMarkdown } from './InfoMarkdown'
 
 const emptyDocument = (title?: string): InfoDocumentContent => ({
   schema: 1,
@@ -59,65 +59,6 @@ const withMarkdown = (
         : block,
     ),
   }
-}
-
-const LinkifiedText = ({ value }: { value: string }) => (
-  <>
-    {linkifyInfoText(value).map((segment, index) =>
-      segment.type === 'link' ? (
-        <a
-          key={`${index}-${segment.href}`}
-          href={segment.href}
-          target="_blank"
-          rel="noreferrer noopener"
-        >
-          {segment.value}
-        </a>
-      ) : (
-        <span key={`${index}-${segment.value}`}>{segment.value}</span>
-      ),
-    )}
-  </>
-)
-
-const MarkdownPreview = ({ value }: { value: string }) => {
-  if (!value.trim()) {
-    return (
-      <p className="tasklist-info-placeholder">
-        Inserisci testo, link e informazioni relative a questa task list.
-      </p>
-    )
-  }
-  return (
-    <div className="tasklist-info-markdown">
-      {parseInfoMarkdown(value).map((line) => {
-        if (line.type === 'blank') {
-          return <div key={line.key} className="tasklist-info-blank" aria-hidden />
-        }
-        if (line.type === 'heading') {
-          const Heading = `h${line.level}` as 'h1' | 'h2' | 'h3'
-          return (
-            <Heading key={line.key}>
-              <LinkifiedText value={line.value} />
-            </Heading>
-          )
-        }
-        if (line.type === 'list-item') {
-          return (
-            <p key={line.key} className="tasklist-info-list-item">
-              <span aria-hidden>•</span>
-              <LinkifiedText value={line.value} />
-            </p>
-          )
-        }
-        return (
-          <p key={line.key}>
-            <LinkifiedText value={line.value} />
-          </p>
-        )
-      })}
-    </div>
-  )
 }
 
 const InfoImageBlock = ({
@@ -474,7 +415,7 @@ export const TaskListInfoPanel = ({
         </div>
       ) : (
         <div className="tasklist-info-preview">
-          <MarkdownPreview value={markdown} />
+          <InfoMarkdown>{markdown}</InfoMarkdown>
         </div>
       )}
 
