@@ -1127,6 +1127,58 @@ pub struct WorkProjectionEvent {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct CanonicalWorkSlot {
+    pub work_spec_id: u64,
+    pub slot: u32,
+    pub work: WorkItemId,
+}
+
+mod work_slot_map {
+    use std::collections::HashMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+
+    use super::{CanonicalWorkSlot, WorkItemId};
+
+    pub fn serialize<S>(
+        slots: &HashMap<(u64, u32), WorkItemId>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut values: Vec<_> = slots
+            .iter()
+            .map(|((work_spec_id, slot), work)| CanonicalWorkSlot {
+                work_spec_id: *work_spec_id,
+                slot: *slot,
+                work: *work,
+            })
+            .collect();
+        values.sort_by_key(|value| (value.work_spec_id, value.slot));
+        values.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<(u64, u32), WorkItemId>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = Vec::<CanonicalWorkSlot>::deserialize(deserializer)?;
+        let mut slots = HashMap::with_capacity(values.len());
+        for value in values {
+            if slots
+                .insert((value.work_spec_id, value.slot), value.work)
+                .is_some()
+            {
+                return Err(D::Error::custom("duplicate canonical work slot"));
+            }
+        }
+        Ok(slots)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuspendedClaimResolution {
     pub work: WorkItemId,
     pub attempt: u16,
@@ -1143,6 +1195,7 @@ pub struct CollaborativeRunState {
     pub run_status: CollaborativeRunStatus,
     pub participants: HashSet<UserId>,
     pub obligations: HashMap<Uuid, ObligationInstance>,
+    #[serde(with = "work_slot_map")]
     pub work_slots: HashMap<(u64, u32), WorkItemId>,
     /// Current Lean `SemanticState.workItems` projection only.
     pub work_items: HashMap<WorkItemId, WorkItem>,
@@ -5072,5 +5125,21 @@ mod tests {
         .unwrap();
         value["observation"]["description"] = serde_json::json!("plaintext");
         assert!(serde_json::from_value::<BlockerResolutionRecord>(value).is_err());
+    }
+
+    #[test]
+    fn collaborative_run_snapshot_round_trips_canonical_slots() {
+        let agent = UserId::new();
+        let local = local_goal(agent, UserId::new());
+        let state = CollaborativeRunState::initialize(
+            RunId::new(),
+            &local.contract,
+            &ContractConditionFacts::default(),
+            0,
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: CollaborativeRunState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, state);
     }
 }

@@ -1958,6 +1958,444 @@ BEGIN
 END;
 $test$;
 
+-- R5.30 persistent-kernel RLS fixture. The member used below can read the
+-- scope through normal permissions but is deliberately not a run participant.
+SELECT set_config(
+    'app.identity_id',
+    '10000000-0000-0000-0000-000000000001',
+    true
+);
+SELECT set_config(
+    'app.device_id',
+    '20000000-0000-0000-0000-000000000001',
+    true
+);
+
+INSERT INTO identities (
+    id, identity_handle, encrypted_profile, principal_kind
+) VALUES (
+    '91000000-0000-0000-0000-000000000001',
+    'completion-kernel-agent', decode('91', 'hex'), 'agent'
+);
+INSERT INTO project_memberships (
+    project_id, identity_id, role, state, suspended_at
+)
+VALUES (
+    '30000000-0000-0000-0000-000000000001',
+    '91000000-0000-0000-0000-000000000001', 'member',
+    'suspended', clock_timestamp()
+);
+INSERT INTO governed_agents (
+    id, project_id, principal_identity_id, controller_identity_id,
+    profile_resource_node_id, encrypted_system_prompt, key_epoch,
+    availability
+) VALUES (
+    '92000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '91000000-0000-0000-0000-000000000001',
+    '10000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000003',
+    decode('92', 'hex'), 1, 'controller_private'
+);
+INSERT INTO agent_local_goal_contracts (
+    id, project_id, agent_id, agent_identity_id,
+    controller_identity_id, revision, contract, contract_hash
+) VALUES (
+    '93000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '92000000-0000-0000-0000-000000000001',
+    '91000000-0000-0000-0000-000000000001',
+    '10000000-0000-0000-0000-000000000001',
+    1, '{}'::jsonb, decode(repeat('93', 32), 'hex')
+);
+INSERT INTO agent_collaborative_runs (
+    id, project_id, goal_id, scope_resource_node_id,
+    local_goal_id, local_goal_revision,
+    contract, contract_hash, state, state_hash,
+    state_version, goal_status, run_status, created_by_identity_id
+) VALUES (
+    '94000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '94100000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000003',
+    '93000000-0000-0000-0000-000000000001', 1,
+    '{}'::jsonb, decode(repeat('94', 32), 'hex'),
+    '{"blockers":{"95000000-0000-0000-0000-000000000001":{"status":"waiting","created_at":1,"terminal_at":null}}}'::jsonb,
+    decode(repeat('95', 32), 'hex'),
+    1, 'active', 'running',
+    '10000000-0000-0000-0000-000000000001'
+);
+INSERT INTO agent_run_participants (
+    project_id, run_id, identity_id, participant_role
+) VALUES (
+    '30000000-0000-0000-0000-000000000001',
+    '94000000-0000-0000-0000-000000000001',
+    '91000000-0000-0000-0000-000000000001', 'agent'
+);
+INSERT INTO agent_run_transitions (
+    id, project_id, run_id, state_version, transition_kind,
+    runtime_actor_kind, actor_identity_id,
+    next_state_hash, facts_hash, state_snapshot, fact_references
+) VALUES (
+    '96000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '94000000-0000-0000-0000-000000000001', 1, 'initialized',
+    'principal', '10000000-0000-0000-0000-000000000001',
+    decode(repeat('95', 32), 'hex'), decode(repeat('96', 32), 'hex'),
+    '{"blockers":{"95000000-0000-0000-0000-000000000001":{"status":"waiting","created_at":1,"terminal_at":null}},"blocker_resolutions":[]}'::jsonb,
+    '{}'::jsonb
+);
+INSERT INTO agent_run_blockers (
+    id, project_id, run_id, obligation_id, waiting_rule_ordinal,
+    scope, waiting_condition, current_status, created_tick
+) VALUES (
+    '95000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '94000000-0000-0000-0000-000000000001',
+    '95100000-0000-0000-0000-000000000001', 1,
+    '{"kind":"goal","goal":"94100000-0000-0000-0000-000000000001"}'::jsonb,
+    '{"kind":"external_outcome","condition":"95200000-0000-0000-0000-000000000001"}'::jsonb,
+    'waiting', 1
+);
+INSERT INTO agent_run_work_slots (
+    project_id, run_id, work_spec_ordinal, slot, work_item_id
+) VALUES (
+    '30000000-0000-0000-0000-000000000001',
+    '94000000-0000-0000-0000-000000000001', 1, 0,
+    '97000000-0000-0000-0000-000000000001'
+);
+INSERT INTO agent_run_claim_leases (
+    id, project_id, run_id, work_item_id, attempt,
+    claimant_identity_id, acquired_at, expires_at, status
+) VALUES (
+    '98000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '94000000-0000-0000-0000-000000000001',
+    '97000000-0000-0000-0000-000000000001', 1,
+    '91000000-0000-0000-0000-000000000001',
+    clock_timestamp(), clock_timestamp() + interval '5 minutes', 'active'
+);
+
+DO $test$
+BEGIN
+    BEGIN
+        UPDATE agent_run_blockers
+        SET current_status = 'cancelled', terminal_tick = 2
+        WHERE id = '95000000-0000-0000-0000-000000000001';
+        RAISE EXCEPTION 'direct blocker status mutation bypassed domain transition';
+    EXCEPTION
+        WHEN SQLSTATE '55000' THEN NULL;
+    END;
+    BEGIN
+        INSERT INTO agent_run_blocker_resolutions (
+            project_id, run_id, blocker_id, observation_kind,
+            observation_id, terminal_status, observed_at,
+            provenance_hash, transition_id
+        ) VALUES (
+            '30000000-0000-0000-0000-000000000001',
+            '94000000-0000-0000-0000-000000000001',
+            '95000000-0000-0000-0000-000000000001',
+            'external_outcome',
+            '95200000-0000-0000-0000-000000000001',
+            'resolved', clock_timestamp(), decode(repeat('99', 32), 'hex'),
+            '96000000-0000-0000-0000-000000000001'
+        );
+        RAISE EXCEPTION 'forged blocker resolution bypassed domain transition';
+    EXCEPTION
+        WHEN SQLSTATE '55000' THEN NULL;
+    END;
+END;
+$test$;
+
+-- R5.30 evidence provenance must not infer work causality from an event chosen
+-- by the runner. Two task completions are deliberately equivalent by actor,
+-- scope and time; only the one named by a preexisting invocation/effect
+-- binding may become a work outcome. The outer subtransaction rolls the
+-- synthetic product adapter fixture back after proving both branches.
+DO $test$
+DECLARE
+    claim_time timestamptz := clock_timestamp() - interval '3 seconds';
+    bound_time timestamptz := clock_timestamp() - interval '2 seconds';
+    completion_time timestamptz := clock_timestamp() - interval '1 second';
+BEGIN
+    BEGIN
+        UPDATE project_memberships
+        SET state = 'active', suspended_at = NULL
+        WHERE project_id = '30000000-0000-0000-0000-000000000001'
+          AND identity_id = '91000000-0000-0000-0000-000000000001';
+
+        INSERT INTO resource_nodes (
+            id, project_id, parent_id, node_kind,
+            encrypted_metadata, created_by_identity_id
+        ) VALUES
+        (
+            '99000000-0000-0000-0000-000000000001',
+            '30000000-0000-0000-0000-000000000001',
+            '40000000-0000-0000-0000-000000000003',
+            'task', decode('9901', 'hex'),
+            '10000000-0000-0000-0000-000000000001'
+        ),
+        (
+            '99000000-0000-0000-0000-000000000002',
+            '30000000-0000-0000-0000-000000000001',
+            '40000000-0000-0000-0000-000000000003',
+            'task', decode('9902', 'hex'),
+            '10000000-0000-0000-0000-000000000001'
+        );
+        INSERT INTO tasks (
+            id, project_id, task_list_id, resource_node_id, task_kind,
+            encrypted_payload, encrypted_value_snapshot, created_by_identity_id
+        ) VALUES
+        (
+            '99100000-0000-0000-0000-000000000001',
+            '30000000-0000-0000-0000-000000000001',
+            '51000000-0000-0000-0000-000000000001',
+            '99000000-0000-0000-0000-000000000001', 'priority',
+            decode('9911', 'hex'), decode('9912', 'hex'),
+            '10000000-0000-0000-0000-000000000001'
+        ),
+        (
+            '99100000-0000-0000-0000-000000000002',
+            '30000000-0000-0000-0000-000000000001',
+            '51000000-0000-0000-0000-000000000001',
+            '99000000-0000-0000-0000-000000000002', 'priority',
+            decode('9921', 'hex'), decode('9922', 'hex'),
+            '10000000-0000-0000-0000-000000000001'
+        );
+        INSERT INTO task_assignments (
+            id, project_id, task_id, assignee_identity_id,
+            assigned_by_identity_id, encrypted_payload, permission_root_grant_id
+        ) VALUES
+        (
+            '99200000-0000-0000-0000-000000000001',
+            '30000000-0000-0000-0000-000000000001',
+            '99100000-0000-0000-0000-000000000001',
+            '91000000-0000-0000-0000-000000000001',
+            '10000000-0000-0000-0000-000000000001', decode('9921', 'hex'),
+            '99200000-0000-0000-0000-000000000011'
+        ),
+        (
+            '99200000-0000-0000-0000-000000000002',
+            '30000000-0000-0000-0000-000000000001',
+            '99100000-0000-0000-0000-000000000002',
+            '91000000-0000-0000-0000-000000000001',
+            '10000000-0000-0000-0000-000000000001', decode('9922', 'hex'),
+            '99200000-0000-0000-0000-000000000012'
+        );
+        INSERT INTO task_completions (
+            id, project_id, task_id, assignment_id,
+            assignee_identity_id, recorded_by_identity_id,
+            occurrence_key, encrypted_payload, completed_at
+        ) VALUES
+        (
+            '99300000-0000-0000-0000-000000000001',
+            '30000000-0000-0000-0000-000000000001',
+            '99100000-0000-0000-0000-000000000001',
+            '99200000-0000-0000-0000-000000000001',
+            '91000000-0000-0000-0000-000000000001',
+            '91000000-0000-0000-0000-000000000001',
+            '99300000-0000-0000-0000-000000000011', decode('9931', 'hex'),
+            completion_time
+        ),
+        (
+            '99300000-0000-0000-0000-000000000002',
+            '30000000-0000-0000-0000-000000000001',
+            '99100000-0000-0000-0000-000000000002',
+            '99200000-0000-0000-0000-000000000002',
+            '91000000-0000-0000-0000-000000000001',
+            '91000000-0000-0000-0000-000000000001',
+            '99300000-0000-0000-0000-000000000012', decode('9932', 'hex'),
+            completion_time
+        );
+        UPDATE tasks
+        SET state = 'completed',
+            completed_by_identity_id = '91000000-0000-0000-0000-000000000001',
+            completed_at = completion_time,
+            payload_version = payload_version + 1
+        WHERE id IN (
+            '99100000-0000-0000-0000-000000000001',
+            '99100000-0000-0000-0000-000000000002'
+        );
+
+        UPDATE agent_run_claim_leases
+        SET acquired_at = claim_time, expires_at = completion_time + interval '5 minutes'
+        WHERE id = '98000000-0000-0000-0000-000000000001';
+        UPDATE agent_collaborative_runs
+        SET state_version = 2,
+            state = jsonb_build_object(
+                'claims', jsonb_build_object(
+                    '98000000-0000-0000-0000-000000000001',
+                    jsonb_build_object('status', 'active')
+                ),
+                'work_items', jsonb_build_object(
+                    '97000000-0000-0000-0000-000000000001',
+                    jsonb_build_object('status', 'claimed')
+                )
+            ),
+            state_hash = decode(repeat('a2', 32), 'hex')
+        WHERE id = '94000000-0000-0000-0000-000000000001';
+        INSERT INTO agent_run_transitions (
+            id, project_id, run_id, state_version, transition_kind,
+            runtime_actor_kind, actor_identity_id, previous_state_hash,
+            next_state_hash, facts_hash, state_snapshot, fact_references
+        ) VALUES (
+            '99700000-0000-0000-0000-000000000001',
+            '30000000-0000-0000-0000-000000000001',
+            '94000000-0000-0000-0000-000000000001', 2, 'work_claimed',
+            'principal', '91000000-0000-0000-0000-000000000001',
+            decode(repeat('95', 32), 'hex'), decode(repeat('a2', 32), 'hex'),
+            decode(repeat('97', 32), 'hex'),
+            jsonb_build_object(
+                'claims', jsonb_build_object(
+                    '98000000-0000-0000-0000-000000000001',
+                    jsonb_build_object('status', 'active')
+                )
+            ), '{}'::jsonb
+        );
+        INSERT INTO agent_invocations (
+            id, project_id, agent_id, agent_identity_id,
+            language_task, authority_envelope, encrypted_input, request_hash,
+            status, attempt, max_attempts, completed_at,
+            encrypted_output, output_hash, created_by_identity_id
+        ) VALUES (
+            '99400000-0000-0000-0000-000000000001',
+            '30000000-0000-0000-0000-000000000001',
+            '92000000-0000-0000-0000-000000000001',
+            '91000000-0000-0000-0000-000000000001',
+            '{}'::jsonb, '{}'::jsonb, decode('9941', 'hex'),
+            decode(repeat('94', 32), 'hex'), 'succeeded', 1, 1, bound_time,
+            decode('9942', 'hex'), decode(repeat('95', 32), 'hex'),
+            '10000000-0000-0000-0000-000000000001'
+        );
+        INSERT INTO agent_effect_proposals (
+            id, project_id, invocation_id, agent_id, ordinal, effect,
+            proposal_hash, status, decided_at, applied_at
+        ) VALUES (
+            '99500000-0000-0000-0000-000000000001',
+            '30000000-0000-0000-0000-000000000001',
+            '99400000-0000-0000-0000-000000000001',
+            '92000000-0000-0000-0000-000000000001', 0,
+            '{"effect":{"resource_id":"99000000-0000-0000-0000-000000000001","operation":"complete_assigned_task"},"materialization":{"kind":"complete_assigned_task"}}'::jsonb,
+            decode(repeat('96', 32), 'hex'), 'applied', bound_time, bound_time
+        );
+        INSERT INTO agent_run_work_product_bindings (
+            project_id, run_id, work_item_id, claim_id, attempt,
+            invocation_id, effect_id, resource_node_id, bound_at,
+            claim_transition_id
+        ) VALUES (
+            '30000000-0000-0000-0000-000000000001',
+            '94000000-0000-0000-0000-000000000001',
+            '97000000-0000-0000-0000-000000000001',
+            '98000000-0000-0000-0000-000000000001', 1,
+            '99400000-0000-0000-0000-000000000001',
+            '99500000-0000-0000-0000-000000000001',
+            '99000000-0000-0000-0000-000000000001', bound_time,
+            '99700000-0000-0000-0000-000000000001'
+        );
+
+        UPDATE agent_run_claim_leases
+        SET status = 'released', terminal_at = completion_time
+        WHERE id = '98000000-0000-0000-0000-000000000001';
+        UPDATE agent_collaborative_runs
+        SET state_version = 3,
+            state = jsonb_build_object(
+                'claims', jsonb_build_object(
+                    '98000000-0000-0000-0000-000000000001',
+                    jsonb_build_object('status', 'released')
+                ),
+                'work_items', jsonb_build_object(
+                    '97000000-0000-0000-0000-000000000001',
+                    jsonb_build_object('status', 'succeeded')
+                )
+            ),
+            state_hash = decode(repeat('a3', 32), 'hex')
+        WHERE id = '94000000-0000-0000-0000-000000000001';
+        INSERT INTO agent_run_transitions (
+            id, project_id, run_id, state_version, transition_kind,
+            runtime_actor_kind, actor_identity_id, observation_kind, observation_id,
+            previous_state_hash, next_state_hash, facts_hash,
+            state_snapshot, fact_references
+        ) VALUES (
+            '99700000-0000-0000-0000-000000000002',
+            '30000000-0000-0000-0000-000000000001',
+            '94000000-0000-0000-0000-000000000001', 3, 'work_succeeded',
+            'principal', '91000000-0000-0000-0000-000000000001',
+            'task_completion', '99300000-0000-0000-0000-000000000002',
+            decode(repeat('a2', 32), 'hex'), decode(repeat('a3', 32), 'hex'),
+            decode(repeat('97', 32), 'hex'),
+            jsonb_build_object(
+                'claims', jsonb_build_object(
+                    '98000000-0000-0000-0000-000000000001',
+                    jsonb_build_object('status', 'released')
+                ),
+                'work_items', jsonb_build_object(
+                    '97000000-0000-0000-0000-000000000001',
+                    jsonb_build_object('status', 'succeeded')
+                )
+            ), '{}'::jsonb
+        );
+        BEGIN
+            INSERT INTO agent_run_work_outcomes (
+                project_id, run_id, work_item_id, claim_id, attempt,
+                outcome_kind, product_event_id, observed_at,
+                provenance_hash, transition_id
+            ) VALUES (
+                '30000000-0000-0000-0000-000000000001',
+                '94000000-0000-0000-0000-000000000001',
+                '97000000-0000-0000-0000-000000000001',
+                '98000000-0000-0000-0000-000000000001', 1,
+                'task_completion', '99300000-0000-0000-0000-000000000002',
+                completion_time, decode(repeat('98', 32), 'hex'),
+                '99700000-0000-0000-0000-000000000002'
+            );
+            RAISE EXCEPTION 'unbound same-agent task completion became a work outcome';
+        EXCEPTION
+            WHEN SQLSTATE '55000' THEN NULL;
+        END;
+
+        UPDATE agent_collaborative_runs
+        SET state_version = 4, state_hash = decode(repeat('a4', 32), 'hex')
+        WHERE id = '94000000-0000-0000-0000-000000000001';
+        INSERT INTO agent_run_transitions (
+            id, project_id, run_id, state_version, transition_kind,
+            runtime_actor_kind, actor_identity_id, observation_kind, observation_id,
+            previous_state_hash, next_state_hash, facts_hash,
+            state_snapshot, fact_references
+        ) SELECT
+            '99700000-0000-0000-0000-000000000003', project_id, run_id,
+            4, transition_kind, runtime_actor_kind, actor_identity_id,
+            'task_completion', '99300000-0000-0000-0000-000000000001',
+            decode(repeat('a3', 32), 'hex'), decode(repeat('a4', 32), 'hex'),
+            facts_hash, state_snapshot, fact_references
+        FROM agent_run_transitions
+        WHERE id = '99700000-0000-0000-0000-000000000002';
+        INSERT INTO agent_run_work_outcomes (
+            project_id, run_id, work_item_id, claim_id, attempt,
+            outcome_kind, product_event_id, observed_at,
+            provenance_hash, transition_id
+        ) VALUES (
+            '30000000-0000-0000-0000-000000000001',
+            '94000000-0000-0000-0000-000000000001',
+            '97000000-0000-0000-0000-000000000001',
+            '98000000-0000-0000-0000-000000000001', 1,
+            'task_completion', '99300000-0000-0000-0000-000000000001',
+            completion_time, decode(repeat('99', 32), 'hex'),
+            '99700000-0000-0000-0000-000000000003'
+        );
+        IF NOT EXISTS (
+            SELECT 1 FROM agent_run_work_outcomes
+            WHERE product_event_id = '99300000-0000-0000-0000-000000000001'
+        ) THEN
+            RAISE EXCEPTION 'causally bound task completion was rejected';
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = 'ZX001', MESSAGE = 'rollback causal outcome fixture';
+    EXCEPTION
+        WHEN SQLSTATE 'ZX001' THEN NULL;
+    END;
+END;
+$test$;
+
 SELECT set_config(
     'app.identity_id',
     '10000000-0000-0000-0000-000000000020',
@@ -2482,11 +2920,14 @@ SELECT set_config(
     true
 );
 
-CREATE ROLE sprout_behavior_rls NOLOGIN;
+CREATE ROLE sprout_behavior_rls NOSUPERUSER NOBYPASSRLS NOLOGIN;
 GRANT USAGE ON SCHEMA public, sprout_private TO sprout_behavior_rls;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO sprout_behavior_rls;
 GRANT INSERT, UPDATE, DELETE ON resource_nodes TO sprout_behavior_rls;
 GRANT INSERT, DELETE ON resource_closure TO sprout_behavior_rls;
+GRANT SELECT, UPDATE ON agent_collaborative_runs TO sprout_behavior_rls;
+GRANT SELECT, UPDATE ON agent_run_blockers TO sprout_behavior_rls;
+GRANT SELECT, UPDATE ON agent_run_claim_leases TO sprout_behavior_rls;
 SET LOCAL ROLE sprout_behavior_rls;
 
 DO $test$
@@ -2498,6 +2939,56 @@ BEGIN
     WHERE recovery_set_id = '77000000-0000-0000-0000-000000000001';
     IF visible_count <> 1 THEN
         RAISE EXCEPTION 'holder-only recovery share RLS failed: saw % rows', visible_count;
+    END IF;
+END;
+$test$;
+
+DO $test$
+DECLARE
+    visible_runs integer;
+    visible_blockers integer;
+    visible_claims integer;
+    changed_runs integer;
+    changed_blockers integer;
+    changed_claims integer;
+BEGIN
+    IF NOT sprout_private.can_access_resource(
+        '30000000-0000-0000-0000-000000000001',
+        '40000000-0000-0000-0000-000000000003',
+        'read'
+    ) THEN
+        RAISE EXCEPTION 'R5.30 RLS fixture foreign member lacks intended scope read';
+    END IF;
+    IF sprout_private.agent_run_access(
+        '30000000-0000-0000-0000-000000000001',
+        '94000000-0000-0000-0000-000000000001'
+    ) THEN
+        RAISE EXCEPTION 'R5.30 foreign non-participant gained agent run access';
+    END IF;
+
+    SELECT count(*) INTO visible_runs FROM agent_collaborative_runs
+    WHERE id = '94000000-0000-0000-0000-000000000001';
+    SELECT count(*) INTO visible_blockers FROM agent_run_blockers
+    WHERE id = '95000000-0000-0000-0000-000000000001';
+    SELECT count(*) INTO visible_claims FROM agent_run_claim_leases
+    WHERE id = '98000000-0000-0000-0000-000000000001';
+    IF visible_runs <> 0 OR visible_blockers <> 0 OR visible_claims <> 0 THEN
+        RAISE EXCEPTION
+            'R5.30 RLS exposed run/blocker/claim to a foreign non-participant';
+    END IF;
+
+    UPDATE agent_collaborative_runs SET updated_at = clock_timestamp()
+    WHERE id = '94000000-0000-0000-0000-000000000001';
+    GET DIAGNOSTICS changed_runs = ROW_COUNT;
+    UPDATE agent_run_blockers SET current_status = 'cancelled', terminal_tick = 2
+    WHERE id = '95000000-0000-0000-0000-000000000001';
+    GET DIAGNOSTICS changed_blockers = ROW_COUNT;
+    UPDATE agent_run_claim_leases SET status = 'released', terminal_at = clock_timestamp()
+    WHERE id = '98000000-0000-0000-0000-000000000001';
+    GET DIAGNOSTICS changed_claims = ROW_COUNT;
+    IF changed_runs <> 0 OR changed_blockers <> 0 OR changed_claims <> 0 THEN
+        RAISE EXCEPTION
+            'R5.30 RLS allowed foreign mutation of run/blocker/claim';
     END IF;
 END;
 $test$;

@@ -1,3 +1,4 @@
+pub(crate) mod agent_runs;
 mod agents;
 mod assignments;
 mod dev_auth;
@@ -100,6 +101,46 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         .route(
             "/v1/projects/{project_id}/agent-global-contracts",
             post(agents::record_global_contract),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs",
+            post(agent_runs::create),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}",
+            get(agent_runs::get),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/refresh",
+            post(agent_runs::refresh),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/claim",
+            post(agent_runs::claim),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/claims/{claim_id}/succeed",
+            post(agent_runs::succeed),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/claims/{claim_id}/fail",
+            post(agent_runs::fail),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/complete",
+            post(agent_runs::complete),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/evidence",
+            post(agent_runs::accept_evidence),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/blockers",
+            post(agent_runs::create_blocker),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/blockers/{blocker_id}/resolve",
+            post(agent_runs::resolve_blocker),
         )
         .route(
             "/v1/projects/{project_id}/user-proxy/threads",

@@ -685,6 +685,196 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         .await
         .expect("record local goal response");
     assert_eq!(local_goal.status(), StatusCode::OK);
+    let collaborative_run_id = Uuid::new_v4();
+    let create_run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/agent-runs", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": collaborative_run_id,
+                        "source": {
+                            "kind": "local_goal",
+                            "id": local_goal_id,
+                            "revision": 1
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("create collaborative run request"),
+        )
+        .await
+        .expect("create collaborative run response");
+    assert_eq!(
+        create_run.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(create_run).await
+    );
+    let claim_run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{collaborative_run_id}/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from("{}"))
+                .expect("claim collaborative work request"),
+        )
+        .await
+        .expect("claim collaborative work response");
+    assert_eq!(
+        claim_run.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(claim_run).await
+    );
+    let claimed_work = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{collaborative_run_id}",
+                        fixture.project_id
+                    ))
+                    .header("authorization", format!("Bearer {runner_token}"))
+                    .body(Body::empty())
+                    .expect("read collaborative run request"),
+            )
+            .await
+            .expect("read collaborative run response"),
+    )
+    .await;
+    let collaborative_claim_id = claimed_work["state"]["claims"]
+        .as_object()
+        .and_then(|claims| claims.keys().next())
+        .expect("persisted collaborative claim")
+        .to_owned();
+    let foreign_agent_id = Uuid::new_v4();
+    let foreign_identity_id = Uuid::new_v4();
+    let foreign_runner_id = Uuid::new_v4();
+    let foreign_device_id = Uuid::new_v4();
+    let foreign_provision = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/agents", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": foreign_agent_id,
+                        "principal_identity_id": foreign_identity_id,
+                        "controller_identity_id": fixture.owner_id,
+                        "identity_handle": format!("foreign-agent-{}", foreign_identity_id.simple()),
+                        "encrypted_profile": encrypted(31),
+                        "profile_resource_node_id": fixture.profile_resource_id,
+                        "encrypted_system_prompt": encrypted(32),
+                        "key_epoch": 1,
+                        "availability": "controller_private",
+                        "runner_id": foreign_runner_id,
+                        "runner_device_id": foreign_device_id,
+                        "encrypted_runner_label": encrypted(33)
+                    })
+                    .to_string(),
+                ))
+                .expect("provision foreign runner request"),
+        )
+        .await
+        .expect("provision foreign runner response");
+    assert_eq!(foreign_provision.status(), StatusCode::OK);
+    let foreign_token = json_body(foreign_provision).await["bootstrap_token"]
+        .as_str()
+        .expect("foreign bootstrap token")
+        .to_owned();
+    let mut foreign_key = fixture.pool.begin().await.expect("begin foreign key setup");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *foreign_key)
+        .await
+        .expect("disable RLS for foreign key setup");
+    sqlx::query(
+        r#"
+        INSERT INTO device_keys (
+            identity_id, device_id, key_version,
+            encryption_public_key, signing_public_key,
+            previous_package_hash, package_hash,
+            x25519_public_key, ed25519_public_key
+        ) VALUES (
+            $1, $2, 1,
+            decode(repeat('88', 32), 'hex'), decode(repeat('99', 32), 'hex'),
+            decode(repeat('00', 32), 'hex'), digest($2::text, 'sha256'),
+            decode(repeat('88', 32), 'hex'), decode(repeat('99', 32), 'hex')
+        )
+        "#,
+    )
+    .bind(foreign_identity_id)
+    .bind(foreign_device_id)
+    .execute(&mut *foreign_key)
+    .await
+    .expect("insert foreign runner key");
+    foreign_key
+        .commit()
+        .await
+        .expect("commit foreign key setup");
+    let foreign_activate = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{foreign_agent_id}/runner/activate",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {foreign_token}"))
+                .body(Body::empty())
+                .expect("activate foreign runner request"),
+        )
+        .await
+        .expect("activate foreign runner response");
+    assert_eq!(foreign_activate.status(), StatusCode::OK);
+    for foreign_uri in [
+        format!(
+            "/v1/projects/{}/agent-runs/{collaborative_run_id}/claim",
+            fixture.project_id
+        ),
+        format!(
+            "/v1/projects/{}/agent-runs/{collaborative_run_id}/claims/{collaborative_claim_id}/succeed",
+            fixture.project_id
+        ),
+        format!(
+            "/v1/projects/{}/agent-runs/{collaborative_run_id}/claims/{collaborative_claim_id}/fail",
+            fixture.project_id
+        ),
+    ] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(foreign_uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {foreign_token}"))
+                    .body(Body::from("{}"))
+                    .expect("foreign runner completion request"),
+            )
+            .await
+            .expect("foreign runner completion response");
+        let status = rejected.status();
+        let body = json_body(rejected).await;
+        assert!(
+            matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+            "foreign runner status={status} body={body}"
+        );
+    }
     let mut plaintext_local_goal = local_goal_contract.clone();
     plaintext_local_goal
         .as_object_mut()
@@ -1282,6 +1472,7 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
     .expect("revoke runner key");
     revoke.commit().await.expect("commit runner revocation");
     let revoked_claim = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -1296,6 +1487,42 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         .await
         .expect("revoked runner claim response");
     assert_eq!(revoked_claim.status(), StatusCode::FORBIDDEN);
+    let revoked_completion_claim = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{collaborative_run_id}/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from("{}"))
+                .expect("revoked completion runner claim request"),
+        )
+        .await
+        .expect("revoked completion runner claim response");
+    assert_eq!(revoked_completion_claim.status(), StatusCode::FORBIDDEN);
+    for terminal_action in ["succeed", "fail"] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{collaborative_run_id}/claims/{collaborative_claim_id}/{terminal_action}",
+                        fixture.project_id
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {runner_token}"))
+                    .body(Body::from("{}"))
+                    .expect("revoked runner terminal work request"),
+            )
+            .await
+            .expect("revoked runner terminal work response");
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    }
 
     let audit_count = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM agent_audit_log WHERE project_id = $1 AND agent_id = $2",

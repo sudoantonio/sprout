@@ -31,6 +31,7 @@ const ARCHIVE_WRAP_DOMAIN: &[u8] = b"sprout-retention-archive-wrap-v1";
 pub enum WorkerKind {
     Retention,
     Export,
+    AgentCompletion,
     All,
 }
 
@@ -73,6 +74,15 @@ async fn run_cycle(
     options: WorkerOptions,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    if !options.dry_run && matches!(options.kind, WorkerKind::AgentCompletion | WorkerKind::All) {
+        let recovered = crate::routes::agent_runs::recover_expired_claims(pool).await?;
+        if recovered > 0 {
+            tracing::info!(
+                recovered_claims = recovered,
+                "recovered expired agent work claims"
+            );
+        }
+    }
     if !options.dry_run && matches!(options.kind, WorkerKind::Retention | WorkerKind::All) {
         sqlx::query("SELECT sprout_private.materialize_retention_subjects($1)")
             .bind(now)
@@ -102,6 +112,7 @@ async fn run_cycle(
             WorkerKind::Export => {
                 export_project(pool, config, worker_id, project_id, options, now).await?
             }
+            WorkerKind::AgentCompletion => {}
             WorkerKind::All => {
                 retention_project(
                     pool, config, worker_id, project_id, options, now, true, false,

@@ -49,8 +49,13 @@ devono essere confusi:
 | canonical slot/ID stability | **coperto nel kernel domain** | Il record inattivo mantiene lo stesso `(WorkSpecId, slot) → WorkItemId`; uno slot inattivo non è libero e la riattivazione riproietta lo stesso ID. |
 | `NoOpenGoalRelevantWork` / `ContractCompletionCriterion` | **coperto nel kernel domain** | La completion considera tutti e soli i WorkItem presenti nella projection corrente e tutti i blocker waiting correnti; la storia inattiva non bypassa work attivo e non rende impossibile la completion. Test `inactive_work_history_neither_bypasses_nor_prevents_completion`. |
 
-Questo incremento è ancora **domain-only** finché projection, record storici,
-deadline e transition non vengono resi atomici nella persistence/runtime.
+La migration `0025_agent_completion_runtime.sql` porta ora questa projection
+nel runtime persistente: lo snapshot domain hashato resta l'unica semantica,
+mentre slot, claim, blocker, resolution, work-product binding, outcome,
+evidence e causal link sono certificati/guard relazionali. Ogni transition è
+serializable, versionata e append-only; i facts vengono ricostruiti dal server.
+Le API non possono fornire activation, eligibility, condition facts, blocker
+status, discharge, completion o authority.
 
 ## Matrice R4 e continuità R4 → R5
 
@@ -74,25 +79,25 @@ deadline e transition non vengono resi atomici nella persistence/runtime.
 
 | Requisito Lean | Stato concrete iniziale | Gap verificato |
 | --- | --- | --- |
-| `GoalContract` DSL completa | **parziale** | Rust persiste scope, obligation, dependency e WorkSpec semplificate. Mancano goal identity/status, `ContractCondition` per activation/required/completion, evidence rules, waiting rules e completion condition normalizzata. |
-| `GoalContractWellFormed` | **parziale** | Sono validati ID unici, dependency rank, entry cardinality, bounds, continuation e alternative rank. Mancano owner=obligation, evidence/wait subject validity, evidence per ogni obligation, discharge rule membership e condition normalization. |
-| revisioni autorevoli/program snapshot | **parziale** | Local/global JSON sono append-only e revisionati. Manca una run/program snapshot attiva con fencing e history del goal status. |
-| `ObligationInstance` e birth closure | **mancante** | Nessuna tabella/API/runtime per istanze active/discharged; nessuna materializzazione atomica delle required obligation. |
-| `WorkItem`, slot certificate, canonical work universe | **mancante** | Esistono soltanto WorkSpec statiche nel JSON. Mancano slot `(workSpec,maxInstances)`, ID canonici, status runtime, parent e source comment. |
-| activation, eligibility e work existence | **mancante** | Nessun evaluator deterministico delle condition/dependency, entry slot 0 o frontier completeness. R5.30.11 lo dichiara interno. |
-| waiting rules e typed blocker | **mancante** | Nessuna persistence di blocker scope/condition/status/rule certificate o risoluzione meccanica. |
-| dispatch e scheduler position | **mancante** | La coda invocation non è dispatch di WorkItem e non persiste posizione/aging. |
-| claim/lease, esclusività, expiry, recovery | **parziale** | È completo per una invocation isolata; manca il binding a WorkItem/attempt, claim certificate, recovery dello stesso work ID e invalidazione di terminal effects dopo expiry. |
-| retry generation e failure continuation | **parziale** | Retry della stessa invocation è bounded. Non vengono eseguiti `alternatives`, `dischargeBy`, `failGoal` o continuation WorkSpec; il client dichiara inoltre `retryable`. |
-| evidence meccanica/semantica e provenance | **mancante** | Output cifrato ed effect proposal non sono `Evidence`; mancano subject tipizzato, verification mode, causal binding ed evidence judge separato. |
-| discharge e accepted-evidence closure | **mancante** | Nessun endpoint/state transition obligation discharge; tool success non deve implicarlo. |
-| `CompletionCriterion` bookkeeping | **mancante** | Nessuna chiusura atomica che richieda tutte le obligation required discharged, nessun work aperto e nessun blocker waiting. |
-| `RunCompleted ≠ GoalCompleted` | **mancante** | Invocation succeeded è oggi l'unico terminale operativo esposto; non esistono run e goal status distinti. |
-| causal graph globale | **mancante** | Nessuna persistence di nodi/link obligation/work/comment/task/tool/blocker e rank causale. |
-| finitezza e anti-loop multi-agent | **solo domain parziale** | I bounds/rank WorkSpec sono validati, ma non esistono slot certificate e causal graph runtime dai quali derivare finitezza e well-foundedness. |
-| scheduler aging, fairness e anti-starvation | **mancante** | Nessun `AgingSchedulerPolicy`/position descent persistito o testabile. È target interno, pur restando libera la scelta dell'algoritmo concreto. |
-| global collaborative completion | **mancante** | Il candidate globale è persistibile, ma non esiste run con participant e closure di tutto il work/evidence/handoff globale. |
-| failure/termination dynamics e progress measure | **mancante** | Nessun max-resolution deadline per WorkItem, rank di progresso o distinzione terminal/success. |
+| `GoalContract` DSL completa | **coperto nel kernel persistente** | Contract schema-closed con goal/scope, condition ricorsive, obligation, dependency, WorkSpec, evidence/waiting rule e completion normalizzata; la revisione autorevole viene copiata e hashata nella run. |
+| `GoalContractWellFormed` | **coperto nel kernel domain** | Il validator chiude riferimenti, ownership, rank/bounds, entry, continuation/failure plan, evidence/waiting subject e normalizzazione prima della persistenza. |
+| revisioni autorevoli/program snapshot | **coperto per la run** | La creazione accetta soltanto LocalGoal attivo alla revisione esatta o GlobalContract corrente con source LocalGoal attive; contract/state hash, optimistic version e snapshot append-only fanno fencing. |
+| `ObligationInstance` e birth closure | **coperto nel kernel persistente** | Le istanze sono nella projection canonica hashata e in ogni transition snapshot; activation e birth closure sono costruite da facts server-side. |
+| `WorkItem`, slot certificate, canonical work universe | **implementato, verifica persistente pendente / parziale forte** | Slot relazionali immutabili certificano `(WorkSpecId,slot)→WorkItemId`; projection corrente, inactive history e projection events sono nello snapshot. Sono verdi round-trip serde domain e schema DB, ma manca ancora un gate restart DB che dimostri deactivation/reactivation e identity stability dopo reload del processo. |
+| activation, eligibility e work existence | **coperto nel kernel persistente** | Facts da task/stato autorevole, refresh/claim/effect nella stessa transaction serializable e projection validator domain. Nessun facts payload è accettato dall'API. |
+| waiting rules e typed blocker | **parziale forte** | Blocker/status/resolution sono persistiti e certificati dalla transition domain. Task terminal è risolto da stato prodotto; decisione admin, risposta principal e outcome esterno restano fail-closed finché mancano i rispettivi ledger tipizzati. |
+| dispatch e scheduler position | **coperto nel kernel persistente** | Dispatch, attempt, enqueue tick e scheduler position sono parte dello snapshot autorevole; la claim relazionale ne è il guard di concorrenza. |
+| claim/lease, esclusività, expiry, recovery | **coperto nel runtime persistente** | Unique active claim per work, unique attempt, lock serializable, authority/runner corrente prima di claim/effect e worker scheduler-only per recovery bounded. |
+| retry generation e failure continuation | **parziale forte** | `retrySame`, alternative e `failGoal` sono transition domain persistite con attempt/continuation canoniche. `dischargeBy` è validato dal kernel ma l'API failure non può ancora collegare una evidence autorevole e quindi fallisce chiuso. |
+| evidence meccanica/semantica e provenance | **parziale fail-closed** | Evidence è schema-closed e derivata dal server. Una task completion vale solo dopo un binding preesistente `claim transition→invocation→applied effect→task resource`; stesso agent/scope/tempo non basta. Poiché manca ancora il materializer task agentico che crea quel binding, l'adapter API reale non può oggi produrlo. Semantic judgment resta boundary esterna ma non ha placeholder permissivi. |
+| discharge e accepted-evidence closure | **parziale fail-closed** | Il kernel discharge soltanto tramite `accept_evidence`; il certificato DB richiede outcome causale, rule/mechanical mode e snapshot con obligation discharged. Il percorso task diventerà raggiungibile solo dal futuro materializer autorevole, non da una scelta runner. |
+| `CompletionCriterion` bookkeeping | **implementato, verifica persistente pendente / parziale forte** | Il runtime rivaluta facts, obligation required, work corrente e blocker nella transaction della transition terminale. Sono verdi i validator domain e i check DB di shape, ma manca ancora un test API/DB positivo e negativo che provi la commit atomica dopo restart. |
+| `RunCompleted ≠ GoalCompleted` | **implementato, verifica persistente pendente / parziale forte** | `goal_status` e `run_status` sono distinti e il DB vieta `run=completed` con goal non completed; manca il gate persistente che osservi `GoalCompleted` prima di `RunCompleted`, il rollback su failure e la commit finale atomica. |
+| causal graph globale | **parziale** | Link domain e certificati relazionali append-only esistono per i nodi generati dal kernel; comment/tool e task-effect R4 non ancora materializzabili restano gap, non link sintetici. |
+| finitezza e anti-loop multi-agent | **coperto nel kernel/persistence** | Slot finiti, rank di generation/dependency, bounds e identità canoniche sono nella revisione hashata e nelle transition history. |
+| scheduler aging, fairness e anti-starvation | **implementato, verifica persistente pendente / parziale forte** | Aging e scheduler position sono calcolati dal kernel e persistibili nello snapshot; il worker recupera lease scadute senza actor HTTP inducibile. Mancano gate DB/concurrency/restart che provino position descent, bounded service e assenza di starvation fra più agenti. |
+| global collaborative completion | **implementato, verifica persistente pendente / parziale forte** | Il runtime può creare una run dal GlobalContract corrente e modella participant/obligation/work globali; manca un test persistente multi-agent positivo/negativo che escluda completion della run al terminale di una sola invocation/partecipante. |
+| failure/termination dynamics e progress measure | **coperto nel kernel persistente** | Attempt bound, max-resolution deadline, suspended-claim recovery, terminal work/goal e run terminale sono distinti e storicizzati. |
 
 ## Matrice R5.33–R5.34: authority e information flow
 
