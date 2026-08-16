@@ -2241,13 +2241,17 @@ impl CollaborativeRunState {
         {
             self.suspended_claim_resolutions.remove(&work_id);
         }
+        // `lease_ticks` is an operational preference. The normative bound is
+        // the selected WorkSpec's `max_resolution_ticks` (R5.30 execution
+        // dynamics), so a lease may shorten but never extend that certificate.
+        let effective_lease_ticks = lease_ticks.min(u64::from(spec.max_resolution_ticks));
         let claim = WorkClaim {
             id: ClaimId::new(),
             work: work_id,
             attempt: work.attempt,
             claimant,
             acquired_at: tick,
-            expires_at: tick.saturating_add(lease_ticks),
+            expires_at: tick.saturating_add(effective_lease_ticks),
             status: ClaimStatus::Active,
         };
         self.claims.insert(claim.id, claim.clone());
@@ -4376,6 +4380,23 @@ mod tests {
             .unwrap();
         assert_eq!(first.work, second.work);
         assert_eq!(second.attempt, first.attempt + 1);
+    }
+
+    #[test]
+    fn operational_lease_cannot_extend_the_work_spec_resolution_bound() {
+        let agent = UserId::new();
+        let mut local = local_goal(agent, UserId::new());
+        local.contract.work_specs[0].max_resolution_ticks = 3;
+        let facts = ContractConditionFacts::default();
+        let mut run =
+            CollaborativeRunState::initialize(RunId::new(), &local.contract, &facts, 10).unwrap();
+
+        let bounded = run
+            .claim_next(&local.contract, agent, &facts, 11, 300, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bounded.acquired_at, 11);
+        assert_eq!(bounded.expires_at, 14);
     }
 
     #[test]

@@ -57,6 +57,28 @@ serializable, versionata e append-only; i facts vengono ricostruiti dal server.
 Le API non possono fornire activation, eligibility, condition facts, blocker
 status, discharge, completion o authority.
 
+Il checkpoint dei gate persistenti è verificato su PostgreSQL reale dalla
+suite DB-enabled `agent_completion_gates` (quattro test, esecuzione seriale):
+
+- un nuovo processo/router ricarica lo stesso mapping canonico degli slot, la
+  projection current/inactive e la projection history senza duplicare ID;
+- un tentativo di completion con obligation, work e blocker aperti esegue
+  rollback integrale, mentre `GoalCompleted` resta osservabilmente distinto da
+  `RunCompleted` fino alla commit finale;
+- claimant concorrenti non ottengono due lease, una lease scaduta non può
+  autorizzare un effect, il worker recupera lo stesso WorkItem canonico al
+  tentativo successivo e la posizione di uno work più giovane scende entro il
+  bound della frontier persistita;
+- una run da GlobalContract con due agent partecipanti resta active/running
+  dopo il terminale del primo; soltanto obligation, work ed evidence causale
+  di entrambi consentono prima `GoalCompleted` e poi `RunCompleted`.
+
+La fixture dell'ultimo gate prepara un ledger prodotto già causalmente legato
+`claim transition → invocation succeeded → applied task effect → task
+completion`; i trigger DB e gli adapter API lo rivalidano. Questo non colma il
+materializer task agentico ancora assente: evidence/discharge rimangono quindi
+classificati fail-closed sotto.
+
 ## Matrice R4 e continuità R4 → R5
 
 | Requisito Lean | Stato concrete iniziale | Gap verificato |
@@ -83,20 +105,20 @@ status, discharge, completion o authority.
 | `GoalContractWellFormed` | **coperto nel kernel domain** | Il validator chiude riferimenti, ownership, rank/bounds, entry, continuation/failure plan, evidence/waiting subject e normalizzazione prima della persistenza. |
 | revisioni autorevoli/program snapshot | **coperto per la run** | La creazione accetta soltanto LocalGoal attivo alla revisione esatta o GlobalContract corrente con source LocalGoal attive; contract/state hash, optimistic version e snapshot append-only fanno fencing. |
 | `ObligationInstance` e birth closure | **coperto nel kernel persistente** | Le istanze sono nella projection canonica hashata e in ogni transition snapshot; activation e birth closure sono costruite da facts server-side. |
-| `WorkItem`, slot certificate, canonical work universe | **implementato, verifica persistente pendente / parziale forte** | Slot relazionali immutabili certificano `(WorkSpecId,slot)→WorkItemId`; projection corrente, inactive history e projection events sono nello snapshot. Sono verdi round-trip serde domain e schema DB, ma manca ancora un gate restart DB che dimostri deactivation/reactivation e identity stability dopo reload del processo. |
+| `WorkItem`, slot certificate, canonical work universe | **coperto nel kernel persistente** | Slot relazionali immutabili certificano `(WorkSpecId,slot)→WorkItemId`; projection corrente, inactive history e projection events sono nello snapshot. `restart_reload_preserves_canonical_projection_and_history` materializza e disattiva work tramite facts prodotto, ricostruisce il server sullo stesso PostgreSQL e prova mapping, ID, current/inactive projection e history invariati e non duplicati. |
 | activation, eligibility e work existence | **coperto nel kernel persistente** | Facts da task/stato autorevole, refresh/claim/effect nella stessa transaction serializable e projection validator domain. Nessun facts payload è accettato dall'API. |
 | waiting rules e typed blocker | **parziale forte** | Blocker/status/resolution sono persistiti e certificati dalla transition domain. Task terminal è risolto da stato prodotto; decisione admin, risposta principal e outcome esterno restano fail-closed finché mancano i rispettivi ledger tipizzati. |
 | dispatch e scheduler position | **coperto nel kernel persistente** | Dispatch, attempt, enqueue tick e scheduler position sono parte dello snapshot autorevole; la claim relazionale ne è il guard di concorrenza. |
-| claim/lease, esclusività, expiry, recovery | **coperto nel runtime persistente** | Unique active claim per work, unique attempt, lock serializable, authority/runner corrente prima di claim/effect e worker scheduler-only per recovery bounded. |
+| claim/lease, esclusività, expiry, recovery | **coperto nel runtime persistente** | Unique active claim per work, unique attempt, lock serializable, authority/runner corrente prima di claim/effect e worker scheduler-only per recovery bounded. I 300 secondi sono soltanto il default operativo: `claim_next` limita la lease effettiva alla `WorkSpec.maxResolutionTicks` certificata, come richiesto dalle dynamics R5.30, e il certificato DB conserva quel deadline. Il gate PostgreSQL concorrente prova un solo vincitore, rifiuto dell'effect dopo expiry e recovery persistente sul medesimo WorkItem con attempt successivo. |
 | retry generation e failure continuation | **parziale forte** | `retrySame`, alternative e `failGoal` sono transition domain persistite con attempt/continuation canoniche. `dischargeBy` è validato dal kernel ma l'API failure non può ancora collegare una evidence autorevole e quindi fallisce chiuso. |
 | evidence meccanica/semantica e provenance | **parziale fail-closed** | Evidence è schema-closed e derivata dal server. Una task completion vale solo dopo un binding preesistente `claim transition→invocation→applied effect→task resource`; stesso agent/scope/tempo non basta. Poiché manca ancora il materializer task agentico che crea quel binding, l'adapter API reale non può oggi produrlo. Semantic judgment resta boundary esterna ma non ha placeholder permissivi. |
 | discharge e accepted-evidence closure | **parziale fail-closed** | Il kernel discharge soltanto tramite `accept_evidence`; il certificato DB richiede outcome causale, rule/mechanical mode e snapshot con obligation discharged. Il percorso task diventerà raggiungibile solo dal futuro materializer autorevole, non da una scelta runner. |
-| `CompletionCriterion` bookkeeping | **implementato, verifica persistente pendente / parziale forte** | Il runtime rivaluta facts, obligation required, work corrente e blocker nella transaction della transition terminale. Sono verdi i validator domain e i check DB di shape, ma manca ancora un test API/DB positivo e negativo che provi la commit atomica dopo restart. |
-| `RunCompleted ≠ GoalCompleted` | **implementato, verifica persistente pendente / parziale forte** | `goal_status` e `run_status` sono distinti e il DB vieta `run=completed` con goal non completed; manca il gate persistente che osservi `GoalCompleted` prima di `RunCompleted`, il rollback su failure e la commit finale atomica. |
+| `CompletionCriterion` bookkeeping | **coperto nel runtime persistente** | Il runtime rivaluta facts, obligation required, work corrente e blocker nella transaction della transition terminale. Il gate API/DB prova il rifiuto con tutti e tre ancora aperti, hash/version/status immutati dopo rollback e commit finale coerente. |
+| `RunCompleted ≠ GoalCompleted` | **coperto nel runtime persistente** | `goal_status` e `run_status` sono distinti e il DB vieta `run=completed` con goal non completed. I gate osservano persistentemente `goal=completed, run=running` prima della transition finale e `goal=completed, run=completed` soltanto dopo la commit atomica. |
 | causal graph globale | **parziale** | Link domain e certificati relazionali append-only esistono per i nodi generati dal kernel; comment/tool e task-effect R4 non ancora materializzabili restano gap, non link sintetici. |
 | finitezza e anti-loop multi-agent | **coperto nel kernel/persistence** | Slot finiti, rank di generation/dependency, bounds e identità canoniche sono nella revisione hashata e nelle transition history. |
-| scheduler aging, fairness e anti-starvation | **implementato, verifica persistente pendente / parziale forte** | Aging e scheduler position sono calcolati dal kernel e persistibili nello snapshot; il worker recupera lease scadute senza actor HTTP inducibile. Mancano gate DB/concurrency/restart che provino position descent, bounded service e assenza di starvation fra più agenti. |
-| global collaborative completion | **implementato, verifica persistente pendente / parziale forte** | Il runtime può creare una run dal GlobalContract corrente e modella participant/obligation/work globali; manca un test persistente multi-agent positivo/negativo che escluda completion della run al terminale di una sola invocation/partecipante. |
+| scheduler aging, fairness e anti-starvation | **coperto per la scheduler policy persistente corrente** | Aging e scheduler position sono calcolati dal kernel e persistiti nello snapshot. Il gate crea work in tick distinti tramite un fact prodotto autorevole, prova selezione del più anziano, position descent e servizio del successivo entro due claim; prova inoltre concorrenza, expiry, recovery worker e reload DB senza cambiare semantica scheduler. La fairness R4 generale delle invocation resta separatamente mancante nella matrice R4. |
+| global collaborative completion | **coperto nel kernel persistente** | Il gate crea una run dal GlobalContract corrente con due agent participant e obligation/work necessari distinti. Il terminale del primo non completa goal/run; dopo outcome ed evidence causale di entrambi il goal diventa completed ma la run resta running fino alla commit amministrativa finale. |
 | failure/termination dynamics e progress measure | **coperto nel kernel persistente** | Attempt bound, max-resolution deadline, suspended-claim recovery, terminal work/goal e run terminale sono distinti e storicizzati. |
 
 ## Matrice R5.33–R5.34: authority e information flow

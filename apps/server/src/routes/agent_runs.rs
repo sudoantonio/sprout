@@ -27,7 +27,6 @@ use crate::{
     error::AppError,
 };
 
-const WORK_LEASE_TICKS: u64 = 300;
 const SCHEDULER_AGING_STEP: u64 = 1;
 
 #[derive(Deserialize)]
@@ -400,7 +399,7 @@ pub async fn claim(
             UserId::from(actor.identity_id),
             &facts,
             tick,
-            WORK_LEASE_TICKS,
+            app.config.agent_work_lease.as_secs(),
             SCHEDULER_AGING_STEP,
         )
         .map_err(domain_error)?;
