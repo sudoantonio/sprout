@@ -223,12 +223,16 @@ fn server_visible_agent_contracts_are_recursively_closed() {
     let controller = Uuid::new_v4();
     let resource = Uuid::new_v4();
     let obligation = Uuid::new_v4();
+    let goal_id = Uuid::new_v4();
     let goal = json!({
+        "goal": goal_id,
         "scope": resource,
         "obligations": [{
             "id": obligation,
+            "goal": goal_id,
             "owner": agent,
-            "required_for_completion": true,
+            "activation": { "kind": "always" },
+            "required_for_completion": { "kind": "always" },
             "dependency_rank": 0
         }],
         "dependencies": [],
@@ -236,7 +240,8 @@ fn server_visible_agent_contracts_are_recursively_closed() {
             "id": 1,
             "obligation": obligation,
             "owner": agent,
-            "kind": "internal",
+            "kind": "agent_action",
+            "activation": { "kind": "always" },
             "allowed_actions": ["replace_own_task"],
             "max_instances": 1,
             "max_attempts": 1,
@@ -245,7 +250,16 @@ fn server_visible_agent_contracts_are_recursively_closed() {
             "is_entry": true,
             "continuations": [],
             "failure_plan": { "kind": "fail_goal" }
-        }]
+        }],
+        "evidence_rules": [{
+            "id": 1,
+            "obligation": obligation,
+            "kind": "derived_fact",
+            "subject": { "kind": "derived" },
+            "verification": "semantic_judgment"
+        }],
+        "waiting_rules": [],
+        "completion_condition": { "kind": "always" }
     });
     let local = json!({
         "id": Uuid::new_v4(),
@@ -595,12 +609,16 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
 
     let local_goal_id = Uuid::new_v4();
     let obligation_id = Uuid::new_v4();
+    let goal_id = Uuid::new_v4();
     let goal_contract = json!({
+        "goal": goal_id,
         "scope": fixture.profile_resource_id,
         "obligations": [{
             "id": obligation_id,
+            "goal": goal_id,
             "owner": agent_identity_id,
-            "required_for_completion": true,
+            "activation": { "kind": "always" },
+            "required_for_completion": { "kind": "always" },
             "dependency_rank": 0
         }],
         "dependencies": [],
@@ -608,7 +626,8 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
             "id": 1,
             "obligation": obligation_id,
             "owner": agent_identity_id,
-            "kind": "internal",
+            "kind": "agent_action",
+            "activation": { "kind": "always" },
             "allowed_actions": ["replace_own_task"],
             "max_instances": 1,
             "max_attempts": 2,
@@ -617,7 +636,16 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
             "is_entry": true,
             "continuations": [],
             "failure_plan": { "kind": "fail_goal" }
-        }]
+        }],
+        "evidence_rules": [{
+            "id": 1,
+            "obligation": obligation_id,
+            "kind": "derived_fact",
+            "subject": { "kind": "derived" },
+            "verification": "semantic_judgment"
+        }],
+        "waiting_rules": [],
+        "completion_condition": { "kind": "always" }
     });
     let local_goal_contract = json!({
         "id": local_goal_id,

@@ -24,6 +24,34 @@ Questa è la matrice di partenza all'HEAD
 `83bc6def6132fa87f595725dade64ed4e65963ea`; verrà aggiornata dopo ogni
 incremento.
 
+## Incremento domain R5.30: projection corrente e storia operativa
+
+La rappresentazione domain in corso separa esplicitamente due piani che non
+devono essere confusi:
+
+- `CollaborativeRunState.work_items` è la sola projection corrente di
+  `SemanticState.workItems` e contiene esclusivamente WorkItem la cui
+  `WorkSpec.activation` vale nei fatti correnti;
+- `work_slots`, `inactive_work_items` e `work_projection_history` conservano
+  identità canonica, stato operativo e provenance storica, ma non vengono
+  interpretati come WorkItem presenti nel `SemanticState` corrente.
+
+| Requisito Lean | Refinement domain corrente | Invariante/test concrete |
+| --- | --- | --- |
+| `workActivationSound` | **coperto nel kernel domain** | La materializzazione richiede activation vera; `refresh_frontier` rimuove atomicamente dalla projection corrente il work divenuto inattivo; `validate_current_projection` rifiuta ogni work corrente non attivo. `inactive_required_entry_is_rejected_before_any_work_projection_exists` e `inactive_work_is_not_projected_and_reactivation_preserves_canonical_identity`. |
+| `eligibleWorkStatusSound` / `ContractWorkEligible` | **coperto nel kernel domain** | `Eligible` richiede activation corrente, dependency chiuse, attempt sotto bound e assenza di blocker waiting applicabili. La stessa condizione è rivalidata al claim e prima del terminal effect. |
+| `blockedWorkHasWaitingBlocker` | **coperto nel kernel domain** | `Blocked` non è più il fallback per activation/dependency false. Può essere introdotto soltanto insieme a un blocker waiting applicabile; il validator rifiuta `Blocked` opachi. Test `blocked_work_always_has_an_applicable_external_waiting_blocker`. |
+| `waitingBlockersExternallyControlled` | **coperto nel kernel domain** | La creazione accetta solo principal umani, administrator, task assegnate a umani o external outcome dichiarati dalla waiting rule. Target work/obligation interni sono rifiutati. |
+| `BlockerResolution`, `BlockerWaiting` → `BlockerTerminal` | **coperto nel kernel domain** | Il caller non sceglie lo status terminale. Una `BlockerResolutionObservation` schema-closed deve coincidere con la projection autorevole di una task umana terminale, una risposta/commento osservato, una decisione administrator valida oppure un outcome esterno con provenance hash esplicito. L'observation deve inoltre soddisfare `observed_at ≥ blocker.created_at`, anche quando evento e fact sono altrimenti autentici e identici. Il runtime deriva `resolved`/`failed`/`cancelled`, registra una resolution append-only e crea dispatch solo dopo la validazione. La terminalità del blocker non modifica né discharge l'obligation. |
+| dependency interne | **coperto nel kernel domain** | Una dependency non chiusa impedisce la materializzazione/eligibility e non crea blocker. Test `internal_dependency_does_not_create_a_false_blocker`. |
+| activation entry required | **strengthening concrete necessario** | Il validator richiede che `(obligation.activation ∧ requiredForCompletion)` implichi l'activation della WorkSpec entry. Senza questa proprietà `requiredObligationClosure`, `entryWorkClosure` e `workActivationSound` sarebbero simultaneamente insoddisfacibili. |
+| claim durante deactivation / `claimedWorkResolvesWithinSpecBound` | **coperto nel kernel domain** | Il work esce subito dalla projection, la claim viene rilasciata e il terminal effect è rifiutato. Una deadline derivata da `maxResolutionTicks` richiede retry/progresso o porta il goal a un terminale failed; nessuna claim resta sospesa. Test `activation_ceasing_during_claim_rejects_effect_and_resolves_by_bound`. |
+| canonical slot/ID stability | **coperto nel kernel domain** | Il record inattivo mantiene lo stesso `(WorkSpecId, slot) → WorkItemId`; uno slot inattivo non è libero e la riattivazione riproietta lo stesso ID. |
+| `NoOpenGoalRelevantWork` / `ContractCompletionCriterion` | **coperto nel kernel domain** | La completion considera tutti e soli i WorkItem presenti nella projection corrente e tutti i blocker waiting correnti; la storia inattiva non bypassa work attivo e non rende impossibile la completion. Test `inactive_work_history_neither_bypasses_nor_prevents_completion`. |
+
+Questo incremento è ancora **domain-only** finché projection, record storici,
+deadline e transition non vengono resi atomici nella persistence/runtime.
+
 ## Matrice R4 e continuità R4 → R5
 
 | Requisito Lean | Stato concrete iniziale | Gap verificato |
@@ -146,4 +174,3 @@ gli invarianti interni sopra elencati:
 6. scelta tecnica dell'algoritmo scheduler, del database, dei lock e del clock;
    finitezza, fairness derivabile, lease safety, recovery e completion restano
    comunque obblighi interni del concrete product.
-
