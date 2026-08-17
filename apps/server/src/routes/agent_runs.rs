@@ -1214,7 +1214,7 @@ async fn authoritative_evidence(
     })
 }
 
-async fn authoritative_condition_facts(
+pub(crate) async fn authoritative_condition_facts(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     contract: &GoalContract,

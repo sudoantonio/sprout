@@ -217,6 +217,361 @@ async fn json_body(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("decode JSON response")
 }
 
+async fn add_human_member(fixture: &Fixture, role: &str) -> (Uuid, Uuid, String, Uuid) {
+    let identity_id = Uuid::new_v4();
+    let device_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let bearer = token(identity_id, session_id);
+    let permission_root_id = Uuid::new_v4();
+    let mut transaction = fixture.pool.begin().await.expect("begin member fixture");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *transaction)
+        .await
+        .expect("disable RLS for member fixture");
+    sqlx::query(
+        "INSERT INTO identities (id, identity_handle, encrypted_profile)
+         VALUES ($1, $2, decode('01', 'hex'))",
+    )
+    .bind(identity_id)
+    .bind(format!("member-{}", identity_id.simple()))
+    .execute(&mut *transaction)
+    .await
+    .expect("insert member identity");
+    sqlx::query(
+        "INSERT INTO devices (id, identity_id, device_kind, encrypted_label, trust_state)
+         VALUES ($1, $2, 'web', decode('01', 'hex'), 'trusted')",
+    )
+    .bind(device_id)
+    .bind(identity_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("insert member device");
+    sqlx::query(
+        "INSERT INTO sessions (id, identity_id, device_id, token_hash, expires_at)
+         VALUES ($1, $2, $3, $4, clock_timestamp() + interval '1 hour')",
+    )
+    .bind(session_id)
+    .bind(identity_id)
+    .bind(device_id)
+    .bind(Sha256::digest(bearer.as_bytes()).to_vec())
+    .execute(&mut *transaction)
+    .await
+    .expect("insert member session");
+    sqlx::query(
+        "INSERT INTO project_memberships (project_id, identity_id, role)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(fixture.project_id)
+    .bind(identity_id)
+    .bind(role)
+    .execute(&mut *transaction)
+    .await
+    .expect("insert project member");
+    sqlx::query(
+        "SELECT sprout_private.grant_hierarchical_permission(
+             $1, $2, $3, 'manage', 'full', 'restricted', $4, $5
+         )",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(identity_id)
+    .bind(permission_root_id)
+    .bind(fixture.owner_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("grant member resource permission");
+    transaction.commit().await.expect("commit member fixture");
+    (identity_id, device_id, bearer, permission_root_id)
+}
+
+async fn provision_controlled_agent(
+    fixture: &Fixture,
+    app: &axum::Router,
+    controller_identity_id: Uuid,
+    profile_resource_node_id: Uuid,
+    seed: u8,
+) -> (Uuid, Uuid, Uuid, Uuid) {
+    let agent_id = Uuid::new_v4();
+    let principal_identity_id = Uuid::new_v4();
+    let runner_id = Uuid::new_v4();
+    let runner_device_id = Uuid::new_v4();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/agents", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": agent_id,
+                        "principal_identity_id": principal_identity_id,
+                        "controller_identity_id": controller_identity_id,
+                        "identity_handle": format!("shared-agent-{}", principal_identity_id.simple()),
+                        "encrypted_profile": encrypted(seed),
+                        "profile_resource_node_id": profile_resource_node_id,
+                        "encrypted_system_prompt": encrypted(seed.wrapping_add(1)),
+                        "key_epoch": 1,
+                        "availability": "controller_private",
+                        "runner_id": runner_id,
+                        "runner_device_id": runner_device_id,
+                        "encrypted_runner_label": encrypted(seed.wrapping_add(2))
+                    })
+                    .to_string(),
+                ))
+                .expect("provision controlled agent request"),
+        )
+        .await
+        .expect("provision controlled agent response");
+    assert_eq!(response.status(), StatusCode::OK);
+    (agent_id, principal_identity_id, runner_id, runner_device_id)
+}
+
+async fn purge_resource_through_retention(
+    fixture: &Fixture,
+    resource_node_id: Uuid,
+    owner_identity_id: Uuid,
+) {
+    let subject_id = Uuid::new_v4();
+    let lease_token = Uuid::new_v4();
+    let now = Utc::now();
+    let deleted_at = now - ChronoDuration::days(20);
+    let mut transaction = fixture.pool.begin().await.expect("begin retention purge");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *transaction)
+        .await
+        .expect("disable RLS for retention fixture");
+    sqlx::query(
+        "UPDATE resource_nodes SET deleted_at = $3
+         WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(resource_node_id)
+    .bind(deleted_at)
+    .execute(&mut *transaction)
+    .await
+    .expect("soft-delete retention resource");
+    sqlx::query(
+        r#"
+        INSERT INTO retention_subjects (
+            id, project_id, source_kind, source_id, resource_node_id,
+            owner_identity_id, retention_class, source_at, warning_at,
+            purge_at, state, lease_owner, lease_token, leased_until
+        ) VALUES (
+            $1, $2, 'resource_deleted', $3, $3, $4,
+            'deleted_or_obsolete', $5, $6, $7, 'purging', $8, $9, $10
+        )
+        "#,
+    )
+    .bind(subject_id)
+    .bind(fixture.project_id)
+    .bind(resource_node_id)
+    .bind(owner_identity_id)
+    .bind(deleted_at)
+    .bind(deleted_at + ChronoDuration::days(1))
+    .bind(deleted_at + ChronoDuration::days(15))
+    .bind(Uuid::new_v4())
+    .bind(lease_token)
+    .bind(now + ChronoDuration::hours(1))
+    .execute(&mut *transaction)
+    .await
+    .expect("insert retention subject and lease");
+    transaction
+        .commit()
+        .await
+        .expect("commit retention purge setup");
+    let purged =
+        sqlx::query_scalar::<_, bool>("SELECT sprout_private.purge_retention_subject($1, $2, $3)")
+            .bind(subject_id)
+            .bind(lease_token)
+            .bind(now)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("execute retention purge");
+    assert!(purged);
+}
+
+async fn create_cross_owner_tasks(
+    fixture: &Fixture,
+    requester_id: Uuid,
+    target_controller_id: Uuid,
+) -> (Uuid, Uuid) {
+    let task_list_resource_id = Uuid::new_v4();
+    let task_list_id = Uuid::new_v4();
+    let source_task_resource_id = Uuid::new_v4();
+    let source_task_id = Uuid::new_v4();
+    let review_task_resource_id = Uuid::new_v4();
+    let review_task_id = Uuid::new_v4();
+    let mut transaction = fixture.pool.begin().await.expect("begin task fixtures");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *transaction)
+        .await
+        .expect("disable RLS for task fixtures");
+    let topic_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM topics WHERE project_id = $1 AND resource_node_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("load fixture topic");
+    for (resource_id, parent_id, kind) in [
+        (
+            task_list_resource_id,
+            fixture.profile_resource_id,
+            "task_list",
+        ),
+        (source_task_resource_id, task_list_resource_id, "task"),
+        (review_task_resource_id, task_list_resource_id, "task"),
+    ] {
+        sqlx::query(
+            "INSERT INTO resource_nodes (
+                 id, project_id, parent_id, node_kind,
+                 encrypted_metadata, created_by_identity_id
+             ) VALUES ($1, $2, $3, $4, decode('01', 'hex'), $5)",
+        )
+        .bind(resource_id)
+        .bind(fixture.project_id)
+        .bind(parent_id)
+        .bind(kind)
+        .bind(requester_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("insert task resource");
+        sqlx::query(
+            "INSERT INTO resource_epochs (
+                 project_id, resource_node_id, epoch,
+                 created_by_identity_id, created_by_device_id,
+                 created_by_device_key_version, key_commitment, reason
+             ) VALUES ($1, $2, 1, $3, $4, 1,
+                       decode(repeat('ab', 32), 'hex'), 'created')",
+        )
+        .bind(fixture.project_id)
+        .bind(resource_id)
+        .bind(fixture.owner_id)
+        .bind(fixture.owner_device_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("insert task resource epoch");
+    }
+    sqlx::query(
+        "INSERT INTO task_lists (
+             id, project_id, topic_id, resource_node_id, encrypted_payload
+         ) VALUES ($1, $2, $3, $4, decode('01', 'hex'))",
+    )
+    .bind(task_list_id)
+    .bind(fixture.project_id)
+    .bind(topic_id)
+    .bind(task_list_resource_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("insert task list");
+    for (task_id, resource_id) in [
+        (source_task_id, source_task_resource_id),
+        (review_task_id, review_task_resource_id),
+    ] {
+        sqlx::query(
+            "INSERT INTO tasks (
+                 id, project_id, task_list_id, resource_node_id,
+                 encrypted_payload, task_kind, encrypted_value_snapshot,
+                 created_by_identity_id
+             ) VALUES ($1, $2, $3, $4, decode('01', 'hex'),
+                       'priority', decode('01', 'hex'), $5)",
+        )
+        .bind(task_id)
+        .bind(fixture.project_id)
+        .bind(task_list_id)
+        .bind(resource_id)
+        .bind(requester_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("insert task");
+    }
+    sqlx::query(
+        "INSERT INTO task_assignments (
+             id, project_id, task_id, assignee_identity_id,
+             assigned_by_identity_id, encrypted_payload, permission_root_grant_id
+         ) VALUES ($1, $2, $3, $4, $5, decode('01', 'hex'), $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(fixture.project_id)
+    .bind(review_task_id)
+    .bind(target_controller_id)
+    .bind(requester_id)
+    .bind(Uuid::new_v4())
+    .execute(&mut *transaction)
+    .await
+    .expect("assign review task to target controller");
+    transaction.commit().await.expect("commit task fixtures");
+    (source_task_resource_id, review_task_resource_id)
+}
+
+fn local_goal_value(
+    local_goal_id: Uuid,
+    revision: u64,
+    agent_identity_id: Uuid,
+    controller_id: Uuid,
+    contract_scope: Uuid,
+    clause_scope: Uuid,
+    action: &str,
+) -> Value {
+    let obligation_id = Uuid::new_v4();
+    let goal_id = Uuid::new_v4();
+    json!({
+        "id": local_goal_id,
+        "revision": revision,
+        "agent": agent_identity_id,
+        "controller": controller_id,
+        "encrypted_prompt": encrypted(40_u8.wrapping_add(revision as u8)),
+        "contract": {
+            "goal": goal_id,
+            "scope": contract_scope,
+            "obligations": [{
+                "id": obligation_id,
+                "goal": goal_id,
+                "owner": agent_identity_id,
+                "activation": {"kind": "always"},
+                "required_for_completion": {"kind": "always"},
+                "dependency_rank": 0
+            }],
+            "dependencies": [],
+            "work_specs": [{
+                "id": 1,
+                "obligation": obligation_id,
+                "owner": agent_identity_id,
+                "kind": "agent_action",
+                "activation": {"kind": "always"},
+                "allowed_actions": [action],
+                "max_instances": 1,
+                "max_attempts": 1,
+                "max_resolution_ticks": 10,
+                "generation_rank": 0,
+                "is_entry": true,
+                "continuations": [],
+                "failure_plan": {"kind": "fail_goal"}
+            }],
+            "evidence_rules": [{
+                "id": 1,
+                "obligation": obligation_id,
+                "kind": "derived_fact",
+                "subject": {"kind": "derived"},
+                "verification": "semantic_judgment"
+            }],
+            "waiting_rules": [],
+            "completion_condition": {"kind": "always"}
+        },
+        "clauses": [{
+            "id": 1,
+            "domain": 1,
+            "scope": clause_scope,
+            "work_spec_ids": [1]
+        }],
+        "origin": {"kind": "controller_prompt"},
+        "supersedes_revision": (revision > 1).then_some(revision - 1)
+    })
+}
+
 #[test]
 fn server_visible_agent_contracts_are_recursively_closed() {
     let agent = Uuid::new_v4();
@@ -594,7 +949,7 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
                             "rules": [{
                                 "domain": 1,
                                 "scope": fixture.profile_resource_id,
-                                "allowed_actions": ["replace_own_task"]
+                                "allowed_actions": ["post_comment"]
                             }],
                             "supersedes_revision": null
                         }
@@ -606,6 +961,22 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         .await
         .expect("record responsibility response");
     assert_eq!(responsibility.status(), StatusCode::OK);
+    let activate_responsibility = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/users/{}/responsibilities/{responsibility_id}/revisions/1/activate",
+                    fixture.project_id, fixture.owner_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("activate responsibility request"),
+        )
+        .await
+        .expect("activate responsibility response");
+    assert_eq!(activate_responsibility.status(), StatusCode::OK);
 
     let local_goal_id = Uuid::new_v4();
     let obligation_id = Uuid::new_v4();
@@ -628,7 +999,7 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
             "owner": agent_identity_id,
             "kind": "agent_action",
             "activation": { "kind": "always" },
-            "allowed_actions": ["replace_own_task"],
+            "allowed_actions": ["post_comment"],
             "max_instances": 1,
             "max_attempts": 2,
             "max_resolution_ticks": 10,
@@ -685,6 +1056,22 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         .await
         .expect("record local goal response");
     assert_eq!(local_goal.status(), StatusCode::OK);
+    let activate_local_goal = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/local-goals/{local_goal_id}/revisions/1/activate",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("activate local goal request"),
+        )
+        .await
+        .expect("activate local goal response");
+    assert_eq!(activate_local_goal.status(), StatusCode::OK);
     let collaborative_run_id = Uuid::new_v4();
     let create_run = app
         .clone()
@@ -1218,6 +1605,71 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         .await
         .expect("submit proxy response");
     assert_eq!(proxy_request.status(), StatusCode::OK);
+    let proxy_plan_payload = json!({
+        "id": Uuid::new_v4(),
+        "invocation_id": null,
+        "envelope": {
+            "language_task": {
+                "id": Uuid::new_v4(),
+                "kind": "interpret_proxy_request",
+                "input_item_count": 1,
+                "max_input_items": 1,
+                "max_output_items": 1,
+                "max_nesting_depth": 1,
+                "max_attempts": 1,
+                "closed_output_schema": true,
+                "grounded_identifiers_only": true,
+                "requires_formal_proof": false,
+                "requires_permission_decision": false,
+                "requires_exact_semantic_equivalence": false,
+                "requires_exhaustive_world_knowledge": false,
+                "allowed_resource_ids": [fixture.profile_resource_id],
+                "allowed_principal_ids": [fixture.owner_id],
+                "allowed_tools": []
+            },
+            "request_id": proxy_request_id,
+            "user": fixture.owner_id,
+            "candidate_resources": [fixture.profile_resource_id],
+            "candidate_operations": ["post_comment"],
+            "available_tools": [],
+            "max_plan_steps": 1
+        },
+        "plan": {
+            "request_id": proxy_request_id,
+            "thread_id": proxy_thread_id,
+            "user": fixture.owner_id,
+            "intent_id": Uuid::new_v4(),
+            "resource_effects": [{
+                "resource_id": fixture.profile_resource_id,
+                "operation": "post_comment"
+            }],
+            "tool_invocations": [],
+            "encrypted_explanation": encrypted(9)
+        },
+        "confirmation": null
+    });
+    let mut forged_proxy_plan = proxy_plan_payload.clone();
+    forged_proxy_plan["action_classification"] = json!([{
+        "resource_id": fixture.profile_resource_id,
+        "action": "replace_own_task"
+    }]);
+    let forged = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/user-proxy/requests/{proxy_request_id}/plan",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(forged_proxy_plan.to_string()))
+                .expect("forged proxy classification request"),
+        )
+        .await
+        .expect("forged proxy classification response");
+    assert_eq!(forged.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let proxy_plan = app
         .clone()
         .oneshot(
@@ -1229,56 +1681,7 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
                 ))
                 .header(CONTENT_TYPE, "application/json")
                 .header("authorization", format!("Bearer {}", fixture.owner_token))
-                .body(Body::from(
-                    json!({
-                        "id": Uuid::new_v4(),
-                        "invocation_id": null,
-                        "envelope": {
-                            "language_task": {
-                                "id": Uuid::new_v4(),
-                                "kind": "interpret_proxy_request",
-                                "input_item_count": 1,
-                                "max_input_items": 1,
-                                "max_output_items": 1,
-                                "max_nesting_depth": 1,
-                                "max_attempts": 1,
-                                "closed_output_schema": true,
-                                "grounded_identifiers_only": true,
-                                "requires_formal_proof": false,
-                                "requires_permission_decision": false,
-                                "requires_exact_semantic_equivalence": false,
-                                "requires_exhaustive_world_knowledge": false,
-                                "allowed_resource_ids": [fixture.profile_resource_id],
-                                "allowed_principal_ids": [fixture.owner_id],
-                                "allowed_tools": []
-                            },
-                            "request_id": proxy_request_id,
-                            "user": fixture.owner_id,
-                            "candidate_resources": [fixture.profile_resource_id],
-                            "candidate_operations": ["write"],
-                            "available_tools": [],
-                            "max_plan_steps": 1
-                        },
-                        "plan": {
-                            "request_id": proxy_request_id,
-                            "thread_id": proxy_thread_id,
-                            "user": fixture.owner_id,
-                            "intent_id": Uuid::new_v4(),
-                            "resource_effects": [{
-                                "resource_id": fixture.profile_resource_id,
-                                "operation": "write"
-                            }],
-                            "tool_invocations": [],
-                            "encrypted_explanation": encrypted(9)
-                        },
-                        "action_classification": [{
-                            "resource_id": fixture.profile_resource_id,
-                            "action": "replace_own_task"
-                        }],
-                        "confirmation": null
-                    })
-                    .to_string(),
-                ))
+                .body(Body::from(proxy_plan_payload.to_string()))
                 .expect("record proxy plan request"),
         )
         .await
@@ -1532,7 +1935,8 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
     .fetch_one(&fixture.pool)
     .await
     .expect("count agent audit records");
-    assert_eq!(audit_count, 14);
+    // Draft and activation are separate fenced lifecycle events.
+    assert_eq!(audit_count, 15);
 
     let retention_subject_id = Uuid::new_v4();
     let retention_lease_owner = Uuid::new_v4();
@@ -1617,7 +2021,9 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
     .fetch_one(&fixture.pool)
     .await
     .expect("count records after agent retention purge");
-    assert_eq!(remaining_agent_records, 0);
+    // Responsibility is user-level governance and survives deletion of the
+    // controlled agent profile. Every agent-owned runtime record is removed.
+    assert_eq!(remaining_agent_records, 1);
     let runner_session_revoked = sqlx::query_scalar::<_, bool>(
         "SELECT revoked_at IS NOT NULL FROM sessions
          WHERE identity_id = $1 AND device_id = $2",
@@ -1628,4 +2034,1247 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
     .await
     .expect("check runner session revocation after purge");
     assert!(runner_session_revoked);
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn normal_controller_can_atomically_activate_exact_local_goal_and_stale_retry_rolls_back() {
+    let fixture = fixture().await;
+    let app = app(&fixture);
+    let (controller_id, _controller_device_id, controller_token, _controller_permission_root) =
+        add_human_member(&fixture, "member").await;
+    let agent_id = Uuid::new_v4();
+    let agent_identity_id = Uuid::new_v4();
+    let provision = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/agents", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": agent_id,
+                        "principal_identity_id": agent_identity_id,
+                        "controller_identity_id": controller_id,
+                        "identity_handle": format!("member-agent-{}", agent_identity_id.simple()),
+                        "encrypted_profile": encrypted(31),
+                        "profile_resource_node_id": fixture.profile_resource_id,
+                        "encrypted_system_prompt": encrypted(32),
+                        "key_epoch": 1,
+                        "availability": "controller_private",
+                        "runner_id": Uuid::new_v4(),
+                        "runner_device_id": Uuid::new_v4(),
+                        "encrypted_runner_label": encrypted(33)
+                    })
+                    .to_string(),
+                ))
+                .expect("provision normal-user agent request"),
+        )
+        .await
+        .expect("provision normal-user agent response");
+    assert_eq!(provision.status(), StatusCode::OK);
+
+    let responsibility_id = Uuid::new_v4();
+    let responsibility = json!({
+        "id": responsibility_id,
+        "revision": 1,
+        "administrator": fixture.owner_id,
+        "user": controller_id,
+        "encrypted_source_text": encrypted(34),
+        "rules": [{
+            "domain": 1,
+            "scope": fixture.profile_resource_id,
+            "allowed_actions": ["post_comment"]
+        }],
+        "supersedes_revision": null
+    });
+    let drafted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/users/{controller_id}/responsibilities/{responsibility_id}",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(json!({"contract": responsibility}).to_string()))
+                .expect("draft user responsibility request"),
+        )
+        .await
+        .expect("draft user responsibility response");
+    assert_eq!(drafted.status(), StatusCode::OK);
+    let activated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/users/{controller_id}/responsibilities/{responsibility_id}/revisions/1/activate",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("activate user responsibility request"),
+        )
+        .await
+        .expect("activate user responsibility response");
+    assert_eq!(activated.status(), StatusCode::OK);
+
+    let local_goal_id = Uuid::new_v4();
+    let obligation_id = Uuid::new_v4();
+    let goal_id = Uuid::new_v4();
+    let exact_prompt = encrypted(35);
+    let local_goal = json!({
+        "id": local_goal_id,
+        "revision": 1,
+        "agent": agent_identity_id,
+        "controller": controller_id,
+        "encrypted_prompt": exact_prompt,
+        "contract": {
+            "goal": goal_id,
+            "scope": fixture.profile_resource_id,
+            "obligations": [{
+                "id": obligation_id,
+                "goal": goal_id,
+                "owner": agent_identity_id,
+                "activation": {"kind": "always"},
+                "required_for_completion": {"kind": "always"},
+                "dependency_rank": 0
+            }],
+            "dependencies": [],
+            "work_specs": [{
+                "id": 1,
+                "obligation": obligation_id,
+                "owner": agent_identity_id,
+                "kind": "agent_action",
+                "activation": {"kind": "always"},
+                "allowed_actions": ["post_comment"],
+                "max_instances": 1,
+                "max_attempts": 1,
+                "max_resolution_ticks": 10,
+                "generation_rank": 0,
+                "is_entry": true,
+                "continuations": [],
+                "failure_plan": {"kind": "fail_goal"}
+            }],
+            "evidence_rules": [{
+                "id": 1,
+                "obligation": obligation_id,
+                "kind": "derived_fact",
+                "subject": {"kind": "derived"},
+                "verification": "semantic_judgment"
+            }],
+            "waiting_rules": [],
+            "completion_condition": {"kind": "always"}
+        },
+        "clauses": [{
+            "id": 1,
+            "domain": 1,
+            "scope": fixture.profile_resource_id,
+            "work_spec_ids": [1]
+        }],
+        "origin": {"kind": "controller_prompt"},
+        "supersedes_revision": null
+    });
+    let drafted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/local-goal",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {controller_token}"))
+                .body(Body::from(json!({"contract": local_goal}).to_string()))
+                .expect("draft local goal request"),
+        )
+        .await
+        .expect("draft local goal response");
+    assert_eq!(drafted.status(), StatusCode::OK);
+    let activation_uri = format!(
+        "/v1/projects/{}/agents/{agent_id}/local-goals/{local_goal_id}/revisions/1/activate",
+        fixture.project_id
+    );
+    let activated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&activation_uri)
+                .header("authorization", format!("Bearer {controller_token}"))
+                .body(Body::empty())
+                .expect("activate local goal request"),
+        )
+        .await
+        .expect("activate local goal response");
+    assert_eq!(activated.status(), StatusCode::OK);
+
+    let exact_prompt_bound = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT agent.encrypted_system_prompt = prompt.encrypted_prompt
+          AND prompt.state = 'active' AND local.state = 'active'
+        FROM governed_agents agent
+        JOIN agent_prompt_revisions prompt
+          ON prompt.project_id = agent.project_id AND prompt.agent_id = agent.id
+        JOIN agent_local_goal_contracts local
+          ON local.project_id = prompt.project_id
+         AND local.id = prompt.local_goal_id
+         AND local.revision = prompt.local_goal_revision
+        WHERE agent.project_id = $1 AND agent.id = $2
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify exact active prompt binding");
+    assert!(exact_prompt_bound);
+
+    let audit_before = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_user_governance_audit_log
+         WHERE project_id = $1 AND subject_user_identity_id = $2
+           AND event_kind = 'local_goal_activated'",
+    )
+    .bind(fixture.project_id)
+    .bind(controller_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count activation audit before stale retry");
+    assert_eq!(audit_before, 1);
+    let stale = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&activation_uri)
+                .header("authorization", format!("Bearer {controller_token}"))
+                .body(Body::empty())
+                .expect("stale local activation request"),
+        )
+        .await
+        .expect("stale local activation response");
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let audit_after = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_user_governance_audit_log
+         WHERE project_id = $1 AND subject_user_identity_id = $2
+           AND event_kind = 'local_goal_activated'",
+    )
+    .bind(fixture.project_id)
+    .bind(controller_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count activation audit after stale retry");
+    assert_eq!(audit_after, audit_before);
+
+    let responsibility_revision_2 = json!({
+        "id": responsibility_id,
+        "revision": 2,
+        "administrator": fixture.owner_id,
+        "user": controller_id,
+        "encrypted_source_text": encrypted(39),
+        "rules": [{
+            "domain": 1,
+            "scope": fixture.profile_resource_id,
+            "allowed_actions": ["post_comment"]
+        }],
+        "supersedes_revision": 1
+    });
+    let drafted_revision_2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/users/{controller_id}/responsibilities/{responsibility_id}",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({"contract": responsibility_revision_2}).to_string(),
+                ))
+                .expect("draft second responsibility revision request"),
+        )
+        .await
+        .expect("draft second responsibility revision response");
+    assert_eq!(drafted_revision_2.status(), StatusCode::OK);
+    let activated_revision_2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/users/{controller_id}/responsibilities/{responsibility_id}/revisions/2/activate",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("activate second responsibility revision request"),
+        )
+        .await
+        .expect("activate second responsibility revision response");
+    assert_eq!(activated_revision_2.status(), StatusCode::OK);
+    let responsibility_history_is_fenced = sqlx::query_scalar::<_, bool>(
+        "SELECT count(*) FILTER (WHERE revision = 1 AND state = 'superseded') = 1
+             AND count(*) FILTER (WHERE revision = 2 AND state = 'active') = 1
+         FROM agent_responsibility_contracts
+         WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(responsibility_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify fenced responsibility history");
+    assert!(responsibility_history_is_fenced);
+
+    // The domain requires contiguous revisions, so there is no positive
+    // non-contiguous case. Persist a stale/corrupt draft as migration owner to
+    // prove activation follows its explicit supersedes pointer and fails
+    // closed instead of inferring the active predecessor arithmetically.
+    let stale_revision = json!({
+        "id": responsibility_id,
+        "revision": 3,
+        "administrator": fixture.owner_id,
+        "user": controller_id,
+        "encrypted_source_text": encrypted(41),
+        "rules": [{
+            "domain": 1,
+            "scope": fixture.profile_resource_id,
+            "allowed_actions": ["post_comment"]
+        }],
+        "supersedes_revision": 1
+    });
+    let stale_revision_json = stale_revision.to_string();
+    let stale_revision_hash: [u8; 32] = Sha256::digest(stale_revision_json.as_bytes()).into();
+    sqlx::query(
+        "INSERT INTO agent_responsibility_contracts (
+             id, project_id, revision, administrator_identity_id,
+             user_identity_id, contract, contract_hash, state
+         ) VALUES ($1, $2, 3, $3, $4, $5::jsonb, $6, 'draft')",
+    )
+    .bind(responsibility_id)
+    .bind(fixture.project_id)
+    .bind(fixture.owner_id)
+    .bind(controller_id)
+    .bind(stale_revision_json)
+    .bind(stale_revision_hash.as_slice())
+    .execute(&fixture.pool)
+    .await
+    .expect("insert stale supersedes draft fixture");
+    let governance_audit_before_stale = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_user_governance_audit_log
+         WHERE project_id = $1 AND subject_user_identity_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(controller_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count governance audit before stale responsibility activation");
+    let stale_activation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/users/{controller_id}/responsibilities/{responsibility_id}/revisions/3/activate",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("activate stale supersedes responsibility request"),
+        )
+        .await
+        .expect("activate stale supersedes responsibility response");
+    assert_eq!(stale_activation.status(), StatusCode::CONFLICT);
+    let stale_activation_rolled_back = sqlx::query_scalar::<_, bool>(
+        "SELECT count(*) FILTER (WHERE revision = 2 AND state = 'active') = 1
+             AND count(*) FILTER (WHERE revision = 3 AND state = 'draft') = 1
+         FROM agent_responsibility_contracts
+         WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(responsibility_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify stale responsibility activation rollback");
+    assert!(stale_activation_rolled_back);
+    let governance_audit_after_stale = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_user_governance_audit_log
+         WHERE project_id = $1 AND subject_user_identity_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(controller_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count governance audit after stale responsibility activation");
+    assert_eq!(governance_audit_after_stale, governance_audit_before_stale);
+
+    // An administrator-controlled agent is governed directly by current
+    // project-administrator authority; no administrator→administrator
+    // ResponsibilityContract is synthesized.
+    let admin_agent_id = Uuid::new_v4();
+    let admin_agent_identity_id = Uuid::new_v4();
+    let provision_admin_agent = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/agents", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": admin_agent_id,
+                        "principal_identity_id": admin_agent_identity_id,
+                        "controller_identity_id": fixture.owner_id,
+                        "identity_handle": format!("admin-agent-{}", admin_agent_identity_id.simple()),
+                        "encrypted_profile": encrypted(36),
+                        "profile_resource_node_id": fixture.profile_resource_id,
+                        "encrypted_system_prompt": encrypted(37),
+                        "key_epoch": 1,
+                        "availability": "controller_private",
+                        "runner_id": Uuid::new_v4(),
+                        "runner_device_id": Uuid::new_v4(),
+                        "encrypted_runner_label": encrypted(38)
+                    })
+                    .to_string(),
+                ))
+                .expect("provision admin-controlled agent request"),
+        )
+        .await
+        .expect("provision admin-controlled agent response");
+    assert_eq!(provision_admin_agent.status(), StatusCode::OK);
+    let admin_local_goal_id = Uuid::new_v4();
+    let admin_local_goal = local_goal_value(
+        admin_local_goal_id,
+        1,
+        admin_agent_identity_id,
+        fixture.owner_id,
+        fixture.profile_resource_id,
+        fixture.profile_resource_id,
+        "post_comment",
+    );
+    let drafted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{admin_agent_id}/local-goal",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({"contract": admin_local_goal}).to_string(),
+                ))
+                .expect("draft admin local goal request"),
+        )
+        .await
+        .expect("draft admin local goal response");
+    assert_eq!(drafted.status(), StatusCode::OK);
+    let activated = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{admin_agent_id}/local-goals/{admin_local_goal_id}/revisions/1/activate",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("activate admin local goal request"),
+        )
+        .await
+        .expect("activate admin local goal response");
+    assert_eq!(activated.status(), StatusCode::OK);
+    let fake_admin_responsibilities = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_responsibility_contracts
+         WHERE project_id = $1 AND user_identity_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.owner_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count fake administrator responsibilities");
+    assert_eq!(fake_admin_responsibilities, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn purging_one_of_two_same_user_agents_preserves_shared_governance_and_peer_runtime() {
+    let fixture = fixture().await;
+    let app = app(&fixture);
+    let (controller_id, controller_device_id, _controller_token, _permission_root) =
+        add_human_member(&fixture, "member").await;
+    let root_resource_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT parent_id FROM resource_nodes WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load common governance root");
+    let peer_profile_resource_id = Uuid::new_v4();
+    let peer_topic_id = Uuid::new_v4();
+    let mut prepare = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin peer profile setup");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *prepare)
+        .await
+        .expect("disable RLS for peer profile setup");
+    sqlx::query(
+        "INSERT INTO resource_nodes (
+             id, project_id, parent_id, node_kind,
+             encrypted_metadata, created_by_identity_id
+         ) VALUES ($1, $2, $3, 'topic', decode('01', 'hex'), $4)",
+    )
+    .bind(peer_profile_resource_id)
+    .bind(fixture.project_id)
+    .bind(root_resource_id)
+    .bind(fixture.owner_id)
+    .execute(&mut *prepare)
+    .await
+    .expect("insert peer profile resource");
+    sqlx::query(
+        "INSERT INTO resource_epochs (
+             project_id, resource_node_id, epoch,
+             created_by_identity_id, created_by_device_id,
+             created_by_device_key_version, key_commitment, reason
+         ) VALUES ($1, $2, 1, $3, $4, 1,
+                   decode(repeat('ac', 32), 'hex'), 'created')",
+    )
+    .bind(fixture.project_id)
+    .bind(peer_profile_resource_id)
+    .bind(fixture.owner_id)
+    .bind(fixture.owner_device_id)
+    .execute(&mut *prepare)
+    .await
+    .expect("insert peer profile epoch");
+    sqlx::query(
+        "INSERT INTO topics (id, project_id, resource_node_id, encrypted_payload)
+         VALUES ($1, $2, $3, decode('01', 'hex'))",
+    )
+    .bind(peer_topic_id)
+    .bind(fixture.project_id)
+    .bind(peer_profile_resource_id)
+    .execute(&mut *prepare)
+    .await
+    .expect("insert peer profile topic");
+    sqlx::query(
+        "SELECT sprout_private.grant_hierarchical_permission(
+             $1, $2, $3, 'manage', 'full', 'restricted', $4, $5
+         )",
+    )
+    .bind(fixture.project_id)
+    .bind(peer_profile_resource_id)
+    .bind(controller_id)
+    .bind(Uuid::new_v4())
+    .bind(fixture.owner_id)
+    .execute(&mut *prepare)
+    .await
+    .expect("grant controller access to peer profile");
+    prepare.commit().await.expect("commit peer profile setup");
+
+    let (purged_agent_id, _purged_principal_id, _purged_runner_id, _purged_device_id) =
+        provision_controlled_agent(
+            &fixture,
+            &app,
+            controller_id,
+            fixture.profile_resource_id,
+            61,
+        )
+        .await;
+    let (peer_agent_id, peer_principal_id, peer_runner_id, peer_runner_device_id) =
+        provision_controlled_agent(&fixture, &app, controller_id, peer_profile_resource_id, 64)
+            .await;
+
+    let responsibility_id = Uuid::new_v4();
+    let drafted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/users/{controller_id}/responsibilities/{responsibility_id}",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "contract": {
+                            "id": responsibility_id,
+                            "revision": 1,
+                            "administrator": fixture.owner_id,
+                            "user": controller_id,
+                            "encrypted_source_text": encrypted(67),
+                            "rules": [{
+                                "domain": 1,
+                                "scope": root_resource_id,
+                                "allowed_actions": ["post_comment"]
+                            }],
+                            "supersedes_revision": null
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("draft shared user responsibility request"),
+        )
+        .await
+        .expect("draft shared user responsibility response");
+    assert_eq!(drafted.status(), StatusCode::OK);
+    let activated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/users/{controller_id}/responsibilities/{responsibility_id}/revisions/1/activate",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("activate shared user responsibility request"),
+        )
+        .await
+        .expect("activate shared user responsibility response");
+    assert_eq!(activated.status(), StatusCode::OK);
+
+    let agents_governed_by_same_active_contract = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*)
+         FROM governed_agents agent
+         JOIN agent_responsibility_contracts responsibility
+           ON responsibility.project_id = agent.project_id
+          AND responsibility.user_identity_id = agent.controller_identity_id
+          AND responsibility.state = 'active'
+         WHERE agent.project_id = $1 AND agent.controller_identity_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(controller_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count agents sharing active user responsibility");
+    assert_eq!(agents_governed_by_same_active_contract, 2);
+
+    purge_resource_through_retention(&fixture, fixture.profile_resource_id, fixture.owner_id).await;
+
+    let purged_agent_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM governed_agents WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(purged_agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count purged agent");
+    assert_eq!(purged_agent_count, 0);
+    let peer_runtime_intact = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM governed_agents agent
+             JOIN agent_runners runner
+               ON runner.project_id = agent.project_id AND runner.agent_id = agent.id
+             JOIN identities principal ON principal.id = agent.principal_identity_id
+             JOIN devices device
+               ON device.identity_id = principal.id AND device.id = runner.device_id
+             JOIN sessions session
+               ON session.identity_id = principal.id AND session.device_id = device.id
+             WHERE agent.project_id = $1 AND agent.id = $2
+               AND agent.principal_identity_id = $3 AND runner.id = $4
+               AND device.id = $5 AND device.retired_at IS NULL
+               AND session.revoked_at IS NULL
+         )",
+    )
+    .bind(fixture.project_id)
+    .bind(peer_agent_id)
+    .bind(peer_principal_id)
+    .bind(peer_runner_id)
+    .bind(peer_runner_device_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify peer agent runtime isolation");
+    assert!(peer_runtime_intact);
+    let shared_governance_intact = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM agent_responsibility_contracts
+             WHERE project_id = $1 AND id = $2 AND revision = 1
+               AND user_identity_id = $3 AND state = 'active'
+         ) AND EXISTS (
+             SELECT 1 FROM agent_user_governance_audit_log
+             WHERE project_id = $1 AND subject_user_identity_id = $3
+               AND event_kind = 'responsibility_activated'
+         ) AND EXISTS (
+             SELECT 1 FROM sessions
+             WHERE identity_id = $3 AND device_id = $4 AND revoked_at IS NULL
+         )",
+    )
+    .bind(fixture.project_id)
+    .bind(responsibility_id)
+    .bind(controller_id)
+    .bind(controller_device_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify shared governance and controller identity isolation");
+    assert!(shared_governance_intact);
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn cross_owner_review_requires_exact_active_task_provenance_and_current_permission() {
+    let fixture = fixture().await;
+    let app = app(&fixture);
+    let (requester_id, _requester_device, requester_token, requester_permission_root) =
+        add_human_member(&fixture, "member").await;
+    let (controller_id, controller_device, controller_token, _controller_permission_root) =
+        add_human_member(&fixture, "member").await;
+    let (source_task, review_task) =
+        create_cross_owner_tasks(&fixture, requester_id, controller_id).await;
+    let agent_id = Uuid::new_v4();
+    let agent_identity_id = Uuid::new_v4();
+    let provision = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/agents", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": agent_id,
+                        "principal_identity_id": agent_identity_id,
+                        "controller_identity_id": controller_id,
+                        "identity_handle": format!("cross-agent-{}", agent_identity_id.simple()),
+                        "encrypted_profile": encrypted(50),
+                        "profile_resource_node_id": fixture.profile_resource_id,
+                        "encrypted_system_prompt": encrypted(51),
+                        "key_epoch": 1,
+                        "availability": "project_delegable",
+                        "runner_id": Uuid::new_v4(),
+                        "runner_device_id": Uuid::new_v4(),
+                        "encrypted_runner_label": encrypted(52)
+                    })
+                    .to_string(),
+                ))
+                .expect("provision cross-owner target request"),
+        )
+        .await
+        .expect("provision cross-owner target response");
+    assert_eq!(provision.status(), StatusCode::OK);
+
+    let responsibility_id = Uuid::new_v4();
+    let responsibility = json!({
+        "id": responsibility_id,
+        "revision": 1,
+        "administrator": fixture.owner_id,
+        "user": controller_id,
+        "encrypted_source_text": encrypted(53),
+        "rules": [{
+            "domain": 1,
+            "scope": source_task,
+            "allowed_actions": ["assign_own_task"]
+        }],
+        "supersedes_revision": null
+    });
+    let drafted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/users/{controller_id}/responsibilities/{responsibility_id}",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(json!({"contract": responsibility}).to_string()))
+                .expect("draft target responsibility request"),
+        )
+        .await
+        .expect("draft target responsibility response");
+    assert_eq!(drafted.status(), StatusCode::OK);
+    let activated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/users/{controller_id}/responsibilities/{responsibility_id}/revisions/1/activate",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("activate target responsibility request"),
+        )
+        .await
+        .expect("activate target responsibility response");
+    assert_eq!(activated.status(), StatusCode::OK);
+
+    let rejected_assignment_id = Uuid::new_v4();
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/tasks/{review_task}/cross-owner-assignments",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::from(
+                    json!({
+                        "id": rejected_assignment_id,
+                        "target_agent_id": agent_id,
+                        "review_task_resource_node_id": null
+                    })
+                    .to_string(),
+                ))
+                .expect("route out-of-governance request"),
+        )
+        .await
+        .expect("route out-of-governance response");
+    assert_eq!(rejected.status(), StatusCode::OK);
+    assert_eq!(json_body(rejected).await["route"], "rejected");
+
+    let assignment_id = Uuid::new_v4();
+    let routed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/tasks/{source_task}/cross-owner-assignments",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::from(
+                    json!({
+                        "id": assignment_id,
+                        "target_agent_id": agent_id,
+                        "review_task_resource_node_id": review_task
+                    })
+                    .to_string(),
+                ))
+                .expect("route controller review request"),
+        )
+        .await
+        .expect("route controller review response");
+    assert_eq!(routed.status(), StatusCode::OK);
+    assert_eq!(json_body(routed).await["state"], "pending_review");
+    let decided = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/cross-owner-assignments/{assignment_id}/decision",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {controller_token}"))
+                .body(Body::from(json!({"decision": "approved"}).to_string()))
+                .expect("approve controller review request"),
+        )
+        .await
+        .expect("approve controller review response");
+    assert_eq!(decided.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(decided).await["state"],
+        "approved_pending_mandate"
+    );
+    let finalize_uri = format!(
+        "/v1/projects/{}/cross-owner-assignments/{assignment_id}/finalize",
+        fixture.project_id
+    );
+    let approval_alone = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&finalize_uri)
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::empty())
+                .expect("finalize without mandate request"),
+        )
+        .await
+        .expect("finalize without mandate response");
+    assert_eq!(approval_alone.status(), StatusCode::CONFLICT);
+
+    let local_goal_id = Uuid::new_v4();
+    let wrong_task_local = local_goal_value(
+        local_goal_id,
+        1,
+        agent_identity_id,
+        controller_id,
+        source_task,
+        review_task,
+        "assign_own_task",
+    );
+    let drafted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/local-goal",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {controller_token}"))
+                .body(Body::from(
+                    json!({"contract": wrong_task_local}).to_string(),
+                ))
+                .expect("draft wrong-task local goal request"),
+        )
+        .await
+        .expect("draft wrong-task local goal response");
+    assert_eq!(drafted.status(), StatusCode::OK);
+    let activate_local_uri = format!(
+        "/v1/projects/{}/agents/{agent_id}/local-goals/{local_goal_id}/revisions/1/activate",
+        fixture.project_id
+    );
+    let activated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&activate_local_uri)
+                .header("authorization", format!("Bearer {controller_token}"))
+                .body(Body::empty())
+                .expect("activate wrong-task local goal request"),
+        )
+        .await
+        .expect("activate wrong-task local goal response");
+    assert_eq!(activated.status(), StatusCode::OK);
+    let wrong_task_not_ready = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&finalize_uri)
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::empty())
+                .expect("finalize wrong-task mandate request"),
+        )
+        .await
+        .expect("finalize wrong-task mandate response");
+    assert_eq!(wrong_task_not_ready.status(), StatusCode::CONFLICT);
+    let still_pending = sqlx::query_scalar::<_, String>(
+        "SELECT state FROM agent_cross_owner_assignments
+         WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(assignment_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load assignment after wrong task activation");
+    assert_eq!(still_pending, "approved_pending_mandate");
+
+    let exact_task_local = local_goal_value(
+        local_goal_id,
+        2,
+        agent_identity_id,
+        controller_id,
+        source_task,
+        source_task,
+        "assign_own_task",
+    );
+    let drafted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/local-goal",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {controller_token}"))
+                .body(Body::from(
+                    json!({"contract": exact_task_local}).to_string(),
+                ))
+                .expect("draft exact-task local goal request"),
+        )
+        .await
+        .expect("draft exact-task local goal response");
+    assert_eq!(drafted.status(), StatusCode::OK);
+    let activated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/local-goals/{local_goal_id}/revisions/2/activate",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {controller_token}"))
+                .body(Body::empty())
+                .expect("activate exact-task local goal request"),
+        )
+        .await
+        .expect("activate exact-task local goal response");
+    assert_eq!(activated.status(), StatusCode::OK);
+
+    let provenance_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_task_obligation_provenance
+         WHERE project_id = $1 AND task_resource_node_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count exact task obligation provenance");
+    assert_eq!(provenance_count, 1);
+
+    sqlx::query(
+        r#"
+        DO $role$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sprout_governance_app') THEN
+                CREATE ROLE sprout_governance_app NOSUPERUSER NOBYPASSRLS NOLOGIN;
+            END IF;
+        END
+        $role$
+        "#,
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("create non-bypass governance app role");
+    let app_role_is_unprivileged = sqlx::query_scalar::<_, bool>(
+        "SELECT NOT rolsuper AND NOT rolbypassrls
+         FROM pg_roles WHERE rolname = 'sprout_governance_app'",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify governance app role attributes");
+    assert!(app_role_is_unprivileged);
+    for grant in [
+        "GRANT sprout_governance_app TO sprout_test",
+        "GRANT SELECT, DELETE ON agent_task_obligation_provenance TO sprout_governance_app",
+        "GRANT SELECT ON agent_cross_owner_assignments, governed_agents TO sprout_governance_app",
+    ] {
+        sqlx::query(grant)
+            .execute(&fixture.pool)
+            .await
+            .expect("grant minimal governance app test privilege");
+    }
+    let mut forged_retention = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin forged retention test");
+    sqlx::query("SET LOCAL ROLE sprout_governance_app")
+        .execute(&mut *forged_retention)
+        .await
+        .expect("assume non-bypass app role");
+    sqlx::query(
+        "SELECT set_config('app.identity_id', $1, true),
+                set_config('app.device_id', $2, true),
+                set_config('app.project_id', $3, true),
+                set_config('app.agent_retention_resource_id', $4, true)",
+    )
+    .bind(controller_id.to_string())
+    .bind(controller_device.to_string())
+    .bind(fixture.project_id.to_string())
+    .bind(source_task.to_string())
+    .execute(&mut *forged_retention)
+    .await
+    .expect("set forged retention identifier without a lease");
+    sqlx::query(
+        r#"
+        DO $delete$
+        BEGIN
+            BEGIN
+                DELETE FROM agent_task_obligation_provenance
+                WHERE project_id = '30000000-0000-0000-0000-000000000000'::uuid;
+            EXCEPTION WHEN SQLSTATE '55000' THEN
+                NULL;
+            END;
+            BEGIN
+                DELETE FROM agent_task_obligation_provenance
+                WHERE project_id = current_setting('app.project_id')::uuid;
+                RAISE EXCEPTION 'forged retention GUC authorized provenance deletion';
+            EXCEPTION WHEN SQLSTATE '55000' THEN
+                NULL;
+            END;
+        END
+        $delete$
+        "#,
+    )
+    .execute(&mut *forged_retention)
+    .await
+    .expect("manual retention GUC must fail at append-only trigger");
+    forged_retention
+        .commit()
+        .await
+        .expect("commit forged retention negative test");
+    let provenance_after_forgery = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_task_obligation_provenance
+         WHERE project_id = $1 AND task_resource_node_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count provenance after forged retention GUC");
+    assert_eq!(provenance_after_forgery, 1);
+
+    let mut revoke = fixture.pool.begin().await.expect("begin requester revoke");
+    sqlx::query(
+        "SELECT set_config('app.identity_id', $1, true),
+                set_config('app.device_id', $2, true),
+                set_config('app.project_id', $3, true)",
+    )
+    .bind(fixture.owner_id.to_string())
+    .bind(fixture.owner_device_id.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *revoke)
+    .await
+    .expect("set owner context for revoke");
+    sqlx::query_scalar::<_, i64>(
+        "SELECT sprout_private.revoke_hierarchical_permission($1, $2, $3, $4, NULL)",
+    )
+    .bind(fixture.project_id)
+    .bind(requester_permission_root)
+    .bind(requester_id)
+    .bind(fixture.owner_id)
+    .fetch_one(&mut *revoke)
+    .await
+    .expect("revoke requester permission");
+    revoke.commit().await.expect("commit requester revoke");
+    let revoked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&finalize_uri)
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::empty())
+                .expect("finalize after permission revoke request"),
+        )
+        .await
+        .expect("finalize after permission revoke response");
+    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+
+    let mut regrant = fixture.pool.begin().await.expect("begin requester regrant");
+    sqlx::query(
+        "SELECT set_config('app.identity_id', $1, true),
+                set_config('app.device_id', $2, true),
+                set_config('app.project_id', $3, true)",
+    )
+    .bind(fixture.owner_id.to_string())
+    .bind(fixture.owner_device_id.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *regrant)
+    .await
+    .expect("set owner context for regrant");
+    sqlx::query(
+        "SELECT sprout_private.grant_hierarchical_permission(
+             $1, $2, $3, 'manage', 'full', 'restricted', $4, $5
+         )",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(requester_id)
+    .bind(Uuid::new_v4())
+    .bind(fixture.owner_id)
+    .execute(&mut *regrant)
+    .await
+    .expect("regrant requester permission");
+    regrant.commit().await.expect("commit requester regrant");
+    let ready = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&finalize_uri)
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::empty())
+                .expect("finalize exact mandate request"),
+        )
+        .await
+        .expect("finalize exact mandate response");
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert_eq!(json_body(ready).await["state"], "ready");
+
+    let retention_subject_id = Uuid::new_v4();
+    let retention_lease_token = Uuid::new_v4();
+    let retention_now = Utc::now();
+    let deleted_at = retention_now - ChronoDuration::days(20);
+    let mut retention = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin legitimate provenance retention");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *retention)
+        .await
+        .expect("disable RLS for retention fixture setup");
+    sqlx::query(
+        "UPDATE resource_nodes SET deleted_at = $3
+         WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .bind(deleted_at)
+    .execute(&mut *retention)
+    .await
+    .expect("soft-delete task resource for retention");
+    sqlx::query(
+        r#"
+        INSERT INTO retention_subjects (
+            id, project_id, source_kind, source_id, resource_node_id,
+            owner_identity_id, retention_class, source_at, warning_at,
+            purge_at, state, lease_owner, lease_token, leased_until
+        ) VALUES (
+            $1, $2, 'resource_deleted', $3, $3, $4,
+            'deleted_or_obsolete', $5, $6, $7, 'purging', $8, $9, $10
+        )
+        "#,
+    )
+    .bind(retention_subject_id)
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .bind(requester_id)
+    .bind(deleted_at)
+    .bind(deleted_at + ChronoDuration::days(1))
+    .bind(deleted_at + ChronoDuration::days(15))
+    .bind(Uuid::new_v4())
+    .bind(retention_lease_token)
+    .bind(retention_now + ChronoDuration::hours(1))
+    .execute(&mut *retention)
+    .await
+    .expect("insert legitimate retention lease");
+    retention
+        .commit()
+        .await
+        .expect("commit legitimate retention setup");
+    let purged =
+        sqlx::query_scalar::<_, bool>("SELECT sprout_private.purge_retention_subject($1, $2, $3)")
+            .bind(retention_subject_id)
+            .bind(retention_lease_token)
+            .bind(retention_now)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("execute legitimate retention purge");
+    assert!(purged);
+    let provenance_after_purge = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_task_obligation_provenance
+         WHERE project_id = $1 AND task_resource_node_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count provenance after legitimate retention purge");
+    assert_eq!(provenance_after_purge, 0);
 }

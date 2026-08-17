@@ -14,16 +14,18 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sprout_domain::{
     AgentActionClass, AgentAvailabilityMode, AgentId, AgentInterrogationCausalDelta,
-    AgentInterrogationSession, AuthorityEnvelope, EncryptedPayload, GlobalContractCandidate,
-    GovernedAgent, InformationSource, InterrogationId, InvocationId, LocalGoalContract,
-    LocalGoalOrigin, ModelExposureProjection, ModelInvocationContext, PrincipalKind, ProjectId,
-    ProxyExecution, ProxyRequestId, ProxyThreadId, ResourceEffect, ResourceId, ResourceOperation,
+    AgentInterrogationSession, AuthorityEnvelope, CollaborativeRunState, ContractCondition,
+    ContractConditionFacts, CrossOwnerAssignmentRoute, CurrentLocalObligationContext,
+    EncryptedPayload, GlobalContractCandidate, GovernedAgent, InformationSource, InterrogationId,
+    InvocationId, LocalGoalContract, LocalGoalOrigin, ModelExposureProjection,
+    ModelInvocationContext, PersistedTaskIntent, PrincipalKind, ProjectId, ProxyExecution,
+    ProxyRequestId, ProxyThreadId, ResourceEffect, ResourceId, ResourceOperation,
     ResponsibilityContract, StructuredGlobalSynthesisEnvelope, StructuredGlobalWorkGrounding,
-    StructuredLanguageOutput, StructuredLanguageTaskEnvelope, StructuredLanguageTaskKind, UserId,
-    UserProxy, UserProxyActionPlan, UserProxyOutOfResponsibilityConfirmation,
-    UserProxyPlanningEnvelope, UserProxyRequest, UserProxyThread,
-    responsibility_operationally_covers_local_goal, validate_global_synthesis,
-    validate_information_flow, validate_state_grounded_invocation,
+    StructuredLanguageOutput, StructuredLanguageTaskEnvelope, StructuredLanguageTaskKind,
+    TaskObligationProvenance, UserId, UserProxy, UserProxyActionPlan,
+    UserProxyOutOfResponsibilityConfirmation, UserProxyPlanningEnvelope, UserProxyRequest,
+    UserProxyThread, responsibility_operationally_covers_local_goal, route_cross_owner_assignment,
+    validate_global_synthesis, validate_information_flow, validate_state_grounded_invocation,
 };
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -172,6 +174,245 @@ pub async fn provision(
         bootstrap_token: token,
         bootstrap_expires_at: expires_at,
         runner_state: "pending_key",
+    }))
+}
+
+pub async fn activate_local_goal(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id, local_goal_id, revision)): Path<(Uuid, Uuid, Uuid, u64)>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let agent = load_agent(&state, actor, project_id, agent_id).await?;
+    if agent.controller_id != actor.identity_id.into() {
+        return Err(AppError::Forbidden);
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 36))")
+        .bind(agent_id)
+        .execute(&mut *transaction)
+        .await?;
+    let row = sqlx::query(
+        r#"
+        SELECT local.contract::text AS contract, local.contract_hash,
+               prompt.encrypted_prompt, prompt.prompt_hash
+        FROM agent_local_goal_contracts local
+        JOIN agent_prompt_revisions prompt
+          ON prompt.project_id = local.project_id
+         AND prompt.agent_id = local.agent_id
+         AND prompt.local_goal_id = local.id
+         AND prompt.local_goal_revision = local.revision
+        WHERE local.project_id = $1 AND local.agent_id = $2
+          AND local.id = $3 AND local.revision = $4
+          AND local.state = 'draft' AND prompt.state = 'draft'
+        FOR UPDATE OF local, prompt
+        "#,
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(local_goal_id)
+    .bind(to_i64(revision)?)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let contract: LocalGoalContract =
+        serde_json::from_str(row.try_get("contract")?).map_err(|_| AppError::Internal)?;
+    if contract.id != local_goal_id.into()
+        || contract.revision != revision
+        || contract.agent != agent.principal_id
+        || contract.controller != agent.controller_id
+    {
+        return Err(AppError::Conflict);
+    }
+    contract.validate().map_err(agent_validation_error)?;
+    let prompt_bytes = serialize_ciphertext(&contract.encrypted_prompt)?;
+    let stored_prompt: Vec<u8> = row.try_get("encrypted_prompt")?;
+    let stored_prompt_hash: Vec<u8> = row.try_get("prompt_hash")?;
+    let expected_prompt_hash: [u8; 32] = Sha256::digest(&prompt_bytes).into();
+    if stored_prompt != prompt_bytes || stored_prompt_hash != expected_prompt_hash {
+        return Err(AppError::Conflict);
+    }
+    for clause in &contract.clauses {
+        if !resource_access_in_transaction(
+            &mut transaction,
+            project_id,
+            actor.identity_id,
+            Uuid::from(clause.scope),
+            ResourceOperation::Read,
+        )
+        .await?
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
+    let controller_role = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM project_memberships
+         WHERE project_id = $1 AND identity_id = $2 AND state = 'active'",
+    )
+    .bind(project_id)
+    .bind(actor.identity_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    let admin_governed = matches!(controller_role.as_str(), "owner" | "admin");
+    if !admin_governed {
+        let responsibility = load_current_responsibility(
+            &mut transaction,
+            project_id,
+            Uuid::from(contract.controller),
+        )
+        .await?
+        .ok_or(AppError::Forbidden)?;
+        if !responsibility_operationally_covers(
+            &mut transaction,
+            project_id,
+            &responsibility,
+            &contract,
+        )
+        .await?
+        {
+            return Err(AppError::Forbidden);
+        }
+    } else if !resource_access_in_transaction(
+        &mut transaction,
+        project_id,
+        actor.identity_id,
+        Uuid::from(contract.contract.scope),
+        ResourceOperation::Manage,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+
+    if revision > 1 {
+        let supersedes_revision = contract.supersedes_revision.ok_or(AppError::Conflict)?;
+        let superseded = sqlx::query(
+            "UPDATE agent_local_goal_contracts
+             SET state = 'superseded', terminal_at = clock_timestamp()
+             WHERE project_id = $1 AND agent_id = $2 AND id = $3
+               AND revision = $4 AND state = 'active'",
+        )
+        .bind(project_id)
+        .bind(agent_id)
+        .bind(local_goal_id)
+        .bind(to_i64(supersedes_revision)?)
+        .execute(&mut *transaction)
+        .await?;
+        if superseded.rows_affected() != 1 {
+            return Err(AppError::Conflict);
+        }
+        let superseded_prompt = sqlx::query(
+            "UPDATE agent_prompt_revisions
+             SET state = 'superseded', superseded_at = clock_timestamp()
+             WHERE project_id = $1 AND agent_id = $2 AND local_goal_id = $3
+               AND local_goal_revision = $4 AND state = 'active'",
+        )
+        .bind(project_id)
+        .bind(agent_id)
+        .bind(local_goal_id)
+        .bind(to_i64(supersedes_revision)?)
+        .execute(&mut *transaction)
+        .await?;
+        if superseded_prompt.rows_affected() != 1 {
+            return Err(AppError::Conflict);
+        }
+    } else if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM agent_local_goal_contracts
+         WHERE project_id = $1 AND agent_id = $2 AND state = 'active')",
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .fetch_one(&mut *transaction)
+    .await?
+    {
+        return Err(AppError::Conflict);
+    }
+    let activated_local = sqlx::query(
+        "UPDATE agent_local_goal_contracts SET state = 'active'
+         WHERE project_id = $1 AND agent_id = $2 AND id = $3
+           AND revision = $4 AND state = 'draft'",
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(local_goal_id)
+    .bind(to_i64(revision)?)
+    .execute(&mut *transaction)
+    .await?;
+    if activated_local.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
+    let activated_prompt = sqlx::query(
+        "UPDATE agent_prompt_revisions
+         SET state = 'active', approved_by_identity_id = $5,
+             activated_at = clock_timestamp()
+         WHERE project_id = $1 AND agent_id = $2 AND local_goal_id = $3
+           AND local_goal_revision = $4 AND state = 'draft'",
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(local_goal_id)
+    .bind(to_i64(revision)?)
+    .bind(actor.identity_id)
+    .execute(&mut *transaction)
+    .await?;
+    if activated_prompt.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
+    let updated_prompt = sqlx::query(
+        "UPDATE governed_agents SET encrypted_system_prompt = $3
+         WHERE project_id = $1 AND id = $2 AND controller_identity_id = $4
+           AND state = 'active'",
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(prompt_bytes)
+    .bind(actor.identity_id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated_prompt.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
+    persist_cross_owner_task_provenance(&mut transaction, project_id, agent_id, &contract).await?;
+    append_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        AgentId::from(agent_id),
+        None,
+        "local_goal_recorded",
+        json!({
+            "local_goal_id": local_goal_id,
+            "revision": revision,
+            "state": "active",
+            "prompt_hash": hex::encode(expected_prompt_hash),
+            "governance": if admin_governed { "project_administrator" } else { "responsibility" },
+        }),
+    )
+    .await?;
+    append_user_governance_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        actor.identity_id,
+        Some(agent_id),
+        "local_goal_activated",
+        json!({
+            "local_goal_id": local_goal_id,
+            "revision": revision,
+            "prompt_hash": hex::encode(expected_prompt_hash),
+            "governance": if admin_governed { "project_administrator" } else { "responsibility" },
+        }),
+    )
+    .await?;
+    transaction.commit().await?;
+    let contract_hash: Vec<u8> = row.try_get("contract_hash")?;
+    Ok(Json(ContractRecordedResponse {
+        id: local_goal_id,
+        revision,
+        contract_hash_hex: hex::encode(contract_hash),
     }))
 }
 
@@ -336,6 +577,7 @@ pub async fn record_responsibility(
             SELECT contract::text
             FROM agent_responsibility_contracts
             WHERE project_id = $1 AND id = $2 AND revision = $3
+              AND state = 'active'
             "#,
         )
         .bind(project_id)
@@ -372,8 +614,8 @@ pub async fn record_responsibility(
         r#"
         INSERT INTO agent_responsibility_contracts (
             id, project_id, revision, administrator_identity_id,
-            user_identity_id, contract, contract_hash
-        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+            user_identity_id, contract, contract_hash, state
+        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft')
         "#,
     )
     .bind(responsibility_id)
@@ -403,6 +645,275 @@ pub async fn record_responsibility(
     Ok(Json(ContractRecordedResponse {
         id: responsibility_id,
         revision: request.contract.revision,
+        contract_hash_hex: hex::encode(contract_hash),
+    }))
+}
+
+/// Authoritative user-level Responsibility endpoint. The agent-scoped route
+/// remains a compatibility alias, but neither storage nor lifecycle ownership
+/// depends on an agent record.
+pub async fn record_user_responsibility(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, user_id, responsibility_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(request): Json<RecordResponsibilityRequest>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent
+        || request.contract.id != responsibility_id.into()
+        || request.contract.administrator != actor.identity_id.into()
+        || request.contract.user != user_id.into()
+    {
+        return Err(AppError::Forbidden);
+    }
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    let user_is_human_member = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM project_memberships membership
+            JOIN identities identity ON identity.id = membership.identity_id
+            WHERE membership.project_id = $1 AND membership.identity_id = $2
+              AND membership.state = 'active' AND identity.status = 'active'
+              AND identity.principal_kind = 'user'
+        )
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if !user_is_human_member {
+        return Err(AppError::Forbidden);
+    }
+    for rule in &request.contract.rules {
+        if !resource_access(
+            &state,
+            actor,
+            project_id,
+            Uuid::from(rule.scope),
+            ResourceOperation::Manage,
+        )
+        .await?
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
+    request
+        .contract
+        .validate(
+            |principal| {
+                if principal == request.contract.administrator {
+                    Some(PrincipalKind::Administrator)
+                } else if principal == request.contract.user {
+                    Some(PrincipalKind::User)
+                } else {
+                    None
+                }
+            },
+            |_, _| true,
+        )
+        .map_err(agent_validation_error)?;
+
+    let contract_json = canonical_json(&request.contract)?;
+    let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 35))")
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await?;
+    if request.contract.revision > 1 {
+        let previous_json = sqlx::query_scalar::<_, String>(
+            "SELECT contract::text FROM agent_responsibility_contracts
+             WHERE project_id = $1 AND id = $2 AND revision = $3 AND state = 'active'",
+        )
+        .bind(project_id)
+        .bind(responsibility_id)
+        .bind(to_i64(request.contract.revision - 1)?)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::Conflict)?;
+        let previous: ResponsibilityContract =
+            serde_json::from_str(&previous_json).map_err(|_| AppError::Internal)?;
+        request
+            .contract
+            .validate_revision_of(&previous)
+            .map_err(agent_validation_error)?;
+    } else if request.contract.supersedes_revision.is_some()
+        || sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM agent_responsibility_contracts
+             WHERE project_id = $1 AND user_identity_id = $2)",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_one(&mut *transaction)
+        .await?
+    {
+        return Err(AppError::Conflict);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO agent_responsibility_contracts (
+            id, project_id, revision, administrator_identity_id,
+            user_identity_id, contract, contract_hash, state
+        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft')
+        "#,
+    )
+    .bind(responsibility_id)
+    .bind(project_id)
+    .bind(to_i64(request.contract.revision)?)
+    .bind(actor.identity_id)
+    .bind(user_id)
+    .bind(&contract_json)
+    .bind(contract_hash.as_slice())
+    .execute(&mut *transaction)
+    .await?;
+    append_user_governance_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        user_id,
+        None,
+        "responsibility_drafted",
+        json!({
+            "responsibility_id": responsibility_id,
+            "revision": request.contract.revision,
+            "contract_hash": hex::encode(contract_hash),
+        }),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: responsibility_id,
+        revision: request.contract.revision,
+        contract_hash_hex: hex::encode(contract_hash),
+    }))
+}
+
+pub async fn activate_user_responsibility(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, user_id, responsibility_id, revision)): Path<(Uuid, Uuid, Uuid, u64)>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 35))")
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await?;
+    let row = sqlx::query(
+        "SELECT contract::text AS contract, contract_hash
+         FROM agent_responsibility_contracts
+         WHERE project_id = $1 AND user_identity_id = $2 AND id = $3
+           AND revision = $4 AND state = 'draft'
+         FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .bind(responsibility_id)
+    .bind(to_i64(revision)?)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let contract: ResponsibilityContract =
+        serde_json::from_str(row.try_get("contract")?).map_err(|_| AppError::Internal)?;
+    if contract.administrator != actor.identity_id.into()
+        || contract.user != user_id.into()
+        || contract.revision != revision
+    {
+        return Err(AppError::Forbidden);
+    }
+    for rule in &contract.rules {
+        if !resource_access_in_transaction(
+            &mut transaction,
+            project_id,
+            actor.identity_id,
+            Uuid::from(rule.scope),
+            ResourceOperation::Manage,
+        )
+        .await?
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
+    if revision > 1 {
+        let supersedes_revision = contract.supersedes_revision.ok_or(AppError::Conflict)?;
+        let previous_json = sqlx::query_scalar::<_, String>(
+            "SELECT contract::text FROM agent_responsibility_contracts
+             WHERE project_id = $1 AND user_identity_id = $2 AND id = $3
+               AND revision = $4 AND state = 'active'
+             FOR UPDATE",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .bind(responsibility_id)
+        .bind(to_i64(supersedes_revision)?)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::Conflict)?;
+        let previous: ResponsibilityContract =
+            serde_json::from_str(&previous_json).map_err(|_| AppError::Internal)?;
+        contract
+            .validate_revision_of(&previous)
+            .map_err(agent_validation_error)?;
+        let updated = sqlx::query(
+            "UPDATE agent_responsibility_contracts
+             SET state = 'superseded', superseded_at = clock_timestamp()
+             WHERE project_id = $1 AND user_identity_id = $2 AND id = $3
+               AND revision = $4 AND state = 'active'",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .bind(responsibility_id)
+        .bind(to_i64(supersedes_revision)?)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(AppError::Conflict);
+        }
+    } else if contract.supersedes_revision.is_some()
+        || sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM agent_responsibility_contracts
+             WHERE project_id = $1 AND user_identity_id = $2 AND state = 'active')",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_one(&mut *transaction)
+        .await?
+    {
+        return Err(AppError::Conflict);
+    }
+    let activated = sqlx::query(
+        "UPDATE agent_responsibility_contracts
+         SET state = 'active', activated_at = clock_timestamp()
+         WHERE project_id = $1 AND user_identity_id = $2 AND id = $3
+           AND revision = $4 AND state = 'draft'",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .bind(responsibility_id)
+    .bind(to_i64(revision)?)
+    .execute(&mut *transaction)
+    .await?;
+    if activated.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
+    append_user_governance_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        user_id,
+        None,
+        "responsibility_activated",
+        json!({"responsibility_id": responsibility_id, "revision": revision}),
+    )
+    .await?;
+    transaction.commit().await?;
+    let contract_hash: Vec<u8> = row.try_get("contract_hash")?;
+    Ok(Json(ContractRecordedResponse {
+        id: responsibility_id,
+        revision,
         contract_hash_hex: hex::encode(contract_hash),
     }))
 }
@@ -456,23 +967,6 @@ pub async fn record_local_goal(
     let contract_json = canonical_json(&request.contract)?;
     let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
     let mut transaction = begin(&state, actor, project_id).await?;
-    let responsibility = load_current_responsibility(
-        &mut transaction,
-        project_id,
-        Uuid::from(request.contract.controller),
-    )
-    .await?
-    .ok_or(AppError::Forbidden)?;
-    if !responsibility_operationally_covers(
-        &mut transaction,
-        project_id,
-        &responsibility,
-        &request.contract,
-    )
-    .await?
-    {
-        return Err(AppError::Forbidden);
-    }
     if request.contract.revision > 1 {
         let previous_json = sqlx::query_scalar::<_, String>(
             r#"
@@ -495,18 +989,6 @@ pub async fn record_local_goal(
             .contract
             .validate_revision_of(&previous)
             .map_err(agent_validation_error)?;
-        sqlx::query(
-            "UPDATE agent_local_goal_contracts
-             SET state = 'superseded', terminal_at = clock_timestamp()
-             WHERE project_id = $1 AND id = $2 AND revision = $3
-               AND agent_id = $4 AND state = 'active'",
-        )
-        .bind(project_id)
-        .bind(Uuid::from(request.contract.id))
-        .bind(to_i64(request.contract.revision - 1)?)
-        .bind(agent_id)
-        .execute(&mut *transaction)
-        .await?;
     } else if request.contract.supersedes_revision.is_some() {
         return Err(AppError::BadRequest(
             "first local-goal revision cannot supersede another revision",
@@ -516,8 +998,8 @@ pub async fn record_local_goal(
         r#"
         INSERT INTO agent_local_goal_contracts (
             id, project_id, agent_id, agent_identity_id,
-            controller_identity_id, revision, contract, contract_hash
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+            controller_identity_id, revision, contract, contract_hash, state
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, 'draft')
         "#,
     )
     .bind(Uuid::from(request.contract.id))
@@ -528,6 +1010,24 @@ pub async fn record_local_goal(
     .bind(to_i64(request.contract.revision)?)
     .bind(&contract_json)
     .bind(contract_hash.as_slice())
+    .execute(&mut *transaction)
+    .await?;
+    let encrypted_prompt = serialize_ciphertext(&request.contract.encrypted_prompt)?;
+    let prompt_hash: [u8; 32] = Sha256::digest(&encrypted_prompt).into();
+    sqlx::query(
+        r#"
+        INSERT INTO agent_prompt_revisions (
+            project_id, agent_id, local_goal_id, local_goal_revision,
+            encrypted_prompt, prompt_hash, state
+        ) VALUES ($1, $2, $3, $4, $5, $6, 'draft')
+        "#,
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(Uuid::from(request.contract.id))
+    .bind(to_i64(request.contract.revision)?)
+    .bind(encrypted_prompt)
+    .bind(prompt_hash.as_slice())
     .execute(&mut *transaction)
     .await?;
     append_audit(
@@ -541,6 +1041,23 @@ pub async fn record_local_goal(
             "local_goal_id": request.contract.id,
             "revision": request.contract.revision,
             "contract_hash": hex::encode(contract_hash),
+            "state": "draft",
+            "prompt_hash": hex::encode(prompt_hash),
+        }),
+    )
+    .await?;
+    append_user_governance_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        Uuid::from(request.contract.controller),
+        Some(agent_id),
+        "local_goal_drafted",
+        json!({
+            "local_goal_id": request.contract.id,
+            "revision": request.contract.revision,
+            "contract_hash": hex::encode(contract_hash),
+            "prompt_hash": hex::encode(prompt_hash),
         }),
     )
     .await?;
@@ -1082,18 +1599,19 @@ pub async fn submit_proxy_request(
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyActionClassification {
     resource_id: ResourceId,
     action: AgentActionClass,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordProxyPlanRequest {
     id: Uuid,
     invocation_id: Option<InvocationId>,
     envelope: UserProxyPlanningEnvelope,
     plan: UserProxyActionPlan,
-    action_classification: Vec<ProxyActionClassification>,
     confirmation: Option<UserProxyOutOfResponsibilityConfirmation>,
 }
 
@@ -1118,18 +1636,14 @@ pub async fn record_proxy_plan(
     {
         return Err(AppError::Forbidden);
     }
-    validate_proxy_action_classification(&request.plan, &request.action_classification)?;
-    if !request.plan.tool_invocations.is_empty() {
-        return Err(AppError::BadRequest(
-            "proxy tools require a registered deterministic security adapter",
-        ));
-    }
+    let action_classification = derive_proxy_action_classification(&request.plan)?;
+    let mut transaction = begin(&state, actor, project_id).await?;
     let mut permission_facts = HashSet::new();
     for effect in &request.plan.resource_effects {
-        if resource_access(
-            &state,
-            actor,
+        if resource_access_in_transaction(
+            &mut transaction,
             project_id,
+            actor.identity_id,
             Uuid::from(effect.resource_id),
             effect.operation,
         )
@@ -1138,7 +1652,6 @@ pub async fn record_proxy_plan(
             permission_facts.insert((effect.resource_id, effect.operation));
         }
     }
-    let mut transaction = begin(&state, actor, project_id).await?;
     let record = sqlx::query(
         r#"
         SELECT request.thread_id, request.encrypted_payload, request.submitted_at,
@@ -1178,7 +1691,7 @@ pub async fn record_proxy_plan(
         &mut transaction,
         project_id,
         actor.identity_id,
-        &request.action_classification,
+        &action_classification,
     )
     .await?;
     let execution = ProxyExecution {
@@ -1219,7 +1732,7 @@ pub async fn record_proxy_plan(
             "invocation_id": request.invocation_id,
             "envelope": request.envelope,
             "plan": request.plan,
-            "action_classification": request.action_classification,
+            "action_classification": &action_classification,
             "responsibility": responsibility.as_ref().map(|contract| (contract.id, contract.revision)),
             "confirmation": request.confirmation,
         }))?
@@ -1244,7 +1757,7 @@ pub async fn record_proxy_plan(
     .bind(request.invocation_id.map(Uuid::from))
     .bind(canonical_json(&request.envelope)?)
     .bind(canonical_json(&request.plan)?)
-    .bind(canonical_json(&request.action_classification)?)
+    .bind(canonical_json(&action_classification)?)
     .bind(
         responsibility
             .as_ref()
@@ -1272,6 +1785,513 @@ pub async fn record_proxy_plan(
         within_responsibility,
         confirmation_required: !within_responsibility,
         plan_hash_hex: hex::encode(plan_hash),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteCrossOwnerAssignmentRequest {
+    id: Uuid,
+    target_agent_id: AgentId,
+    review_task_resource_node_id: Option<ResourceId>,
+}
+
+#[derive(Serialize)]
+pub struct CrossOwnerAssignmentResponse {
+    id: Uuid,
+    route: &'static str,
+    state: &'static str,
+}
+
+pub async fn route_cross_owner_task_assignment(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, task_resource_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RouteCrossOwnerAssignmentRequest>,
+) -> Result<Json<CrossOwnerAssignmentResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let target_agent_id = Uuid::from(request.target_agent_id);
+    let mut transaction = begin(&state, actor, project_id).await?;
+    if !resource_access_in_transaction(
+        &mut transaction,
+        project_id,
+        actor.identity_id,
+        task_resource_id,
+        ResourceOperation::Manage,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    let target_row = sqlx::query(
+        r#"
+        SELECT principal_identity_id, controller_identity_id, availability,
+               controller_is_administrator,
+               responsibility_contract::text AS responsibility_contract,
+               automatic_contract::text AS automatic_contract,
+               automatic_state::text AS automatic_state,
+               automatic_local_contract::text AS automatic_local_contract,
+               automatic_work_item_id, automatic_bound_at
+        FROM sprout_private.cross_owner_routing_snapshot($1, $2, $3)
+        "#,
+    )
+    .bind(project_id)
+    .bind(task_resource_id)
+    .bind(target_agent_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let target_principal_id: Uuid = target_row.try_get("principal_identity_id")?;
+    let target_controller_id: Uuid = target_row.try_get("controller_identity_id")?;
+    if target_controller_id == actor.identity_id {
+        return Err(AppError::BadRequest(
+            "cross-owner routing requires a different target controller",
+        ));
+    }
+    let target = GovernedAgent {
+        id: request.target_agent_id,
+        principal_id: target_principal_id.into(),
+        controller_id: target_controller_id.into(),
+        project_id: project_id.into(),
+        availability: match target_row.try_get::<String, _>("availability")?.as_str() {
+            "controller_private" => AgentAvailabilityMode::ControllerPrivate,
+            "project_delegable" => AgentAvailabilityMode::ProjectDelegable,
+            _ => return Err(AppError::Internal),
+        },
+    };
+    let recorded_at = Utc::now();
+    let intent_id = Uuid::new_v4();
+    let intent = PersistedTaskIntent {
+        task: task_resource_id.into(),
+        scope: task_resource_id.into(),
+        required_actions: vec![AgentActionClass::AssignOwnTask],
+        created_by: actor.identity_id.into(),
+        recorded_at,
+    };
+
+    let mut automatic_local = None;
+    let mut automatic_provenance = None;
+    let mut automatic_facts = ContractConditionFacts::default();
+    if let (Some(contract_json), Some(state_json), Some(local_json), Some(work_item_uuid)) = (
+        target_row.try_get::<Option<String>, _>("automatic_contract")?,
+        target_row.try_get::<Option<String>, _>("automatic_state")?,
+        target_row.try_get::<Option<String>, _>("automatic_local_contract")?,
+        target_row.try_get::<Option<Uuid>, _>("automatic_work_item_id")?,
+    ) {
+        let contract = serde_json::from_str(&contract_json).map_err(|_| AppError::Internal)?;
+        let run_state: CollaborativeRunState =
+            serde_json::from_str(&state_json).map_err(|_| AppError::Internal)?;
+        let local: LocalGoalContract =
+            serde_json::from_str(&local_json).map_err(|_| AppError::Internal)?;
+        let work_item_id = work_item_uuid.into();
+        if let Some(work) = run_state.work_items.get(&work_item_id) {
+            automatic_facts = super::agent_runs::authoritative_condition_facts(
+                &mut transaction,
+                project_id,
+                &contract,
+                &run_state,
+            )
+            .await?;
+            automatic_provenance = Some(TaskObligationProvenance {
+                task: task_resource_id.into(),
+                agent: target_principal_id.into(),
+                local_revision: local.revision,
+                obligation: work.serves,
+                work_spec_id: work.work_spec_id,
+                recorded_at: target_row
+                    .try_get::<Option<DateTime<Utc>>, _>("automatic_bound_at")?
+                    .ok_or(AppError::Internal)?,
+            });
+            automatic_local = Some(local);
+        }
+    }
+
+    let active_responsibility: Option<ResponsibilityContract> = target_row
+        .try_get::<Option<String>, _>("responsibility_contract")?
+        .map(|value| serde_json::from_str(&value).map_err(|_| AppError::Internal))
+        .transpose()?;
+    let mut covered_rule_scopes = HashSet::new();
+    if let Some(responsibility) = &active_responsibility {
+        for rule in &responsibility.rules {
+            if sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM resource_closure
+                 WHERE project_id = $1 AND ancestor_id = $2 AND descendant_id = $3)",
+            )
+            .bind(project_id)
+            .bind(Uuid::from(rule.scope))
+            .bind(task_resource_id)
+            .fetch_one(&mut *transaction)
+            .await?
+            {
+                covered_rule_scopes.insert(rule.scope);
+            }
+        }
+    }
+    let automatic_route = route_cross_owner_assignment(
+        task_resource_id.into(),
+        &target,
+        CurrentLocalObligationContext {
+            active_local_goal: automatic_local.as_ref(),
+            provenance: automatic_provenance.as_ref(),
+            condition_facts: &automatic_facts,
+        },
+        Some(&intent),
+        active_responsibility.as_ref(),
+        |rule_scope, intent_scope| {
+            intent_scope == task_resource_id.into() && covered_rule_scopes.contains(&rule_scope)
+        },
+    );
+    let controller_is_administrator: bool = target_row.try_get("controller_is_administrator")?;
+    let route = if automatic_route == CrossOwnerAssignmentRoute::AutomaticFromActiveObligation {
+        automatic_route
+    } else if controller_is_administrator
+        || automatic_route == CrossOwnerAssignmentRoute::ControllerReview
+    {
+        CrossOwnerAssignmentRoute::ControllerReview
+    } else {
+        CrossOwnerAssignmentRoute::Rejected
+    };
+    let (route_name, state_name) = match route {
+        CrossOwnerAssignmentRoute::AutomaticFromActiveObligation => {
+            if request.review_task_resource_node_id.is_some() {
+                return Err(AppError::BadRequest(
+                    "automatic route cannot carry a controller review task",
+                ));
+            }
+            ("automatic_existing_obligation", "ready")
+        }
+        CrossOwnerAssignmentRoute::ControllerReview => {
+            let review_task = request
+                .review_task_resource_node_id
+                .ok_or(AppError::BadRequest(
+                    "controller review route requires an existing assigned review task",
+                ))?;
+            let valid_review = sqlx::query_scalar::<_, bool>(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM tasks task
+                    JOIN resource_nodes node
+                      ON node.project_id = task.project_id
+                     AND node.id = task.resource_node_id
+                    JOIN task_assignments assignment
+                      ON assignment.project_id = task.project_id
+                     AND assignment.task_id = task.id
+                     AND assignment.revoked_at IS NULL
+                    WHERE task.project_id = $1 AND task.resource_node_id = $2
+                      AND task.state = 'open' AND task.deleted_at IS NULL
+                      AND node.created_by_identity_id = $3
+                      AND assignment.assignee_identity_id = $4
+                )
+                "#,
+            )
+            .bind(project_id)
+            .bind(Uuid::from(review_task))
+            .bind(actor.identity_id)
+            .bind(target_controller_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !valid_review {
+                return Err(AppError::BadRequest(
+                    "controller review task is not an authoritative open assignment",
+                ));
+            }
+            ("controller_review", "pending_review")
+        }
+        CrossOwnerAssignmentRoute::Rejected => {
+            if request.review_task_resource_node_id.is_some() {
+                return Err(AppError::BadRequest(
+                    "rejected route cannot carry a review task",
+                ));
+            }
+            ("rejected", "rejected")
+        }
+    };
+    sqlx::query(
+        "INSERT INTO agent_task_intents (
+             id, project_id, task_resource_node_id, scope_resource_node_id,
+             required_actions, derived_by_identity_id, recorded_at
+         ) VALUES ($1, $2, $3, $3, $4::jsonb, $5, $6)",
+    )
+    .bind(intent_id)
+    .bind(project_id)
+    .bind(task_resource_id)
+    .bind(canonical_json(&intent.required_actions)?)
+    .bind(actor.identity_id)
+    .bind(recorded_at)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO agent_cross_owner_assignments (
+            id, project_id, task_resource_node_id, requester_identity_id,
+            target_agent_id, target_controller_identity_id, task_intent_id,
+            route, review_task_resource_node_id,
+            responsibility_id, responsibility_revision, state, requested_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9,
+            $10, $11, $12, $13
+        )
+        "#,
+    )
+    .bind(request.id)
+    .bind(project_id)
+    .bind(task_resource_id)
+    .bind(actor.identity_id)
+    .bind(target_agent_id)
+    .bind(target_controller_id)
+    .bind(intent_id)
+    .bind(route_name)
+    .bind(request.review_task_resource_node_id.map(Uuid::from))
+    .bind(
+        active_responsibility
+            .as_ref()
+            .map(|item| Uuid::from(item.id)),
+    )
+    .bind(
+        active_responsibility
+            .as_ref()
+            .map(|item| to_i64(item.revision))
+            .transpose()?,
+    )
+    .bind(state_name)
+    .bind(recorded_at)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(CrossOwnerAssignmentResponse {
+        id: request.id,
+        route: route_name,
+        state: state_name,
+    }))
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossOwnerControllerDecision {
+    Approved,
+    Rejected,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecideCrossOwnerAssignmentRequest {
+    decision: CrossOwnerControllerDecision,
+}
+
+pub async fn decide_cross_owner_task_assignment(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, assignment_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<DecideCrossOwnerAssignmentRequest>,
+) -> Result<Json<CrossOwnerAssignmentResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let row = sqlx::query(
+        "SELECT target_agent_id, target_controller_identity_id
+         FROM agent_cross_owner_assignments
+         WHERE project_id = $1 AND id = $2 AND route = 'controller_review'
+           AND state = 'pending_review' AND decision IS NULL
+         FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(assignment_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let controller_id: Uuid = row.try_get("target_controller_identity_id")?;
+    let target_agent_id: Uuid = row.try_get("target_agent_id")?;
+    let current_controller = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM governed_agents
+         WHERE project_id = $1 AND id = $2 AND controller_identity_id = $3
+           AND state = 'active')",
+    )
+    .bind(project_id)
+    .bind(target_agent_id)
+    .bind(actor.identity_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if controller_id != actor.identity_id || !current_controller {
+        return Err(AppError::Forbidden);
+    }
+    let (decision_name, state_name) = match request.decision {
+        CrossOwnerControllerDecision::Approved => ("approved", "approved_pending_mandate"),
+        CrossOwnerControllerDecision::Rejected => ("rejected", "rejected"),
+    };
+    let updated = sqlx::query(
+        "UPDATE agent_cross_owner_assignments
+         SET decision = $3, state = $4, decided_at = clock_timestamp()
+         WHERE project_id = $1 AND id = $2 AND state = 'pending_review'
+           AND decision IS NULL",
+    )
+    .bind(project_id)
+    .bind(assignment_id)
+    .bind(decision_name)
+    .bind(state_name)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
+    append_user_governance_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        controller_id,
+        Some(target_agent_id),
+        "cross_owner_decided",
+        json!({"assignment_id": assignment_id, "decision": decision_name}),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(CrossOwnerAssignmentResponse {
+        id: assignment_id,
+        route: "controller_review",
+        state: state_name,
+    }))
+}
+
+pub async fn finalize_cross_owner_task_assignment(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, assignment_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<CrossOwnerAssignmentResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let row = sqlx::query(
+        "SELECT task_resource_node_id, requester_identity_id,
+                target_agent_id, target_controller_identity_id
+         FROM agent_cross_owner_assignments
+         WHERE project_id = $1 AND id = $2 AND route = 'controller_review'
+           AND decision = 'approved' AND state = 'approved_pending_mandate'
+         FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(assignment_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let task_resource_id: Uuid = row.try_get("task_resource_node_id")?;
+    let requester_id: Uuid = row.try_get("requester_identity_id")?;
+    let target_agent_id: Uuid = row.try_get("target_agent_id")?;
+    let target_controller_id: Uuid = row.try_get("target_controller_identity_id")?;
+    if requester_id != actor.identity_id
+        || !resource_access_in_transaction(
+            &mut transaction,
+            project_id,
+            actor.identity_id,
+            task_resource_id,
+            ResourceOperation::Manage,
+        )
+        .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    let active = sqlx::query(
+        r#"
+        SELECT task_resource_node_id, task_intent_id,
+               intent_required_actions::text AS intent_required_actions,
+               intent_recorded_at, target_agent_id,
+               target_controller_identity_id, target_principal_identity_id,
+               target_availability, local_contract::text AS local_contract,
+               obligation_id, work_spec_ordinal, provenance_recorded_at,
+               exact_prompt
+        FROM sprout_private.cross_owner_active_mandate_snapshot($1, $2)
+        "#,
+    )
+    .bind(project_id)
+    .bind(assignment_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    if !active.try_get::<bool, _>("exact_prompt")? {
+        return Err(AppError::Conflict);
+    }
+    if active.try_get::<Uuid, _>("task_resource_node_id")? != task_resource_id
+        || active.try_get::<Uuid, _>("target_agent_id")? != target_agent_id
+        || active.try_get::<Uuid, _>("target_controller_identity_id")? != target_controller_id
+    {
+        return Err(AppError::Conflict);
+    }
+    let target_principal_id: Uuid = active.try_get("target_principal_identity_id")?;
+    let local: LocalGoalContract =
+        serde_json::from_str(active.try_get("local_contract")?).map_err(|_| AppError::Internal)?;
+    let required_actions: Vec<AgentActionClass> =
+        serde_json::from_str(active.try_get("intent_required_actions")?)
+            .map_err(|_| AppError::Internal)?;
+    let intent = PersistedTaskIntent {
+        task: task_resource_id.into(),
+        scope: task_resource_id.into(),
+        required_actions,
+        created_by: requester_id.into(),
+        recorded_at: active.try_get("intent_recorded_at")?,
+    };
+    let provenance = TaskObligationProvenance {
+        task: task_resource_id.into(),
+        agent: target_principal_id.into(),
+        local_revision: local.revision,
+        obligation: active.try_get("obligation_id")?,
+        work_spec_id: u64::try_from(active.try_get::<i64, _>("work_spec_ordinal")?)
+            .map_err(|_| AppError::Internal)?,
+        recorded_at: active.try_get("provenance_recorded_at")?,
+    };
+    let target = GovernedAgent {
+        id: target_agent_id.into(),
+        principal_id: target_principal_id.into(),
+        controller_id: target_controller_id.into(),
+        project_id: project_id.into(),
+        availability: match active.try_get::<String, _>("target_availability")?.as_str() {
+            "controller_private" => AgentAvailabilityMode::ControllerPrivate,
+            "project_delegable" => AgentAvailabilityMode::ProjectDelegable,
+            _ => return Err(AppError::Internal),
+        },
+    };
+    let facts = authoritative_local_condition_facts(&mut transaction, project_id, &local).await?;
+    let provenance_obligation = local
+        .contract
+        .obligations
+        .iter()
+        .find(|obligation| obligation.id == provenance.obligation)
+        .ok_or(AppError::Conflict)?;
+    if !cross_owner_condition_is_authoritative(&provenance_obligation.activation)
+        || !cross_owner_condition_is_authoritative(&provenance_obligation.required_for_completion)
+        || route_cross_owner_assignment(
+            task_resource_id.into(),
+            &target,
+            CurrentLocalObligationContext {
+                active_local_goal: Some(&local),
+                provenance: Some(&provenance),
+                condition_facts: &facts,
+            },
+            Some(&intent),
+            None,
+            |_, _| false,
+        ) != CrossOwnerAssignmentRoute::AutomaticFromActiveObligation
+    {
+        return Err(AppError::Conflict);
+    }
+    let updated = sqlx::query(
+        "UPDATE agent_cross_owner_assignments SET state = 'ready'
+         WHERE project_id = $1 AND id = $2
+           AND decision = 'approved' AND state = 'approved_pending_mandate'",
+    )
+    .bind(project_id)
+    .bind(assignment_id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
+    transaction.commit().await?;
+    Ok(Json(CrossOwnerAssignmentResponse {
+        id: assignment_id,
+        route: "controller_review",
+        state: "ready",
     }))
 }
 
@@ -2203,52 +3223,46 @@ fn info_payload_bytes(payload: &EncryptedPayload) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(&dto).map_err(|_| AppError::Internal)
 }
 
-fn validate_proxy_action_classification(
+fn derive_proxy_action_classification(
     plan: &UserProxyActionPlan,
-    classifications: &[ProxyActionClassification],
-) -> Result<(), AppError> {
-    if plan.resource_effects.len() != classifications.len()
-        || plan
-            .resource_effects
-            .iter()
-            .zip(classifications)
-            .any(|(effect, classification)| {
-                effect.resource_id != classification.resource_id
-                    || !action_matches_operation(classification.action, effect.operation)
-            })
-    {
+) -> Result<Vec<ProxyActionClassification>, AppError> {
+    // Tool calls and every required resource effect are part of the normative
+    // footprint. Until a product tool registry can deterministically map both
+    // to Responsibility action classes, accepting them would omit authority-
+    // relevant work from classification. Keep the entire tool plan closed.
+    if !plan.tool_invocations.is_empty() {
         return Err(AppError::BadRequest(
-            "proxy action classification does not match the deterministic effect footprint",
+            "proxy tool footprint has no registered deterministic responsibility classifier",
         ));
     }
-    Ok(())
-}
-
-const fn action_matches_operation(action: AgentActionClass, operation: ResourceOperation) -> bool {
-    matches!(
-        (action, operation),
-        (AgentActionClass::CreateTask, ResourceOperation::Write)
-            | (AgentActionClass::ReplaceOwnTask, ResourceOperation::Write)
-            | (AgentActionClass::DeleteOwnTask, ResourceOperation::Manage)
-            | (AgentActionClass::AssignOwnTask, ResourceOperation::Manage)
-            | (AgentActionClass::UnassignOwnTask, ResourceOperation::Manage)
-            | (
-                AgentActionClass::MarkAssignedDone,
-                ResourceOperation::CompleteAssignedTask
-            )
-            | (
-                AgentActionClass::AppendAssignedNote,
-                ResourceOperation::Write
-            )
-            | (
-                AgentActionClass::AddAssignedAttachment,
-                ResourceOperation::Write
-            )
-            | (
-                AgentActionClass::PostComment,
-                ResourceOperation::PostComment
-            )
-    )
+    plan.resource_effects
+        .iter()
+        .map(|effect| {
+            let action = match effect.operation {
+                ResourceOperation::CompleteAssignedTask => AgentActionClass::MarkAssignedDone,
+                ResourceOperation::PostComment => AgentActionClass::PostComment,
+                // Generic write/manage operations do not identify which
+                // semantic product action will be materialized. Treating a
+                // caller/model label as that missing fact would make the LLM
+                // an authority source, so unsupported footprints fail closed.
+                ResourceOperation::ViewHeader
+                | ResourceOperation::Read
+                | ResourceOperation::ReadComment
+                | ResourceOperation::EditInfo
+                | ResourceOperation::Write
+                | ResourceOperation::Manage
+                | ResourceOperation::DelegateAssignedWork => {
+                    return Err(AppError::BadRequest(
+                        "proxy effect has no registered deterministic responsibility classifier",
+                    ));
+                }
+            };
+            Ok(ProxyActionClassification {
+                resource_id: effect.resource_id,
+                action,
+            })
+        })
+        .collect()
 }
 
 async fn load_proxy_responsibility(
@@ -2265,6 +3279,7 @@ async fn load_proxy_responsibility(
         SELECT contract::text
         FROM agent_responsibility_contracts
         WHERE project_id = $1 AND user_identity_id = $2
+          AND state = 'active'
         ORDER BY revision DESC
         LIMIT 1
         "#,
@@ -2314,6 +3329,7 @@ async fn load_current_responsibility(
         SELECT contract::text
         FROM agent_responsibility_contracts
         WHERE project_id = $1 AND user_identity_id = $2
+          AND state = 'active'
         ORDER BY revision DESC
         LIMIT 1
         "#,
@@ -2355,6 +3371,167 @@ async fn responsibility_operationally_covers(
             goal_scope == local_goal.contract.scope && active_scopes.contains(&rule_scope)
         },
     ))
+}
+
+async fn authoritative_local_condition_facts(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    local: &LocalGoalContract,
+) -> Result<ContractConditionFacts, AppError> {
+    let mut tasks = HashSet::new();
+    for obligation in &local.contract.obligations {
+        collect_condition_tasks(&obligation.activation, &mut tasks);
+        collect_condition_tasks(&obligation.required_for_completion, &mut tasks);
+    }
+    let task_ids: Vec<Uuid> = tasks.iter().copied().map(Uuid::from).collect();
+    let completed_tasks = if task_ids.is_empty() {
+        HashSet::new()
+    } else {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT resource_node_id FROM tasks
+             WHERE project_id = $1 AND resource_node_id = ANY($2)
+               AND state = 'completed' AND deleted_at IS NULL",
+        )
+        .bind(project_id)
+        .bind(&task_ids)
+        .fetch_all(&mut **transaction)
+        .await?
+        .into_iter()
+        .map(ResourceId::from)
+        .collect()
+    };
+    Ok(ContractConditionFacts {
+        completed_tasks,
+        // Cross-owner mandate activation has no run-local discharge state and
+        // no typed comment/admin condition adapter. Such conditions are
+        // rejected by `cross_owner_condition_is_authoritative` below rather
+        // than interpreted from an empty client-provided fact set.
+        discharged_obligations: HashSet::new(),
+        comment_authors: HashSet::new(),
+        administrator_approvals: HashSet::new(),
+    })
+}
+
+async fn persist_cross_owner_task_provenance(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    agent_id: Uuid,
+    local: &LocalGoalContract,
+) -> Result<(), AppError> {
+    let pending = sqlx::query(
+        "SELECT task_intent_id, task_resource_node_id
+         FROM agent_cross_owner_assignments
+         WHERE project_id = $1 AND target_agent_id = $2
+           AND route = 'controller_review' AND decision = 'approved'
+           AND state = 'approved_pending_mandate'
+         FOR SHARE",
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let facts = authoritative_local_condition_facts(transaction, project_id, local).await?;
+    for row in pending {
+        let task_intent_id: Uuid = row.try_get("task_intent_id")?;
+        let task_resource_id: Uuid = row.try_get("task_resource_node_id")?;
+        let mut candidates = Vec::new();
+        for clause in &local.clauses {
+            if Uuid::from(clause.scope) != task_resource_id {
+                continue;
+            }
+            for work_spec_id in &clause.work_spec_ids {
+                let Some(work) = local
+                    .contract
+                    .work_specs
+                    .iter()
+                    .find(|work| work.id == *work_spec_id)
+                else {
+                    continue;
+                };
+                let Some(obligation) = local
+                    .contract
+                    .obligations
+                    .iter()
+                    .find(|obligation| obligation.id == work.obligation)
+                else {
+                    continue;
+                };
+                if work.owner == local.agent
+                    && work
+                        .allowed_actions
+                        .contains(&AgentActionClass::AssignOwnTask)
+                    && obligation.owner == local.agent
+                    && cross_owner_condition_is_authoritative(&obligation.activation)
+                    && cross_owner_condition_is_authoritative(&obligation.required_for_completion)
+                    && obligation.activation.holds(&facts)
+                    && obligation.required_for_completion.holds(&facts)
+                {
+                    candidates.push((obligation.id, work.id));
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        // Ambiguous or absent semantic classification remains fail-closed.
+        if let [(obligation_id, work_spec_id)] = candidates.as_slice() {
+            sqlx::query(
+                "INSERT INTO agent_task_obligation_provenance (
+                     project_id, task_intent_id, task_resource_node_id,
+                     target_agent_id, local_goal_id, local_goal_revision,
+                     obligation_id, work_spec_ordinal
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (project_id, task_intent_id) DO NOTHING",
+            )
+            .bind(project_id)
+            .bind(task_intent_id)
+            .bind(task_resource_id)
+            .bind(agent_id)
+            .bind(Uuid::from(local.id))
+            .bind(to_i64(local.revision)?)
+            .bind(*obligation_id)
+            .bind(to_i64(*work_spec_id)?)
+            .execute(&mut **transaction)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_condition_tasks(condition: &ContractCondition, tasks: &mut HashSet<ResourceId>) {
+    match condition {
+        ContractCondition::TaskDone { task } => {
+            tasks.insert(*task);
+        }
+        ContractCondition::All { left, right } | ContractCondition::Any { left, right } => {
+            collect_condition_tasks(left, tasks);
+            collect_condition_tasks(right, tasks);
+        }
+        ContractCondition::Neg { condition } => collect_condition_tasks(condition, tasks),
+        ContractCondition::Always {}
+        | ContractCondition::Never {}
+        | ContractCondition::ObligationDone { .. }
+        | ContractCondition::CommentBy { .. }
+        | ContractCondition::AdministratorApproved { .. } => {}
+    }
+}
+
+fn cross_owner_condition_is_authoritative(condition: &ContractCondition) -> bool {
+    match condition {
+        ContractCondition::Always {}
+        | ContractCondition::Never {}
+        | ContractCondition::TaskDone { .. } => true,
+        ContractCondition::All { left, right } | ContractCondition::Any { left, right } => {
+            cross_owner_condition_is_authoritative(left)
+                && cross_owner_condition_is_authoritative(right)
+        }
+        ContractCondition::Neg { condition } => cross_owner_condition_is_authoritative(condition),
+        ContractCondition::ObligationDone { .. }
+        | ContractCondition::CommentBy { .. }
+        | ContractCondition::AdministratorApproved { .. } => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2944,6 +4121,67 @@ async fn append_audit(
     .bind(project_id)
     .bind(Uuid::from(agent_id))
     .bind(invocation_id.map(Uuid::from))
+    .bind(actor.identity_id)
+    .bind(actor.device_id)
+    .bind(event_kind)
+    .bind(facts_json)
+    .bind(previous_hash)
+    .bind(entry_hash.as_slice())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn append_user_governance_audit(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: AuthSession,
+    project_id: Uuid,
+    subject_user_identity_id: Uuid,
+    agent_id: Option<Uuid>,
+    event_kind: &'static str,
+    facts: Value,
+) -> Result<(), AppError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 37))")
+        .bind(subject_user_identity_id)
+        .execute(&mut **transaction)
+        .await?;
+    let previous_hash = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT entry_hash FROM agent_user_governance_audit_log
+         WHERE project_id = $1 AND subject_user_identity_id = $2
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(subject_user_identity_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let facts_json = canonical_json(&facts)?;
+    let mut digest = Sha256::new();
+    digest.update(b"sprout-user-governance-audit-v1");
+    digest.update(project_id.as_bytes());
+    digest.update(subject_user_identity_id.as_bytes());
+    if let Some(agent_id) = agent_id {
+        digest.update(agent_id.as_bytes());
+    }
+    digest.update(actor.identity_id.as_bytes());
+    digest.update(actor.device_id.as_bytes());
+    digest.update(event_kind.as_bytes());
+    digest.update(facts_json.as_bytes());
+    if let Some(previous_hash) = &previous_hash {
+        digest.update(previous_hash);
+    }
+    let entry_hash: [u8; 32] = digest.finalize().into();
+    sqlx::query(
+        r#"
+        INSERT INTO agent_user_governance_audit_log (
+            project_id, subject_user_identity_id, agent_id,
+            actor_identity_id, actor_device_id, event_kind,
+            facts, previous_hash, entry_hash
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+        "#,
+    )
+    .bind(project_id)
+    .bind(subject_user_identity_id)
+    .bind(agent_id)
     .bind(actor.identity_id)
     .bind(actor.device_id)
     .bind(event_kind)

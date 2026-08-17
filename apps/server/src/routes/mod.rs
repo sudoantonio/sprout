@@ -87,8 +87,20 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             axum::routing::put(agents::record_responsibility),
         )
         .route(
+            "/v1/projects/{project_id}/users/{user_id}/responsibilities/{responsibility_id}",
+            axum::routing::put(agents::record_user_responsibility),
+        )
+        .route(
+            "/v1/projects/{project_id}/users/{user_id}/responsibilities/{responsibility_id}/revisions/{revision}/activate",
+            post(agents::activate_user_responsibility),
+        )
+        .route(
             "/v1/projects/{project_id}/agents/{agent_id}/local-goal",
             axum::routing::put(agents::record_local_goal),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/local-goals/{local_goal_id}/revisions/{revision}/activate",
+            post(agents::activate_local_goal),
         )
         .route(
             "/v1/projects/{project_id}/agents/{agent_id}/interrogations",
@@ -153,6 +165,18 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         .route(
             "/v1/projects/{project_id}/user-proxy/requests/{request_id}/plan",
             post(agents::record_proxy_plan),
+        )
+        .route(
+            "/v1/projects/{project_id}/tasks/{task_resource_id}/cross-owner-assignments",
+            post(agents::route_cross_owner_task_assignment),
+        )
+        .route(
+            "/v1/projects/{project_id}/cross-owner-assignments/{assignment_id}/decision",
+            post(agents::decide_cross_owner_task_assignment),
+        )
+        .route(
+            "/v1/projects/{project_id}/cross-owner-assignments/{assignment_id}/finalize",
+            post(agents::finalize_cross_owner_task_assignment),
         )
         .route(
             "/v1/projects/{project_id}/agents/{agent_id}/invocations",

@@ -81,7 +81,7 @@ classificati fail-closed sotto.
 
 ## Matrice R4 e continuità R4 → R5
 
-| Requisito Lean | Stato concrete iniziale | Gap verificato |
+| Requisito Lean | Stato concrete corrente | Gap verificato |
 | --- | --- | --- |
 | `ApiBoundary`, actor/session e `Move.agentMove` | **parziale** | Sessioni e identity agent sono distinte e validate; manca una proiezione persistente uniforme delle mosse R4 che attribuisca ogni task/comment/tool effect all'actor agentico senza confonderlo col controller. |
 | `WellFormedState`, permission e frame conditions | **parziale** | Permission/RLS/E2EE esistenti sono riusati e gli agenti non possono usare le normali mutation route. Il dispatcher copre solo Info e non rappresenta tutte le `AgentAction`; non esiste quindi ancora una verifica delle frame condition su tutto il linguaggio R4. |
@@ -92,14 +92,14 @@ classificati fail-closed sotto.
 | `Activates`, `TriggerResponsiveness` | **mancante** | Non esiste event/trigger dispatcher agentico per resource update, comment e tool terminal event. |
 | scheduler/runtime fairness R4 | **mancante** | `SKIP LOCKED ORDER BY created_at` seleziona invocation, ma non certifica agent fairness, runtime fairness, responsiveness o anti-starvation R4. |
 | `TaskCompletionCausality`, assigned-task liveness | **parziale** | Le mutation task sono auditabili nel prodotto generale; il percorso agentico non conserva un causal link R4/R5 e non implementa liveness delle task assegnate. |
-| `PromptObligationLiveness` e prompt corrente | **parziale** | Il prompt E2EE è persistito sul profilo agent e LocalGoal; non esiste activation atomica prompt/LocalGoal né lifecycle obligation/discharge. |
+| `PromptObligationLiveness` e prompt corrente | **parziale forte** | Prompt revision e LocalGoal hanno draft/active/superseded distinti e l'esatto ciphertext prompt viene attivato atomicamente con la revisione LocalGoal; obligation/discharge R4 end-to-end restano dipendenti dai materializer task/tool ancora mancanti. |
 | `UniqueCommentNotifications` | **mancante** | Dipende dal sistema commenti assente. |
 | `CorrectionProfileFromRun`, `Outcome`, strategy preference | **mancante** | Non esiste una run osservabile completa da cui derivare revision/comment counts; non va sostituita da metriche client-declared. |
 | `ProjectsToR4`, `PreservesR4ValidRun`, `ResponsibleRun` | **mancante** | Il runtime R5 corrente non costruisce una proiezione R4 completa; questa continuità deve diventare un invariante degli eventi agentici, non una dichiarazione documentale. |
 
 ## Matrice R5.30–R5.32: completion kernel
 
-| Requisito Lean | Stato concrete iniziale | Gap verificato |
+| Requisito Lean | Stato concrete corrente | Gap verificato |
 | --- | --- | --- |
 | `GoalContract` DSL completa | **coperto nel kernel persistente** | Contract schema-closed con goal/scope, condition ricorsive, obligation, dependency, WorkSpec, evidence/waiting rule e completion normalizzata; la revisione autorevole viene copiata e hashata nella run. |
 | `GoalContractWellFormed` | **coperto nel kernel domain** | Il validator chiude riferimenti, ownership, rank/bounds, entry, continuation/failure plan, evidence/waiting subject e normalizzazione prima della persistenza. |
@@ -123,7 +123,7 @@ classificati fail-closed sotto.
 
 ## Matrice R5.33–R5.34: authority e information flow
 
-| Requisito Lean | Stato concrete iniziale | Gap verificato |
+| Requisito Lean | Stato concrete corrente | Gap verificato |
 | --- | --- | --- |
 | permission engine/RLS/E2EE senza ACL parallele | **completo per le superfici esistenti** | Agent identity/device usa membership, device key, envelope e revocation esistenti. I nuovi oggetti ancora mancanti dovranno riusare lo stesso modello. |
 | actor/controller/authority separati | **parziale** | I record sono distinti e gli effect verificano actor + envelope. Manca `workAuthorityPrincipal` persistito per WorkItem e run sponsor. |
@@ -139,17 +139,17 @@ classificati fail-closed sotto.
 
 ## Matrice R5.35: responsibility e governance
 
-| Requisito Lean | Stato concrete iniziale | Gap verificato |
+| Requisito Lean | Stato concrete corrente | Gap verificato |
 | --- | --- | --- |
-| Responsibility administrator→user, user-level | **parziale/non conforme** | La chiave logica è già user-level, ma l'API è innestata sotto un agent e impone che lo user sia quel controller. Retention agent elimina responsibility col profilo. Deve diventare lifecycle user-level indipendente dagli agenti. |
-| admin-controller senza self-responsibility artificiale | **non conforme** | LocalGoal richiede sempre una responsibility corrente; va usata governance amministrativa del progetto per controller administrator. |
-| responsibility E2EE + regole strutturali minime | **parziale** | Source text è E2EE e rules server-visible. Mancano draft/active/superseded state, compilation envelope/certificate e server-derived compiler binding. |
-| revision/history/provenance responsibility | **parziale** | Revision append-only e admin/user invarianti esistono. Manca active pointer/state e isolamento retention corretto. |
-| prompt/LocalGoal draft separato dall'active | **mancante** | L'endpoint inserisce direttamente `active` e supersede la precedente revisione. |
+| Responsibility administrator→user, user-level | **coperto** | API e chiave autorevole sono project+user+revision, con un solo draft/active corrente per user. Il gate PostgreSQL same-user/two-agent prova condivisione della stessa responsibility e isolamento del purge di un agent. |
+| admin-controller senza self-responsibility artificiale | **coperto** | L'activation LocalGoal usa la membership owner/admin e il permission engine corrente; il test API dimostra activation di un agent admin-controlled con zero self-Responsibility. |
+| responsibility E2EE + regole strutturali minime | **parziale forte** | Source text resta E2EE, rules strutturali schema-closed e lifecycle draft/active/superseded sono persistiti. Compilation linguistica/certificate da runner autorizzato non ha ancora un adapter concreto e resta fail-closed, come boundary provider R5.37. |
+| revision/history/provenance responsibility | **coperto** | Revision fencing, active/draft pointer, supersession esatta e audit user-level append-only sono persistiti. L'activation risolve `contract.supersedes_revision` contro l'active esatto e poi applica il validator domain (che richiede anche contiguità); il gate stale prova rollback e audit invariato. Purge agent/resource preserva Responsibility e audit dopo rivalidazione retention; sono verdi i test agent singolo e same-user/two-agent. |
+| prompt/LocalGoal draft separato dall'active | **coperto** | Draft LocalGoal e draft prompt sono separati dagli active; retry stale fallisce senza audit parziale e la revisione precedente viene superseded soltanto usando l'esatto `supersedes_revision`. |
 | requirements/GoalContract compilation bounded | **solo domain parziale** | Envelope generico esiste; mancano PromptRequirement/binding, compilation record e validator/API specifici R5.37D. |
 | classifier deterministico LocalGoal | **non conforme** | `clauses` domain/scope arrivano dal client e sono usate nel gate; non c'è output classifier persistito/provenance. |
-| exact final prompt approval | **mancante** | Nessun record/certificate che leghi controller, draft, ciphertext esatto e local revision. |
-| activation atomica prompt + LocalGoal | **non conforme** | Viene attivato solo LocalGoal; `governed_agents.encrypted_system_prompt` non è aggiornato atomicamente. |
+| exact final prompt approval | **coperto per activation manuale** | `agent_prompt_revisions` lega ciphertext+hash, agent, LocalGoal id/revision e approver. L'activation controlla nuovamente l'esatto ciphertext/hash e persiste approver/audit nella stessa transaction; compilation/approval mediata da futuro adapter LLM non è simulata. |
+| activation atomica prompt + LocalGoal | **coperto** | Una sola transaction fenced rivalida authority/permission/responsibility e richiede `rows_affected = 1` per predecessor LocalGoal/prompt, draft LocalGoal/prompt e update dell'esatto ciphertext in `governed_agents`; ogni mismatch rollbacka anche gli audit. |
 | stessa governance alla creazione iniziale agent | **non conforme** | Provisioning crea agent/prompt prima di LocalGoal e responsibility authorization. |
 | rewrite/escalation consent | **mancante** | Nessuna draft disposition, coverage diff, consent o summary bounded. |
 | admin exception review/decision | **mancante** | Nessuna review task, editable draft, decision rejected/goal-only/goal+responsibility o final controller approval. |
@@ -163,24 +163,24 @@ classificati fail-closed sotto.
 
 ## Matrice R5.36–R5.37: proxy, interrogation, cross-owner e LLM boundary
 
-| Requisito Lean | Stato concrete iniziale | Gap verificato |
+| Requisito Lean | Stato concrete corrente | Gap verificato |
 | --- | --- | --- |
 | un solo logical UserProxy per umano, N thread | **parziale** | Unique per project/user e più thread creator-only esistono; provisioning avviene lazy e richiede ID client, non per default per ogni umano. |
 | proxy non-principal/no ACL/key/tool grant | **completo** | È mediation metadata legato all'identity utente. |
 | transcript E2EE creator-only append-only | **parziale** | Request E2EE sono creator-only; manca una sequenza message completa human/proxy/tool con previous-message e append-only transcript history. |
 | planning structured/bounded | **parziale** | Envelope e piano chiuso sono validati e persistiti; manca output/execution lifecycle completo. |
-| footprint-derived responsibility | **non conforme** | L'API accetta `action_classification` dal client. Controlla coerenza parziale con gli effect, ma non usa un classifier deterministico product-side per tool/operation→action class. |
+| footprint-derived responsibility | **parziale forte/fail-closed** | `action_classification` non è più accettato e un campo forgiato è rifiutato dallo schema. Il server deriva le classi dai `resource_effects` supportati; `tool_invocations` e operation ambigue sono incluse nella valutazione ma restano fail-closed finché manca un catalog adapter deterministico. |
 | automatic in-responsibility / one-shot outside | **parziale** | Il gate e binding esatto confirmation esistono; nessun effect proxy viene materializzato e auditato come actor=user/mediatedBy. |
 | interrogation human→agent | **parziale** | Sessione/transcript E2EE creator-only e delta vuoto esistono; è limitata al controller del target, mentre la specifica consente user/admin senza control requirement. |
 | interrogation agent→agent dedicated tool | **mancante** | Le sessioni rifiutano actor agent e non verificano ToolCall binding. |
 | answer/context/provenance read-only forte | **parziale** | Delta vuoto è validato alla creazione, ma non esiste answer submission, state-grounded context exact o causality comparison prima/dopo. |
-| TaskIntent e obligation provenance persistiti | **solo domain** | Tipi e routing puro esistono; nessuna tabella/API crea e valida i record contro task e LocalGoal attivo. |
-| cross-owner automatic/review/reject | **solo domain** | Il router puro implementa le tre classi per user-controller; manca admin-controller project governance, request validation, persistence, review task e assignment gate. |
-| prompt+LocalGoal attivi prima di assignment reviewed | **mancante** | Nessun workflow cross-owner concreto. |
+| TaskIntent e obligation provenance persistiti | **coperto per il governance contract** | `agent_task_intents` e provenance esatta TaskIntent→task→agent→LocalGoal revision→obligation→WorkSpec sono persistiti. Facts e route sono ricostruiti server-side; la provenance è append-only salvo purge retention autenticato e causalmente scoped. |
+| cross-owner automatic/review/reject | **parziale forte** | Request, route, review task, decision e stato sono persistiti; il runtime riusa `route_cross_owner_assignment` con facts autorevoli. Fuori governance è rejected, user-controller usa Responsibility e admin-controller project governance. Manca ancora il materializer che esegue l'assegnazione task dopo lo stato `ready`, quindi nessun placeholder la simula. |
+| prompt+LocalGoal attivi prima di assignment reviewed | **parziale forte/fail-closed** | Controller approval produce solo `approved_pending_mandate`. `ready` richiede exact active prompt+LocalGoal e provenance della specifica TaskIntent nella obligation/WorkSpec attiva; un'altra task con `AssignOwnTask` non basta. L'effetto assignment resta indisponibile finché manca il materializer autorevole. |
 | superfici LLM structured R5.37 | **parziale** | Kind/envelope generico schema-closed esiste. Mancano envelope/output specifici persistiti per requirements, responsibility compilation, TaskIntent, summaries e interrogation answer. |
 | no placeholder/provider permissivo | **completo** | I path senza adapter falliscono chiusi. |
 | no model memory | **parziale forte** | Non esiste store cognitivo parallelo; invocation source correnti persistite e rivalidate. Manca una attestazione dell'adapter runner che exposure reale = source dichiarate e ricostruzione per tutte le future superfici. |
-| operational histories append-only | **solo domain/parziale DB** | Audit agent è append-only; `SemanticOperationalState` non include transcript e i task intent/provenance non sono persistiti. |
+| operational histories append-only | **parziale forte** | Audit agent e user-governance, TaskIntent e obligation provenance sono persistiti; provenance e audit rifiutano mutation dirette. Il DELETE provenance è ammesso solo dal retention workflow rivalidato sul subject esatto. Transcript/message history completa e materializer R4 restano gap. |
 | schema server-visible chiuso/no plaintext annidato | **parziale forte** | I tipi principali usano `deny_unknown_fields` e test negativi ricorsivi esistono. Alcuni tipi (`ResourceEffect`, proxy structs, source) non hanno schema chiuso uniforme; ogni nuovo tipo va chiuso e sottoposto a test ricorsivo. |
 
 ## Boundary realmente esterne
