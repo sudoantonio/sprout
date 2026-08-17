@@ -197,7 +197,7 @@ pub async fn activate_local_goal(
     let row = sqlx::query(
         r#"
         SELECT local.contract::text AS contract, local.contract_hash,
-               prompt.encrypted_prompt, prompt.prompt_hash
+               prompt.draft_id, prompt.encrypted_prompt, prompt.prompt_hash
         FROM agent_local_goal_contracts local
         JOIN agent_prompt_revisions prompt
           ON prompt.project_id = local.project_id
@@ -230,6 +230,7 @@ pub async fn activate_local_goal(
     let prompt_bytes = serialize_ciphertext(&contract.encrypted_prompt)?;
     let stored_prompt: Vec<u8> = row.try_get("encrypted_prompt")?;
     let stored_prompt_hash: Vec<u8> = row.try_get("prompt_hash")?;
+    let prompt_draft_id: Uuid = row.try_get("draft_id")?;
     let expected_prompt_hash: [u8; 32] = Sha256::digest(&prompt_bytes).into();
     if stored_prompt != prompt_bytes || stored_prompt_hash != expected_prompt_hash {
         return Err(AppError::Conflict);
@@ -375,6 +376,24 @@ pub async fn activate_local_goal(
     if updated_prompt.rows_affected() != 1 {
         return Err(AppError::Conflict);
     }
+    let final_approval = sqlx::query(
+        "INSERT INTO agent_prompt_final_approvals (
+             project_id, draft_id, agent_id, controller_identity_id,
+             local_goal_id, local_goal_revision, prompt_hash
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(project_id)
+    .bind(prompt_draft_id)
+    .bind(agent_id)
+    .bind(actor.identity_id)
+    .bind(local_goal_id)
+    .bind(to_i64(revision)?)
+    .bind(expected_prompt_hash.as_slice())
+    .execute(&mut *transaction)
+    .await?;
+    if final_approval.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
     persist_cross_owner_task_provenance(&mut transaction, project_id, agent_id, &contract).await?;
     append_audit(
         &mut transaction,
@@ -387,6 +406,7 @@ pub async fn activate_local_goal(
             "local_goal_id": local_goal_id,
             "revision": revision,
             "state": "active",
+            "prompt_draft_id": prompt_draft_id,
             "prompt_hash": hex::encode(expected_prompt_hash),
             "governance": if admin_governed { "project_administrator" } else { "responsibility" },
         }),
@@ -402,6 +422,7 @@ pub async fn activate_local_goal(
         json!({
             "local_goal_id": local_goal_id,
             "revision": revision,
+            "prompt_draft_id": prompt_draft_id,
             "prompt_hash": hex::encode(expected_prompt_hash),
             "governance": if admin_governed { "project_administrator" } else { "responsibility" },
         }),
@@ -2292,6 +2313,270 @@ pub async fn finalize_cross_owner_task_assignment(
         id: assignment_id,
         route: "controller_review",
         state: "ready",
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializeCrossOwnerAssignmentRequest {
+    effect_id: Uuid,
+    task_assignment_id: Uuid,
+    idempotency_key: Uuid,
+    encrypted_assignment_payload_b64: String,
+}
+
+#[derive(Serialize)]
+pub struct MaterializeCrossOwnerAssignmentResponse {
+    cross_owner_assignment_id: Uuid,
+    effect_id: Uuid,
+    task_assignment_id: Uuid,
+    task_id: Uuid,
+    assignee_identity_id: Uuid,
+    replayed: bool,
+}
+
+pub async fn materialize_cross_owner_task_assignment(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, assignment_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<MaterializeCrossOwnerAssignmentRequest>,
+) -> Result<Json<MaterializeCrossOwnerAssignmentResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let encrypted_payload = super::assignments::decode(&request.encrypted_assignment_payload_b64)?;
+    if encrypted_payload.is_empty() {
+        return Err(AppError::BadRequest(
+            "encrypted assignment payload is empty",
+        ));
+    }
+    let request_hash: [u8; 32] = Sha256::digest(
+        canonical_json(&json!({
+            "assignment_id": assignment_id,
+            "effect_id": request.effect_id,
+            "task_assignment_id": request.task_assignment_id,
+            "idempotency_key": request.idempotency_key,
+            "encrypted_assignment_payload_b64": request.encrypted_assignment_payload_b64,
+        }))?
+        .as_bytes(),
+    )
+    .into();
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 37))")
+        .bind(assignment_id)
+        .execute(&mut *transaction)
+        .await?;
+    if let Some(existing) = sqlx::query(
+        "SELECT id, task_assignment_id, task_id, assignee_identity_id, request_hash
+         FROM agent_cross_owner_assignment_effects
+         WHERE project_id = $1 AND cross_owner_assignment_id = $2",
+    )
+    .bind(project_id)
+    .bind(assignment_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    {
+        let stored_hash: Vec<u8> = existing.try_get("request_hash")?;
+        if stored_hash != request_hash {
+            return Err(AppError::Conflict);
+        }
+        transaction.commit().await?;
+        return Ok(Json(MaterializeCrossOwnerAssignmentResponse {
+            cross_owner_assignment_id: assignment_id,
+            effect_id: existing.try_get("id")?,
+            task_assignment_id: existing.try_get("task_assignment_id")?,
+            task_id: existing.try_get("task_id")?,
+            assignee_identity_id: existing.try_get("assignee_identity_id")?,
+            replayed: true,
+        }));
+    }
+    let routed_task_resource_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT task_resource_node_id
+         FROM agent_cross_owner_assignments
+         WHERE project_id = $1 AND id = $2
+           AND requester_identity_id = $3 AND state = 'ready'
+         FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(assignment_id)
+    .bind(actor.identity_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    if !resource_access_in_transaction(
+        &mut transaction,
+        project_id,
+        actor.identity_id,
+        routed_task_resource_id,
+        ResourceOperation::Manage,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    let row = sqlx::query(
+        r#"
+        SELECT task_resource_node_id, task_id,
+               task_intent_id, intent_required_actions::text AS intent_required_actions,
+               intent_recorded_at, target_agent_id, target_controller_identity_id,
+               target_principal_identity_id, target_availability,
+               local_contract::text AS local_contract, obligation_id,
+               work_spec_ordinal, provenance_recorded_at, exact_prompt
+        FROM sprout_private.cross_owner_materialization_snapshot($1, $2)
+        "#,
+    )
+    .bind(project_id)
+    .bind(assignment_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    if !row.try_get::<bool, _>("exact_prompt")? {
+        return Err(AppError::Conflict);
+    }
+    let task_resource_id: Uuid = row.try_get("task_resource_node_id")?;
+    let task_id: Uuid = row.try_get("task_id")?;
+    let task_intent_id: Uuid = row.try_get("task_intent_id")?;
+    let target_agent_id: Uuid = row.try_get("target_agent_id")?;
+    let target_controller_id: Uuid = row.try_get("target_controller_identity_id")?;
+    let target_principal_id: Uuid = row.try_get("target_principal_identity_id")?;
+    if task_resource_id != routed_task_resource_id {
+        return Err(AppError::Conflict);
+    }
+    let local: LocalGoalContract =
+        serde_json::from_str(row.try_get("local_contract")?).map_err(|_| AppError::Internal)?;
+    let intent = PersistedTaskIntent {
+        task: task_resource_id.into(),
+        scope: task_resource_id.into(),
+        required_actions: serde_json::from_str(row.try_get("intent_required_actions")?)
+            .map_err(|_| AppError::Internal)?,
+        created_by: actor.identity_id.into(),
+        recorded_at: row.try_get("intent_recorded_at")?,
+    };
+    let provenance = TaskObligationProvenance {
+        task: task_resource_id.into(),
+        agent: target_principal_id.into(),
+        local_revision: local.revision,
+        obligation: row.try_get("obligation_id")?,
+        work_spec_id: u64::try_from(row.try_get::<i64, _>("work_spec_ordinal")?)
+            .map_err(|_| AppError::Internal)?,
+        recorded_at: row.try_get("provenance_recorded_at")?,
+    };
+    let target = GovernedAgent {
+        id: target_agent_id.into(),
+        principal_id: target_principal_id.into(),
+        controller_id: target_controller_id.into(),
+        project_id: project_id.into(),
+        availability: match row.try_get::<String, _>("target_availability")?.as_str() {
+            "controller_private" => AgentAvailabilityMode::ControllerPrivate,
+            "project_delegable" => AgentAvailabilityMode::ProjectDelegable,
+            _ => return Err(AppError::Internal),
+        },
+    };
+    let facts = authoritative_local_condition_facts(&mut transaction, project_id, &local).await?;
+    if route_cross_owner_assignment(
+        task_resource_id.into(),
+        &target,
+        CurrentLocalObligationContext {
+            active_local_goal: Some(&local),
+            provenance: Some(&provenance),
+            condition_facts: &facts,
+        },
+        Some(&intent),
+        None,
+        |_, _| false,
+    ) != CrossOwnerAssignmentRoute::AutomaticFromActiveObligation
+    {
+        return Err(AppError::Conflict);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO task_assignments (
+            id, project_id, task_id, assignee_identity_id,
+            assigned_by_identity_id, encrypted_payload, permission_root_grant_id,
+            permission_managed_by_assignment
+        ) VALUES ($1, $2, $3, $4, $5, $6, $1, false)
+        "#,
+    )
+    .bind(request.task_assignment_id)
+    .bind(project_id)
+    .bind(task_id)
+    .bind(target_principal_id)
+    .bind(actor.identity_id)
+    .bind(&encrypted_payload)
+    .execute(&mut *transaction)
+    .await?;
+    let applied_at = Utc::now();
+    let provenance_hash = Sha256::digest(
+        canonical_json(&json!({
+            "project_id": project_id,
+            "cross_owner_assignment_id": assignment_id,
+            "task_intent_id": task_intent_id,
+            "task_resource_node_id": task_resource_id,
+            "task_id": task_id,
+            "task_assignment_id": request.task_assignment_id,
+            "target_agent_id": target_agent_id,
+            "assignee_identity_id": target_principal_id,
+            "materialized_by_identity_id": actor.identity_id,
+            "applied_at": applied_at,
+        }))?
+        .as_bytes(),
+    );
+    sqlx::query(
+        r#"
+        INSERT INTO agent_cross_owner_assignment_effects (
+            id, project_id, cross_owner_assignment_id, task_intent_id,
+            task_resource_node_id, task_id, task_assignment_id,
+            target_agent_id, assignee_identity_id,
+            materialized_by_identity_id, materialized_by_device_id,
+            idempotency_key, request_hash, provenance_hash, applied_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9,
+            $10, $11, $12, $13, $14, $15
+        )
+        "#,
+    )
+    .bind(request.effect_id)
+    .bind(project_id)
+    .bind(assignment_id)
+    .bind(task_intent_id)
+    .bind(task_resource_id)
+    .bind(task_id)
+    .bind(request.task_assignment_id)
+    .bind(target_agent_id)
+    .bind(target_principal_id)
+    .bind(actor.identity_id)
+    .bind(actor.device_id)
+    .bind(request.idempotency_key)
+    .bind(request_hash.as_slice())
+    .bind(provenance_hash.as_slice())
+    .bind(applied_at)
+    .execute(&mut *transaction)
+    .await?;
+    append_user_governance_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        target_controller_id,
+        Some(target_agent_id),
+        "cross_owner_materialized",
+        json!({
+            "cross_owner_assignment_id": assignment_id,
+            "effect_id": request.effect_id,
+            "task_intent_id": task_intent_id,
+            "task_assignment_id": request.task_assignment_id,
+            "task_resource_node_id": task_resource_id,
+            "provenance_hash": hex::encode(provenance_hash),
+        }),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(MaterializeCrossOwnerAssignmentResponse {
+        cross_owner_assignment_id: assignment_id,
+        effect_id: request.effect_id,
+        task_assignment_id: request.task_assignment_id,
+        task_id,
+        assignee_identity_id: target_principal_id,
+        replayed: false,
     }))
 }
 

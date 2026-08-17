@@ -2103,7 +2103,7 @@ async fn insert_task_row(
         .await?)
 }
 
-async fn insert_outbox(
+pub(crate) async fn insert_outbox(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     aggregate_kind: &str,
@@ -2579,7 +2579,7 @@ fn parse_task_kind(kind: &str) -> Result<TaskKindDto, AppError> {
     }
 }
 
-fn opaque_payload(payload: &EncryptedPayloadDto) -> Result<Vec<u8>, AppError> {
+pub(crate) fn opaque_payload(payload: &EncryptedPayloadDto) -> Result<Vec<u8>, AppError> {
     if payload.version == 0
         || payload.algorithm.trim().is_empty()
         || payload.key_id.trim().is_empty()

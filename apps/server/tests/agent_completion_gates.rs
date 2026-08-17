@@ -931,6 +931,407 @@ async fn bind_claim_to_task_product(
 
 #[tokio::test]
 #[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
+    let fixture = fixture().await;
+    let agent = &fixture.agents[0];
+    let bound_task = create_open_task(&fixture, agent).await;
+    let unrelated_task = create_open_task(&fixture, agent).await;
+    let obligation = Uuid::new_v4();
+    let mut contract = goal_contract(
+        fixture.scope_resource_id,
+        &[(
+            agent.identity_id,
+            obligation,
+            1,
+            json!({ "kind": "always" }),
+            true,
+            vec![],
+            0,
+            "task_action",
+        )],
+    );
+    contract["work_specs"][0]["allowed_actions"] = json!(["mark_assigned_done"]);
+    let local_goal_id = insert_local_goal(&fixture, agent, contract).await;
+    let task_provenance_id = Uuid::new_v4();
+    let mut provenance = fixture.pool.begin().await.expect("begin causal provenance");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *provenance)
+        .await
+        .expect("disable RLS for causal provenance fixture");
+    sqlx::query(
+        r#"
+        INSERT INTO agent_task_obligation_provenance (
+            id, project_id, task_intent_id, task_resource_node_id,
+            target_agent_id, local_goal_id, local_goal_revision,
+            obligation_id, work_spec_ordinal
+        ) VALUES ($1, $2, NULL, $3, $4, $5, 1, $6, 1)
+        "#,
+    )
+    .bind(task_provenance_id)
+    .bind(fixture.project_id)
+    .bind(bound_task.resource_id)
+    .bind(agent.agent_id)
+    .bind(local_goal_id)
+    .bind(obligation)
+    .execute(&mut *provenance)
+    .await
+    .expect("insert generic task-obligation provenance");
+    provenance
+        .commit()
+        .await
+        .expect("commit generic causal provenance");
+
+    let app = app(&fixture, Duration::from_secs(300));
+    let (run_id, _) = create_run(&app, &fixture, "local_goal", local_goal_id).await;
+    let work_claim = claim(&app, &fixture, run_id, agent).await;
+    let claim_id: Uuid = work_claim["id"]
+        .as_str()
+        .expect("claim id")
+        .parse()
+        .expect("claim UUID");
+    let work_item_id: Uuid = work_claim["work"]
+        .as_str()
+        .expect("work item id")
+        .parse()
+        .expect("work UUID");
+
+    let unrelated_completion = complete_task_event(&fixture, agent, &unrelated_task).await;
+    let (status, _) = succeed(
+        &app,
+        &fixture,
+        run_id,
+        agent,
+        claim_id,
+        Some(unrelated_completion),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "same agent/scope/time is not causal provenance"
+    );
+
+    let actor_device_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT device_id FROM agent_runners
+         WHERE project_id = $1 AND agent_id = $2 AND state = 'active'",
+    )
+    .bind(fixture.project_id)
+    .bind(agent.agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load active runner device");
+    for (case_name, after_expiry) in [("equal", false), ("after", true)] {
+        let completion_id = Uuid::new_v4();
+        let effect_id = Uuid::new_v4();
+        let mut boundary = fixture
+            .pool
+            .begin()
+            .await
+            .expect("begin lease boundary gate");
+        sqlx::query("SET LOCAL row_security = off")
+            .execute(&mut *boundary)
+            .await
+            .expect("disable RLS for lease boundary gate");
+        sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+            .execute(&mut *boundary)
+            .await
+            .expect("defer product completion consistency");
+        let expires_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT clock_timestamp() + interval '1 minute'",
+        )
+        .fetch_one(&mut *boundary)
+        .await
+        .expect("choose exact lease boundary");
+        let applied_at = if after_expiry {
+            expires_at + chrono::Duration::microseconds(1)
+        } else {
+            expires_at
+        };
+        sqlx::query(
+            "UPDATE agent_run_claim_leases SET expires_at = $3
+             WHERE project_id = $1 AND id = $2",
+        )
+        .bind(fixture.project_id)
+        .bind(claim_id)
+        .bind(expires_at)
+        .execute(&mut *boundary)
+        .await
+        .expect("set exact lease boundary");
+        sqlx::query(
+            r#"
+            INSERT INTO task_completions (
+                id, project_id, task_id, assignment_id,
+                assignee_identity_id, recorded_by_identity_id,
+                occurrence_key, encrypted_payload, completed_at
+            ) VALUES ($1, $2, $3, $4, $5, $5, $1, decode('04', 'hex'), $6)
+            "#,
+        )
+        .bind(completion_id)
+        .bind(fixture.project_id)
+        .bind(bound_task.task_id)
+        .bind(bound_task.assignment_id)
+        .bind(agent.identity_id)
+        .bind(applied_at)
+        .execute(&mut *boundary)
+        .await
+        .expect("stage boundary task completion");
+        sqlx::query(
+            "UPDATE tasks
+             SET state = 'completed', completed_by_identity_id = $3,
+                 completed_at = $4, payload_version = payload_version + 1
+             WHERE project_id = $1 AND id = $2 AND state = 'open'",
+        )
+        .bind(fixture.project_id)
+        .bind(bound_task.task_id)
+        .bind(agent.identity_id)
+        .bind(applied_at)
+        .execute(&mut *boundary)
+        .await
+        .expect("stage boundary task state");
+        let rejected = sqlx::query(
+            r#"
+            INSERT INTO agent_run_task_effects (
+                id, project_id, run_id, work_item_id, claim_id, attempt,
+                task_provenance_id, task_intent_id, task_resource_node_id, task_id,
+                task_assignment_id, task_completion_id, target_agent_id,
+                cross_owner_effect_id, actor_identity_id, actor_device_id,
+                idempotency_key, request_hash, provenance_hash, applied_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, NULL, $8, $9,
+                $10, $11, $12, NULL, $13, $14, $15,
+                decode(repeat('01', 32), 'hex'),
+                decode(repeat('02', 32), 'hex'), $16
+            )
+            "#,
+        )
+        .bind(effect_id)
+        .bind(fixture.project_id)
+        .bind(run_id)
+        .bind(work_item_id)
+        .bind(claim_id)
+        .bind(work_claim["attempt"].as_u64().expect("claim attempt") as i32)
+        .bind(task_provenance_id)
+        .bind(bound_task.resource_id)
+        .bind(bound_task.task_id)
+        .bind(bound_task.assignment_id)
+        .bind(completion_id)
+        .bind(agent.agent_id)
+        .bind(agent.identity_id)
+        .bind(actor_device_id)
+        .bind(Uuid::new_v4())
+        .bind(applied_at)
+        .execute(&mut *boundary)
+        .await
+        .expect_err("effect at or after lease expiry must fail closed");
+        assert_eq!(
+            rejected.as_database_error().and_then(|error| error.code()),
+            Some(std::borrow::Cow::Borrowed("55000")),
+            "unexpected SQLSTATE for {case_name} boundary"
+        );
+        boundary
+            .rollback()
+            .await
+            .expect("rollback rejected boundary effect atomically");
+
+        let task_state = sqlx::query_as::<_, (String, Option<Uuid>)>(
+            "SELECT state, completed_by_identity_id FROM tasks
+             WHERE project_id = $1 AND id = $2",
+        )
+        .bind(fixture.project_id)
+        .bind(bound_task.task_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("verify boundary task rollback");
+        assert_eq!(task_state, ("open".to_owned(), None));
+        let completion_residue = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM task_completions
+             WHERE project_id = $1 AND id = $2",
+        )
+        .bind(fixture.project_id)
+        .bind(completion_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count rejected completion residue");
+        let effect_residue = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_run_task_effects
+             WHERE project_id = $1 AND id = $2",
+        )
+        .bind(fixture.project_id)
+        .bind(effect_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count rejected effect residue");
+        let outcome_residue = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_run_work_outcomes
+             WHERE project_id = $1 AND run_id = $2 AND work_item_id = $3",
+        )
+        .bind(fixture.project_id)
+        .bind(run_id)
+        .bind(work_item_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count rejected outcome residue");
+        let evidence_residue = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_run_evidence_provenance
+             WHERE project_id = $1 AND run_id = $2 AND work_item_id = $3",
+        )
+        .bind(fixture.project_id)
+        .bind(run_id)
+        .bind(work_item_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count rejected evidence residue");
+        assert_eq!(completion_residue, 0, "{case_name} completion residue");
+        assert_eq!(effect_residue, 0, "{case_name} effect residue");
+        assert_eq!(outcome_residue, 0, "{case_name} outcome residue");
+        assert_eq!(evidence_residue, 0, "{case_name} evidence residue");
+        let terminal_audit = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_run_transitions
+             WHERE project_id = $1 AND run_id = $2
+               AND transition_kind = 'work_succeeded'",
+        )
+        .bind(fixture.project_id)
+        .bind(run_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count rejected boundary terminal audit");
+        assert_eq!(
+            terminal_audit, 0,
+            "{case_name} boundary left terminal audit"
+        );
+    }
+
+    let effect_id = Uuid::new_v4();
+    let completion_id = Uuid::new_v4();
+    let idempotency_key = Uuid::new_v4();
+    let body = json!({
+        "effect_id": effect_id,
+        "completion_id": completion_id,
+        "expected_payload_version": 1,
+        "encrypted_completion": {
+            "version": 1,
+            "algorithm": "aes-256-gcm",
+            "key_id": "causal-completion-key",
+            "nonce_b64": "AQEBAQEBAQEBAQEB",
+            "ciphertext_b64": "AgM="
+        },
+        "idempotency_key": idempotency_key
+    });
+    let endpoint = format!(
+        "/v1/projects/{}/agent-runs/{run_id}/claims/{claim_id}/materialize-task-completion",
+        fixture.project_id
+    );
+    let (status, materialized) = request_json(
+        app.clone(),
+        Method::POST,
+        endpoint.clone(),
+        &agent.token,
+        body.clone(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "materialize causal task effect: {materialized}"
+    );
+    assert_eq!(materialized["replayed"], false);
+    assert_eq!(
+        materialized["state"]["work_items"][work_item_id.to_string()]["status"],
+        "succeeded"
+    );
+
+    let (status, replayed) = request_json(
+        app.clone(),
+        Method::POST,
+        endpoint.clone(),
+        &agent.token,
+        body.clone(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "replay causal task effect: {replayed}"
+    );
+    assert_eq!(replayed["replayed"], true);
+    let mut mismatched = body;
+    mismatched["encrypted_completion"]["ciphertext_b64"] = json!("BAU=");
+    let (status, _) = request_json(
+        app.clone(),
+        Method::POST,
+        endpoint,
+        &agent.token,
+        mismatched,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, evidenced) = request_json(
+        app,
+        Method::POST,
+        format!(
+            "/v1/projects/{}/agent-runs/{run_id}/evidence",
+            fixture.project_id
+        ),
+        &agent.token,
+        json!({
+            "id": Uuid::new_v4(),
+            "rule_id": 1,
+            "work_item_id": work_item_id,
+            "source": { "kind": "task_completion", "id": completion_id }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "accept causal evidence: {evidenced}"
+    );
+    assert_eq!(
+        evidenced["state"]["obligations"][obligation.to_string()]["status"],
+        "discharged"
+    );
+
+    let effect = sqlx::query(
+        "SELECT effect.task_resource_node_id, effect.task_completion_id,
+                effect.cross_owner_effect_id, effect.applied_at, claim.expires_at
+         FROM agent_run_task_effects effect
+         JOIN agent_run_claim_leases claim
+           ON claim.project_id = effect.project_id AND claim.id = effect.claim_id
+         WHERE effect.project_id = $1 AND effect.id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(effect_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load generic task effect certificate");
+    assert_eq!(
+        effect.try_get::<Uuid, _>("task_resource_node_id").unwrap(),
+        bound_task.resource_id
+    );
+    assert_eq!(
+        effect.try_get::<Uuid, _>("task_completion_id").unwrap(),
+        completion_id
+    );
+    assert_eq!(
+        effect
+            .try_get::<Option<Uuid>, _>("cross_owner_effect_id")
+            .unwrap(),
+        None
+    );
+    assert!(
+        effect
+            .try_get::<chrono::DateTime<chrono::Utc>, _>("applied_at")
+            .unwrap()
+            < effect
+                .try_get::<chrono::DateTime<chrono::Utc>, _>("expires_at")
+                .unwrap(),
+        "accepted effect must be strictly before claim expiry"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
 async fn restart_reload_preserves_canonical_projection_and_history() {
     let fixture = fixture().await;
     let trigger_task = create_open_task(&fixture, &fixture.agents[0]).await;

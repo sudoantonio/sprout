@@ -135,6 +135,10 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             post(agent_runs::succeed),
         )
         .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/claims/{claim_id}/materialize-task-completion",
+            post(agent_runs::materialize_task_completion),
+        )
+        .route(
             "/v1/projects/{project_id}/agent-runs/{run_id}/claims/{claim_id}/fail",
             post(agent_runs::fail),
         )
@@ -177,6 +181,10 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         .route(
             "/v1/projects/{project_id}/cross-owner-assignments/{assignment_id}/finalize",
             post(agents::finalize_cross_owner_task_assignment),
+        )
+        .route(
+            "/v1/projects/{project_id}/cross-owner-assignments/{assignment_id}/materialize",
+            post(agents::materialize_cross_owner_task_assignment),
         )
         .route(
             "/v1/projects/{project_id}/agents/{agent_id}/invocations",

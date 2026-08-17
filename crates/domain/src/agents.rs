@@ -3244,22 +3244,22 @@ pub struct CurrentLocalObligationContext<'a> {
     pub condition_facts: &'a ContractConditionFacts,
 }
 
-/// Cross-owner routing never treats a linguistic label as authority. Exact
-/// active obligation provenance enables the automatic route; otherwise only a
-/// persisted intent covered by the target controller's responsibility can
-/// open a review. Everything else is rejected.
-pub fn route_cross_owner_assignment(
+/// Exact product provenance for a task materialized from a currently required
+/// LocalGoal obligation. This is independent of how the task was routed or
+/// assigned; cross-owner governance is only one possible origin.
+#[must_use]
+pub fn task_obligation_provenance_valid_at(
     task: ResourceId,
     target_agent: &GovernedAgent,
     local_obligation: CurrentLocalObligationContext<'_>,
-    intent: Option<&PersistedTaskIntent>,
-    controller_responsibility: Option<&ResponsibilityContract>,
-    resource_within_scope: impl Fn(ResourceId, ResourceId) -> bool,
-) -> CrossOwnerAssignmentRoute {
-    if let (Some(local), Some(provenance)) = (
+) -> bool {
+    let (Some(local), Some(provenance)) = (
         local_obligation.active_local_goal,
         local_obligation.provenance,
-    ) && provenance.task == task
+    ) else {
+        return false;
+    };
+    provenance.task == task
         && provenance.agent == target_agent.principal_id
         && provenance.local_revision == local.revision
         && local.contract.obligations.iter().any(|obligation| {
@@ -3277,7 +3277,21 @@ pub fn route_cross_owner_assignment(
                 && work.obligation == provenance.obligation
                 && work.owner == target_agent.principal_id
         })
-    {
+}
+
+/// Cross-owner routing never treats a linguistic label as authority. Exact
+/// active obligation provenance enables the automatic route; otherwise only a
+/// persisted intent covered by the target controller's responsibility can
+/// open a review. Everything else is rejected.
+pub fn route_cross_owner_assignment(
+    task: ResourceId,
+    target_agent: &GovernedAgent,
+    local_obligation: CurrentLocalObligationContext<'_>,
+    intent: Option<&PersistedTaskIntent>,
+    controller_responsibility: Option<&ResponsibilityContract>,
+    resource_within_scope: impl Fn(ResourceId, ResourceId) -> bool,
+) -> CrossOwnerAssignmentRoute {
+    if task_obligation_provenance_valid_at(task, target_agent, local_obligation) {
         return CrossOwnerAssignmentRoute::AutomaticFromActiveObligation;
     }
 

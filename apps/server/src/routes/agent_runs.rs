@@ -7,13 +7,16 @@ use axum::{
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sprout_api_contract::EncryptedPayloadDto;
 use sprout_domain::{
-    BlockScope, BlockerId, BlockerResolutionFacts, BlockerResolutionObservation, BlockerStatus,
-    ClaimId, CollaborativeRunState, CollaborativeRunStatus, ContractCondition,
-    ContractConditionFacts, ContractEvidenceSubject, EvidenceId, EvidenceKind, EvidenceRecord,
-    EvidenceSubject, EvidenceVerificationMode, ExternalBlockerFacts, GlobalContractCandidate,
-    GoalContract, GoalStatus, LocalGoalContract, ObservedTerminalOutcome, ResourceId, RunId,
-    UserId, WaitingCondition, WorkClaim, WorkItemId, WorkKind,
+    AgentActionClass, AgentAvailabilityMode, BlockScope, BlockerId, BlockerResolutionFacts,
+    BlockerResolutionObservation, BlockerStatus, ClaimId, CollaborativeRunState,
+    CollaborativeRunStatus, ContractCondition, ContractConditionFacts, ContractEvidenceSubject,
+    CurrentLocalObligationContext, EvidenceId, EvidenceKind, EvidenceRecord, EvidenceSubject,
+    EvidenceVerificationMode, ExternalBlockerFacts, GlobalContractCandidate, GoalContract,
+    GoalStatus, GovernedAgent, LocalGoalContract, ObservedTerminalOutcome, ResourceId, RunId,
+    TaskObligationProvenance, UserId, WaitingCondition, WorkClaim, WorkItemId, WorkKind,
+    task_obligation_provenance_valid_at,
 };
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -51,6 +54,26 @@ pub struct EmptyIntent {}
 #[serde(deny_unknown_fields)]
 pub struct SucceedWorkRequest {
     outcome: Option<WorkOutcomeReference>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializeTaskCompletionRequest {
+    effect_id: Uuid,
+    completion_id: Uuid,
+    expected_payload_version: u64,
+    encrypted_completion: EncryptedPayloadDto,
+    idempotency_key: Uuid,
+}
+
+#[derive(Serialize)]
+pub struct MaterializeTaskCompletionResponse {
+    effect_id: Uuid,
+    completion_id: Uuid,
+    replayed: bool,
+    run_id: RunId,
+    state_version: u64,
+    state: CollaborativeRunState,
 }
 
 #[derive(Deserialize)]
@@ -444,6 +467,325 @@ pub async fn succeed(
         request.outcome,
     )
     .await
+}
+
+pub async fn materialize_task_completion(
+    State(app): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, run_id, claim_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(request): Json<MaterializeTaskCompletionRequest>,
+) -> Result<Json<MaterializeTaskCompletionResponse>, AppError> {
+    if !actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let encrypted_completion = super::task_flows::opaque_payload(&request.encrypted_completion)?;
+    let request_hash = digest_json(&serde_json::json!({
+        "project_id": project_id,
+        "run_id": run_id,
+        "claim_id": claim_id,
+        "effect_id": request.effect_id,
+        "completion_id": request.completion_id,
+        "expected_payload_version": request.expected_payload_version,
+        "encrypted_completion": request.encrypted_completion,
+        "idempotency_key": request.idempotency_key,
+    }))?;
+    let mut transaction = begin(&app, actor, project_id).await?;
+    require_active_runner(&mut transaction, project_id, actor).await?;
+    let mut locked = lock_run(&mut transaction, project_id, run_id).await?;
+    require_current_run_authority(&mut transaction, project_id, actor, &locked.state).await?;
+
+    if let Some(existing) = sqlx::query(
+        "SELECT id, task_completion_id, request_hash
+         FROM agent_run_task_effects
+         WHERE project_id = $1 AND actor_identity_id = $2 AND idempotency_key = $3",
+    )
+    .bind(project_id)
+    .bind(actor.identity_id)
+    .bind(request.idempotency_key)
+    .fetch_optional(&mut *transaction)
+    .await?
+    {
+        let stored_hash: Vec<u8> = existing.try_get("request_hash")?;
+        if stored_hash != request_hash
+            || existing.try_get::<Uuid, _>("id")? != request.effect_id
+            || existing.try_get::<Uuid, _>("task_completion_id")? != request.completion_id
+        {
+            return Err(AppError::Conflict);
+        }
+        transaction.commit().await?;
+        return Ok(Json(MaterializeTaskCompletionResponse {
+            effect_id: request.effect_id,
+            completion_id: request.completion_id,
+            replayed: true,
+            run_id: RunId::from(run_id),
+            state_version: positive_u64(locked.state_version)?,
+            state: locked.state,
+        }));
+    }
+
+    let tick = runtime_tick()?;
+    let facts = authoritative_condition_facts(
+        &mut transaction,
+        project_id,
+        &locked.contract,
+        &locked.state,
+    )
+    .await?;
+    locked.state.recover_expired_claims(tick);
+    locked
+        .state
+        .refresh_frontier(&locked.contract, &facts, tick)
+        .map_err(domain_error)?;
+    let claim_key = ClaimId::from(claim_id);
+    let claim = locked
+        .state
+        .claims
+        .get(&claim_key)
+        .cloned()
+        .ok_or(AppError::Conflict)?;
+    let work = locked
+        .state
+        .work_items
+        .get(&claim.work)
+        .cloned()
+        .ok_or(AppError::Conflict)?;
+    let work_spec = locked
+        .contract
+        .work_specs
+        .iter()
+        .find(|spec| spec.id == work.work_spec_id)
+        .ok_or(AppError::Internal)?;
+    if work_spec.kind != WorkKind::TaskAction
+        || !work_spec
+            .allowed_actions
+            .contains(&AgentActionClass::MarkAssignedDone)
+        || claim.claimant != UserId::from(actor.identity_id)
+    {
+        return Err(AppError::Forbidden);
+    }
+
+    let snapshot_rows =
+        sqlx::query("SELECT * FROM sprout_private.agent_task_effect_snapshot($1, $2, $3)")
+            .bind(project_id)
+            .bind(run_id)
+            .bind(claim_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+    let [snapshot] = snapshot_rows.as_slice() else {
+        return Err(AppError::Conflict);
+    };
+    let snapshot_work_item_id: Uuid = snapshot.try_get("work_item_id")?;
+    let snapshot_attempt: i32 = snapshot.try_get("attempt")?;
+    let snapshot_work_spec: i64 = snapshot.try_get("work_spec_ordinal")?;
+    if snapshot_work_item_id != Uuid::from(work.id)
+        || snapshot_attempt != i32::from(claim.attempt)
+        || u64::try_from(snapshot_work_spec).ok() != Some(work.work_spec_id)
+    {
+        return Err(AppError::Conflict);
+    }
+    let task_resource_id: Uuid = snapshot.try_get("task_resource_node_id")?;
+    let task_id: Uuid = snapshot.try_get("task_id")?;
+    let task_assignment_id: Uuid = snapshot.try_get("task_assignment_id")?;
+    let task_provenance_id: Uuid = snapshot.try_get("task_provenance_id")?;
+    let task_intent_id: Option<Uuid> = snapshot.try_get("task_intent_id")?;
+    let target_agent_id: Uuid = snapshot.try_get("target_agent_id")?;
+    let local: LocalGoalContract = serde_json::from_value(snapshot.try_get("local_contract")?)
+        .map_err(|_| AppError::Internal)?;
+    let provenance = TaskObligationProvenance {
+        task: ResourceId::from(task_resource_id),
+        agent: UserId::from(actor.identity_id),
+        local_revision: u64::try_from(snapshot.try_get::<i64, _>("local_goal_revision")?)
+            .map_err(|_| AppError::Internal)?,
+        obligation: snapshot.try_get("obligation_id")?,
+        work_spec_id: u64::try_from(snapshot_work_spec).map_err(|_| AppError::Internal)?,
+        recorded_at: snapshot.try_get("provenance_recorded_at")?,
+    };
+    let governed = GovernedAgent {
+        id: target_agent_id.into(),
+        principal_id: actor.identity_id.into(),
+        controller_id: snapshot
+            .try_get::<Uuid, _>("target_controller_identity_id")?
+            .into(),
+        project_id: project_id.into(),
+        availability: match snapshot
+            .try_get::<String, _>("target_availability")?
+            .as_str()
+        {
+            "controller_private" => AgentAvailabilityMode::ControllerPrivate,
+            "project_delegable" => AgentAvailabilityMode::ProjectDelegable,
+            _ => return Err(AppError::Internal),
+        },
+    };
+    if !task_obligation_provenance_valid_at(
+        task_resource_id.into(),
+        &governed,
+        CurrentLocalObligationContext {
+            active_local_goal: Some(&local),
+            provenance: Some(&provenance),
+            condition_facts: &facts,
+        },
+    ) || provenance.obligation != work.serves
+    {
+        return Err(AppError::Conflict);
+    }
+    let expected_payload_version = i64::try_from(request.expected_payload_version)
+        .map_err(|_| AppError::BadRequest("payload version is too large"))?;
+    if snapshot.try_get::<i64, _>("task_payload_version")? != expected_payload_version {
+        return Err(AppError::Conflict);
+    }
+    let applied_at = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+        .fetch_one(&mut *transaction)
+        .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO task_completions (
+            id, project_id, task_id, assignment_id,
+            assignee_identity_id, recorded_by_identity_id,
+            occurrence_key, encrypted_payload, completed_at,
+            idempotency_key, request_hash
+        ) VALUES ($1, $2, $3, $4, $5, $5, $1, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(request.completion_id)
+    .bind(project_id)
+    .bind(task_id)
+    .bind(task_assignment_id)
+    .bind(actor.identity_id)
+    .bind(&encrypted_completion)
+    .bind(applied_at)
+    .bind(request.idempotency_key)
+    .bind(request_hash.as_slice())
+    .execute(&mut *transaction)
+    .await?;
+    let task_updated = sqlx::query(
+        "UPDATE tasks
+         SET state = 'completed', completed_by_identity_id = $3,
+             completed_at = $4, payload_version = payload_version + 1
+         WHERE project_id = $1 AND id = $2 AND state = 'open'
+           AND payload_version = $5",
+    )
+    .bind(project_id)
+    .bind(task_id)
+    .bind(actor.identity_id)
+    .bind(applied_at)
+    .bind(expected_payload_version)
+    .execute(&mut *transaction)
+    .await?;
+    if task_updated.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
+    let cross_owner_effect_id: Option<Uuid> = snapshot.try_get("cross_owner_effect_id")?;
+    let provenance_hash = digest_json(&serde_json::json!({
+        "project_id": project_id,
+        "run_id": run_id,
+        "work_item_id": work.id,
+        "claim_id": claim.id,
+        "attempt": claim.attempt,
+        "task_provenance_id": task_provenance_id,
+        "task_intent_id": task_intent_id,
+        "task_resource_node_id": task_resource_id,
+        "task_id": task_id,
+        "task_assignment_id": task_assignment_id,
+        "task_completion_id": request.completion_id,
+        "target_agent_id": target_agent_id,
+        "cross_owner_effect_id": cross_owner_effect_id,
+        "applied_at": applied_at,
+    }))?;
+    sqlx::query(
+        r#"
+        INSERT INTO agent_run_task_effects (
+            id, project_id, run_id, work_item_id, claim_id, attempt,
+            task_provenance_id, task_intent_id, task_resource_node_id, task_id,
+            task_assignment_id, task_completion_id, target_agent_id,
+            cross_owner_effect_id, actor_identity_id, actor_device_id,
+            idempotency_key, request_hash, provenance_hash, applied_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+        )
+        "#,
+    )
+    .bind(request.effect_id)
+    .bind(project_id)
+    .bind(run_id)
+    .bind(Uuid::from(work.id))
+    .bind(claim_id)
+    .bind(i32::from(claim.attempt))
+    .bind(task_provenance_id)
+    .bind(task_intent_id)
+    .bind(task_resource_id)
+    .bind(task_id)
+    .bind(task_assignment_id)
+    .bind(request.completion_id)
+    .bind(target_agent_id)
+    .bind(cross_owner_effect_id)
+    .bind(actor.identity_id)
+    .bind(actor.device_id)
+    .bind(request.idempotency_key)
+    .bind(request_hash.as_slice())
+    .bind(provenance_hash.as_slice())
+    .bind(applied_at)
+    .execute(&mut *transaction)
+    .await?;
+
+    locked
+        .state
+        .succeed_work(
+            &locked.contract,
+            claim_key,
+            UserId::from(actor.identity_id),
+            &facts,
+            tick,
+        )
+        .map_err(domain_error)?;
+    let transition = persist_transition(
+        &mut transaction,
+        project_id,
+        Some(actor),
+        &locked,
+        &facts,
+        TransitionMetadata {
+            kind: "work_succeeded",
+            tick,
+            observation: Some(("task_completion", request.completion_id)),
+        },
+    )
+    .await?;
+    let outcome = ValidatedWorkOutcome {
+        work_item_id: work.id,
+        claim_id: claim.id,
+        attempt: claim.attempt,
+        product_event_id: request.completion_id,
+        observed_datetime: applied_at,
+        provenance_hash,
+    };
+    persist_work_outcome(
+        &mut transaction,
+        project_id,
+        run_id,
+        &outcome,
+        transition.id,
+    )
+    .await?;
+    super::task_flows::insert_outbox(
+        &mut transaction,
+        project_id,
+        "task",
+        task_id,
+        "completed",
+        request.idempotency_key,
+        &encrypted_completion,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(MaterializeTaskCompletionResponse {
+        effect_id: request.effect_id,
+        completion_id: request.completion_id,
+        replayed: false,
+        run_id: RunId::from(run_id),
+        state_version: transition.version,
+        state: locked.state,
+    }))
 }
 
 pub async fn fail(

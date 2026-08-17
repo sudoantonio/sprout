@@ -12,7 +12,7 @@ use sprout_domain::{
     StructuredGlobalWorkGrounding,
 };
 use sprout_server::{AppState, build_router, config::Config};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -2235,6 +2235,70 @@ async fn normal_controller_can_atomically_activate_exact_local_goal_and_stale_re
     .await
     .expect("verify exact active prompt binding");
     assert!(exact_prompt_bound);
+    let final_approval = sqlx::query(
+        r#"
+        SELECT prompt.draft_id, approval.agent_id,
+               approval.controller_identity_id, approval.local_goal_id,
+               approval.local_goal_revision,
+               approval.prompt_hash = prompt.prompt_hash AS exact_hash
+        FROM agent_prompt_revisions prompt
+        JOIN agent_prompt_final_approvals approval
+          ON approval.project_id = prompt.project_id
+         AND approval.draft_id = prompt.draft_id
+        WHERE prompt.project_id = $1 AND prompt.agent_id = $2
+          AND prompt.state = 'active'
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact final prompt approval certificate");
+    assert_ne!(
+        final_approval.try_get::<Uuid, _>("draft_id").unwrap(),
+        Uuid::nil()
+    );
+    assert_eq!(
+        final_approval.try_get::<Uuid, _>("agent_id").unwrap(),
+        agent_id
+    );
+    assert_eq!(
+        final_approval
+            .try_get::<Uuid, _>("controller_identity_id")
+            .unwrap(),
+        controller_id
+    );
+    assert_eq!(
+        final_approval.try_get::<Uuid, _>("local_goal_id").unwrap(),
+        local_goal_id
+    );
+    assert_eq!(
+        final_approval
+            .try_get::<i64, _>("local_goal_revision")
+            .unwrap(),
+        1
+    );
+    assert!(final_approval.try_get::<bool, _>("exact_hash").unwrap());
+    let forged_approval = sqlx::query(
+        "INSERT INTO agent_prompt_final_approvals (
+             project_id, draft_id, agent_id, controller_identity_id,
+             local_goal_id, local_goal_revision, prompt_hash
+         ) VALUES ($1, $2, $3, $4, $5, 1, decode(repeat('00', 32), 'hex'))",
+    )
+    .bind(fixture.project_id)
+    .bind(Uuid::new_v4())
+    .bind(agent_id)
+    .bind(controller_id)
+    .bind(local_goal_id)
+    .execute(&fixture.pool)
+    .await
+    .expect_err("mismatched prompt/draft approval must fail closed");
+    assert_eq!(
+        forged_approval
+            .as_database_error()
+            .and_then(|error| error.code()),
+        Some(std::borrow::Cow::Borrowed("55000"))
+    );
 
     let audit_before = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM agent_user_governance_audit_log
@@ -2247,6 +2311,16 @@ async fn normal_controller_can_atomically_activate_exact_local_goal_and_stale_re
     .await
     .expect("count activation audit before stale retry");
     assert_eq!(audit_before, 1);
+    let approvals_before = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_prompt_final_approvals
+         WHERE project_id = $1 AND agent_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count final approvals before stale retry");
+    assert_eq!(approvals_before, 1);
     let stale = app
         .clone()
         .oneshot(
@@ -2271,6 +2345,16 @@ async fn normal_controller_can_atomically_activate_exact_local_goal_and_stale_re
     .await
     .expect("count activation audit after stale retry");
     assert_eq!(audit_after, audit_before);
+    let approvals_after = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_prompt_final_approvals
+         WHERE project_id = $1 AND agent_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count final approvals after stale retry");
+    assert_eq!(approvals_after, approvals_before);
 
     let responsibility_revision_2 = json!({
         "id": responsibility_id,
@@ -2731,7 +2815,7 @@ async fn purging_one_of_two_same_user_agents_preserves_shared_governance_and_pee
 async fn cross_owner_review_requires_exact_active_task_provenance_and_current_permission() {
     let fixture = fixture().await;
     let app = app(&fixture);
-    let (requester_id, _requester_device, requester_token, requester_permission_root) =
+    let (requester_id, requester_device, requester_token, requester_permission_root) =
         add_human_member(&fixture, "member").await;
     let (controller_id, controller_device, controller_token, _controller_permission_root) =
         add_human_member(&fixture, "member").await;
@@ -3166,6 +3250,7 @@ async fn cross_owner_review_requires_exact_active_task_provenance_and_current_pe
         .expect("finalize after permission revoke response");
     assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
 
+    let requester_regrant_id = Uuid::new_v4();
     let mut regrant = fixture.pool.begin().await.expect("begin requester regrant");
     sqlx::query(
         "SELECT set_config('app.identity_id', $1, true),
@@ -3186,13 +3271,14 @@ async fn cross_owner_review_requires_exact_active_task_provenance_and_current_pe
     .bind(fixture.project_id)
     .bind(fixture.profile_resource_id)
     .bind(requester_id)
-    .bind(Uuid::new_v4())
+    .bind(requester_regrant_id)
     .bind(fixture.owner_id)
     .execute(&mut *regrant)
     .await
     .expect("regrant requester permission");
     regrant.commit().await.expect("commit requester regrant");
     let ready = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3206,10 +3292,363 @@ async fn cross_owner_review_requires_exact_active_task_provenance_and_current_pe
     assert_eq!(ready.status(), StatusCode::OK);
     assert_eq!(json_body(ready).await["state"], "ready");
 
+    let materialize_uri = format!(
+        "/v1/projects/{}/cross-owner-assignments/{assignment_id}/materialize",
+        fixture.project_id
+    );
+    let effect_id = Uuid::new_v4();
+    let task_assignment_id = Uuid::new_v4();
+    let idempotency_key = Uuid::new_v4();
+    let materialize_body = json!({
+        "effect_id": effect_id,
+        "task_assignment_id": task_assignment_id,
+        "idempotency_key": idempotency_key,
+        "encrypted_assignment_payload_b64": "AQ=="
+    });
+    let target_permission_roots_before = sqlx::query_scalar::<_, i64>(
+        "SELECT count(DISTINCT root_grant_id)
+         FROM sprout_private.domain_permission_rows
+         WHERE project_id = $1 AND member_identity_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(fixture.project_id)
+    .bind(agent_identity_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count target permission roots before materialization");
+
+    let mut revoke_after_ready = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin requester revoke after ready");
+    sqlx::query(
+        "SELECT set_config('app.identity_id', $1, true),
+                set_config('app.device_id', $2, true),
+                set_config('app.project_id', $3, true)",
+    )
+    .bind(fixture.owner_id.to_string())
+    .bind(fixture.owner_device_id.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *revoke_after_ready)
+    .await
+    .expect("set owner context for post-ready revoke");
+    sqlx::query_scalar::<_, i64>(
+        "SELECT sprout_private.revoke_hierarchical_permission($1, $2, $3, $4, NULL)",
+    )
+    .bind(fixture.project_id)
+    .bind(requester_regrant_id)
+    .bind(requester_id)
+    .bind(fixture.owner_id)
+    .fetch_one(&mut *revoke_after_ready)
+    .await
+    .expect("revoke requester permission after ready");
+    revoke_after_ready
+        .commit()
+        .await
+        .expect("commit requester revoke after ready");
+
+    let mut snapshot_without_manage = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin direct snapshot permission negative");
+    sqlx::query(
+        "SELECT set_config('app.identity_id', $1, true),
+                set_config('app.device_id', $2, true),
+                set_config('app.project_id', $3, true)",
+    )
+    .bind(requester_id.to_string())
+    .bind(requester_device.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *snapshot_without_manage)
+    .await
+    .expect("set requester context for direct snapshot negative");
+    let snapshot_error =
+        sqlx::query("SELECT * FROM sprout_private.cross_owner_materialization_snapshot($1, $2)")
+            .bind(fixture.project_id)
+            .bind(assignment_id)
+            .fetch_all(&mut *snapshot_without_manage)
+            .await
+            .expect_err("SECURITY DEFINER snapshot must reject caller without current manage");
+    assert_eq!(
+        snapshot_error
+            .as_database_error()
+            .and_then(|error| error.code()),
+        Some(std::borrow::Cow::Borrowed("42501"))
+    );
+    snapshot_without_manage
+        .rollback()
+        .await
+        .expect("rollback direct snapshot negative");
+
+    let revoked_materialization = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&materialize_uri)
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::from(materialize_body.to_string()))
+                .expect("materialize after permission revoke request"),
+        )
+        .await
+        .expect("materialize after permission revoke response");
+    assert_eq!(revoked_materialization.status(), StatusCode::FORBIDDEN);
+    let effects_after_revoke = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_cross_owner_assignment_effects
+         WHERE project_id = $1 AND cross_owner_assignment_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(assignment_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count effects after revoked materialization");
+    assert_eq!(effects_after_revoke, 0);
+
+    let mut restore_after_ready = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin requester restore after ready");
+    sqlx::query(
+        "SELECT set_config('app.identity_id', $1, true),
+                set_config('app.device_id', $2, true),
+                set_config('app.project_id', $3, true)",
+    )
+    .bind(fixture.owner_id.to_string())
+    .bind(fixture.owner_device_id.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *restore_after_ready)
+    .await
+    .expect("set owner context for requester restore after ready");
+    sqlx::query(
+        "SELECT sprout_private.grant_hierarchical_permission(
+             $1, $2, $3, 'manage', 'full', 'restricted', $4, $5
+         )",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(requester_id)
+    .bind(Uuid::new_v4())
+    .bind(fixture.owner_id)
+    .execute(&mut *restore_after_ready)
+    .await
+    .expect("restore requester permission after ready");
+    restore_after_ready
+        .commit()
+        .await
+        .expect("commit requester restore after ready");
+
+    let materialized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&materialize_uri)
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::from(materialize_body.to_string()))
+                .expect("materialize ready cross-owner request"),
+        )
+        .await
+        .expect("materialize ready cross-owner response");
+    assert_eq!(materialized.status(), StatusCode::OK);
+    let materialized = json_body(materialized).await;
+    assert_eq!(materialized["effect_id"], effect_id.to_string());
+    assert_eq!(
+        materialized["task_assignment_id"],
+        task_assignment_id.to_string()
+    );
+    assert_eq!(materialized["replayed"], false);
+
+    let replayed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&materialize_uri)
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::from(materialize_body.to_string()))
+                .expect("retry materialization request"),
+        )
+        .await
+        .expect("retry materialization response");
+    assert_eq!(replayed.status(), StatusCode::OK);
+    assert_eq!(json_body(replayed).await["replayed"], true);
+
+    let hash_mismatch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&materialize_uri)
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::from(
+                    json!({
+                        "effect_id": effect_id,
+                        "task_assignment_id": task_assignment_id,
+                        "idempotency_key": idempotency_key,
+                        "encrypted_assignment_payload_b64": "Ag=="
+                    })
+                    .to_string(),
+                ))
+                .expect("hash-mismatched retry request"),
+        )
+        .await
+        .expect("hash-mismatched retry response");
+    assert_eq!(hash_mismatch.status(), StatusCode::CONFLICT);
+
+    let (effect_count, task_assignment_count, assignment_owns_permission) =
+        sqlx::query_as::<_, (i64, i64, bool)>(
+            "SELECT
+                 (SELECT count(*) FROM agent_cross_owner_assignment_effects
+                  WHERE project_id = $1 AND cross_owner_assignment_id = $2),
+                 (SELECT count(*) FROM task_assignments
+                  WHERE project_id = $1 AND id = $3),
+                 (SELECT permission_managed_by_assignment FROM task_assignments
+                  WHERE project_id = $1 AND id = $3)",
+        )
+        .bind(fixture.project_id)
+        .bind(assignment_id)
+        .bind(task_assignment_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("load materialization idempotency result");
+    assert_eq!(effect_count, 1);
+    assert_eq!(task_assignment_count, 1);
+    assert!(!assignment_owns_permission);
+    let target_permission_roots_after = sqlx::query_scalar::<_, i64>(
+        "SELECT count(DISTINCT root_grant_id)
+         FROM sprout_private.domain_permission_rows
+         WHERE project_id = $1 AND member_identity_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(fixture.project_id)
+    .bind(agent_identity_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count target permission roots after materialization");
+    assert_eq!(
+        target_permission_roots_after,
+        target_permission_roots_before
+    );
+
+    let preexisting_target_permission = Uuid::new_v4();
+    let mut add_preexisting_target_permission = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin pre-existing target permission setup");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *add_preexisting_target_permission)
+        .await
+        .expect("disable RLS for pre-existing target permission setup");
+    sqlx::query(
+        "SELECT sprout_private.grant_hierarchical_permission(
+             $1, $2, $3, 'view', 'full', 'restricted', $4, $5
+         )",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(agent_identity_id)
+    .bind(preexisting_target_permission)
+    .bind(fixture.owner_id)
+    .execute(&mut *add_preexisting_target_permission)
+    .await
+    .expect("create pre-existing target permission after materialization");
+    add_preexisting_target_permission
+        .commit()
+        .await
+        .expect("commit pre-existing target permission setup");
+    let (source_task_id, source_epoch_id, source_epoch) = sqlx::query_as::<_, (Uuid, Uuid, i32)>(
+        "SELECT task.id, epoch.id, epoch.epoch
+             FROM tasks task
+             JOIN resource_epochs epoch
+               ON epoch.project_id = task.project_id
+              AND epoch.resource_node_id = task.resource_node_id
+              AND epoch.retired_at IS NULL
+             WHERE task.project_id = $1 AND task.resource_node_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load task and key epoch before cross-owner revocation");
+    let revoked_assignment = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/v1/projects/{}/tasks/{source_task_id}/assignments/{task_assignment_id}",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {requester_token}"))
+                .body(Body::from(
+                    json!({
+                        "rotations": [],
+                        "idempotency_key": "cross-owner-revoke-isolation"
+                    })
+                    .to_string(),
+                ))
+                .expect("revoke cross-owner assignment request"),
+        )
+        .await
+        .expect("revoke cross-owner assignment response");
+    assert_eq!(revoked_assignment.status(), StatusCode::OK);
+    let preexisting_permission_still_active = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM sprout_private.domain_permission_rows
+             WHERE project_id = $1 AND member_identity_id = $2
+               AND root_grant_id = $3 AND revoked_at IS NULL
+         )",
+    )
+    .bind(fixture.project_id)
+    .bind(agent_identity_id)
+    .bind(preexisting_target_permission)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("check pre-existing target permission after assignment revoke");
+    assert!(preexisting_permission_still_active);
+    let current_epoch_after_revoke = sqlx::query_as::<_, (Uuid, i32)>(
+        "SELECT id, epoch FROM resource_epochs
+         WHERE project_id = $1 AND resource_node_id = $2 AND retired_at IS NULL",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load task key epoch after cross-owner assignment revoke");
+    assert_eq!(current_epoch_after_revoke, (source_epoch_id, source_epoch));
+
     let retention_subject_id = Uuid::new_v4();
     let retention_lease_token = Uuid::new_v4();
     let retention_now = Utc::now();
     let deleted_at = retention_now - ChronoDuration::days(20);
+    let semantic_provenance_before_purge = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*)
+         FROM sprout_private.semantic_task_obligation_provenance_projection
+         WHERE project_id = $1 AND task_resource_node_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count semantic provenance before retention purge");
+    let semantic_intents_before_purge = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM sprout_private.semantic_task_intent_projection
+         WHERE project_id = $1 AND task_resource_node_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count semantic intents before retention purge");
+    assert_eq!(semantic_provenance_before_purge, 1);
+    assert_eq!(semantic_intents_before_purge, 1);
     let mut retention = fixture
         .pool
         .begin()
@@ -3277,4 +3716,39 @@ async fn cross_owner_review_requires_exact_active_task_provenance_and_current_pe
     .await
     .expect("count provenance after legitimate retention purge");
     assert_eq!(provenance_after_purge, 0);
+    let semantic_provenance_after_purge = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*)
+         FROM sprout_private.semantic_task_obligation_provenance_projection
+         WHERE project_id = $1 AND task_resource_node_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count retained semantic provenance after purge");
+    let semantic_intents_after_purge = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM sprout_private.semantic_task_intent_projection
+         WHERE project_id = $1 AND task_resource_node_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count retained semantic intents after purge");
+    assert_eq!(
+        semantic_provenance_after_purge,
+        semantic_provenance_before_purge
+    );
+    assert_eq!(semantic_intents_after_purge, semantic_intents_before_purge);
+    let retained_effects = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_product_effect_retained_history
+         WHERE project_id = $1 AND task_resource_node_id = $2
+           AND effect_kind = 'cross_owner_assignment'",
+    )
+    .bind(fixture.project_id)
+    .bind(source_task)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count retained cross-owner effect provenance");
+    assert_eq!(retained_effects, 1);
 }
