@@ -1765,6 +1765,36 @@ impl CollaborativeRunState {
         Ok(())
     }
 
+    /// Project an authoritative product task effect into the Lean causal graph.
+    /// Callers must obtain `task` from the certified product-effect binding;
+    /// this method deliberately accepts no WorkSpec, obligation, LocalGoal or
+    /// direction supplied by a runner.
+    pub fn record_task_effect_causal_link(
+        &mut self,
+        work: WorkItemId,
+        task: ResourceId,
+        tick: u64,
+    ) -> Result<(), AgentValidationError> {
+        if !self.work_items.contains_key(&work) {
+            return Err(AgentValidationError::UnknownWorkItem);
+        }
+        self.push_causal_link(
+            CollaborativeCausalNode::Work { work },
+            CollaborativeCausalNode::Task { task },
+            tick,
+        )
+    }
+
+    #[must_use]
+    pub fn task_is_causal_successor(&self, work: WorkItemId, task: ResourceId) -> bool {
+        self.causal_links.iter().any(|link| {
+            link.run == self.id
+                && link.goal == self.goal
+                && link.predecessor == CollaborativeCausalNode::Work { work }
+                && link.successor == CollaborativeCausalNode::Task { task }
+        })
+    }
+
     fn causal_reachable(
         &self,
         start: &CollaborativeCausalNode,
@@ -5131,6 +5161,37 @@ mod tests {
             run.push_causal_link(work, obligation, 1),
             Err(AgentValidationError::CausalRankDoesNotDecrease)
         );
+    }
+
+    #[test]
+    fn task_effect_projects_from_exact_work_to_exact_task() {
+        let agent = UserId::new();
+        let local = local_goal(agent, UserId::new());
+        let facts = ContractConditionFacts::default();
+        let mut run =
+            CollaborativeRunState::initialize(RunId::new(), &local.contract, &facts, 0).unwrap();
+        let work = run.work_items.values().next().unwrap().id;
+        let task = ResourceId::new();
+
+        run.record_task_effect_causal_link(work, task, 1).unwrap();
+        run.record_task_effect_causal_link(work, task, 2).unwrap();
+
+        assert!(run.task_is_causal_successor(work, task));
+        assert_eq!(
+            run.causal_links
+                .iter()
+                .filter(|link| {
+                    link.predecessor == CollaborativeCausalNode::Work { work }
+                        && link.successor == CollaborativeCausalNode::Task { task }
+                })
+                .count(),
+            1
+        );
+        assert!(!run.causal_links.iter().any(|link| {
+            link.predecessor == CollaborativeCausalNode::Task { task }
+                && link.successor == CollaborativeCausalNode::Work { work }
+        }));
+        assert!(run.causal_rank_decreases_on_every_link());
     }
 
     #[test]

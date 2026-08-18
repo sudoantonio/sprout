@@ -1,4 +1,4 @@
-use std::{env, sync::Arc};
+use std::{env, sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, to_bytes},
@@ -13,6 +13,7 @@ use sprout_domain::{
 };
 use sprout_server::{AppState, build_router, config::Config};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use tokio::sync::oneshot;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -215,6 +216,435 @@ async fn json_body(response: axum::response::Response) -> Value {
         .await
         .expect("read JSON response");
     serde_json::from_slice(&bytes).expect("decode JSON response")
+}
+
+async fn semantic_operational_lists(
+    pool: &PgPool,
+    project_id: Uuid,
+    identity_id: Uuid,
+    device_id: Uuid,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut transaction = pool.begin().await.expect("begin semantic-list projection");
+    sqlx::query(
+        "SELECT set_config('app.identity_id', $1, true),
+                set_config('app.device_id', $2, true),
+                set_config('app.project_id', $3, true)",
+    )
+    .bind(identity_id.to_string())
+    .bind(device_id.to_string())
+    .bind(project_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .expect("set authenticated semantic-list context");
+    let intents = sqlx::query_scalar::<_, Value>(
+        "SELECT COALESCE(
+             jsonb_agg(to_jsonb(item) ORDER BY item.semantic_position), '[]'::jsonb
+         )
+         FROM sprout_private.semantic_task_intent_list($1) item",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("project ordered semantic TaskIntent list");
+    let provenance = sqlx::query_scalar::<_, Value>(
+        "SELECT COALESCE(
+             jsonb_agg(to_jsonb(item) ORDER BY item.semantic_position), '[]'::jsonb
+         )
+         FROM sprout_private.semantic_task_provenance_list($1) item",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("project ordered semantic task provenance list");
+    transaction
+        .commit()
+        .await
+        .expect("commit semantic-list projection");
+    (
+        intents.as_array().cloned().expect("TaskIntent list"),
+        provenance
+            .as_array()
+            .cloned()
+            .expect("task provenance list"),
+    )
+}
+
+fn assert_prefix(before: &[Value], after: &[Value]) {
+    assert!(
+        after.starts_with(before),
+        "semantic list lost its exact prefix"
+    );
+    let positions = after
+        .iter()
+        .map(|entry| entry["semantic_position"].as_i64().expect("position"))
+        .collect::<Vec<_>>();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "semantic positions must be strictly monotone"
+    );
+}
+
+async fn retained_history_snapshot(pool: &PgPool, project_id: Uuid) -> Value {
+    sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT jsonb_build_object(
+          'intents', COALESCE((
+            SELECT jsonb_agg(to_jsonb(row) ORDER BY row.id)
+            FROM agent_task_intent_retained_history row
+            WHERE row.project_id = $1
+          ), '[]'::jsonb),
+          'provenance', COALESCE((
+            SELECT jsonb_agg(to_jsonb(row) ORDER BY row.id)
+            FROM agent_task_obligation_retained_history row
+            WHERE row.project_id = $1
+          ), '[]'::jsonb),
+          'effects', COALESCE((
+            SELECT jsonb_agg(to_jsonb(row) ORDER BY row.effect_kind, row.effect_id)
+            FROM agent_product_effect_retained_history row
+            WHERE row.project_id = $1
+          ), '[]'::jsonb),
+          'causal_links', COALESCE((
+            SELECT jsonb_agg(to_jsonb(row) ORDER BY row.causal_position)
+            FROM agent_run_causal_link_retained_history row
+            WHERE row.project_id = $1
+          ), '[]'::jsonb)
+        )
+        "#,
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .expect("snapshot exact retained semantic history")
+}
+
+async fn semantic_ledger_snapshot(pool: &PgPool, project_id: Uuid) -> Value {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT COALESCE(
+             jsonb_agg(to_jsonb(row) ORDER BY row.semantic_position), '[]'::jsonb
+         )
+         FROM agent_semantic_operational_ledger row
+         WHERE row.project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .expect("snapshot exact semantic ledger")
+}
+
+async fn wait_for_backend_lock(pool: &PgPool, backend_pid: i32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting = sqlx::query_scalar::<_, bool>(
+                "SELECT COALESCE(wait_event_type = 'Lock', false)
+                 FROM pg_stat_activity WHERE pid = $1",
+            )
+            .bind(backend_pid)
+            .fetch_one(pool)
+            .await
+            .expect("observe concurrent semantic append backend");
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("concurrent semantic append never reached a real lock wait");
+}
+
+async fn controlled_concurrent_intent_pair(
+    pool: &PgPool,
+    project_id: Uuid,
+    task_resource_id: Uuid,
+    controller_id: Uuid,
+    winner_id: Uuid,
+    waiter_id: Uuid,
+) -> (i64, i64) {
+    let mut winner = pool.begin().await.expect("open winning append transaction");
+    let mut waiter = pool.begin().await.expect("open waiting append transaction");
+    let winner_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+        .fetch_one(&mut *winner)
+        .await
+        .expect("load winning backend PID");
+    let waiter_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+        .fetch_one(&mut *waiter)
+        .await
+        .expect("load waiting backend PID");
+    assert_ne!(winner_pid, waiter_pid, "both transactions must be open");
+    for transaction in [&mut winner, &mut waiter] {
+        sqlx::query("SET LOCAL row_security = off")
+            .execute(&mut **transaction)
+            .await
+            .expect("disable RLS for controlled concurrency fixture");
+    }
+    sqlx::query(
+        "UPDATE sprout_private.semantic_operational_cursor
+         SET last_position = last_position WHERE singleton",
+    )
+    .execute(&mut *winner)
+    .await
+    .expect("winner acquires semantic cursor lock");
+
+    let waiter_pool = pool.clone();
+    let (attempting_tx, attempting_rx) = oneshot::channel();
+    let waiter_task = tokio::spawn(async move {
+        attempting_tx
+            .send(())
+            .expect("signal waiting append attempt");
+        sqlx::query(
+            "INSERT INTO agent_task_intents (
+                 id, project_id, task_resource_node_id, scope_resource_node_id,
+                 required_actions, derived_by_identity_id
+             ) VALUES ($1, $2, $3, $3, '[\"assign_own_task\"]'::jsonb, $4)",
+        )
+        .bind(waiter_id)
+        .bind(project_id)
+        .bind(task_resource_id)
+        .bind(controller_id)
+        .execute(&mut *waiter)
+        .await
+        .expect("waiting concurrent append succeeds after release");
+        waiter
+            .commit()
+            .await
+            .expect("commit waiting concurrent append");
+    });
+    attempting_rx.await.expect("waiting append started");
+    wait_for_backend_lock(&waiter_pool, waiter_pid).await;
+
+    sqlx::query(
+        "INSERT INTO agent_task_intents (
+             id, project_id, task_resource_node_id, scope_resource_node_id,
+             required_actions, derived_by_identity_id
+         ) VALUES ($1, $2, $3, $3, '[\"assign_own_task\"]'::jsonb, $4)",
+    )
+    .bind(winner_id)
+    .bind(project_id)
+    .bind(task_resource_id)
+    .bind(controller_id)
+    .execute(&mut *winner)
+    .await
+    .expect("insert winning concurrent TaskIntent");
+    winner
+        .commit()
+        .await
+        .expect("commit winning concurrent append");
+    waiter_task.await.expect("join waiting concurrent append");
+
+    let positions = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT record_id, semantic_position
+         FROM agent_semantic_operational_ledger
+         WHERE project_id = $1 AND entry_kind = 'task_intent'
+           AND record_id = ANY($2)
+         ORDER BY semantic_position",
+    )
+    .bind(project_id)
+    .bind(vec![winner_id, waiter_id])
+    .fetch_all(pool)
+    .await
+    .expect("load controlled concurrent positions");
+    assert_eq!(positions.len(), 2);
+    assert_eq!(positions[0].0, winner_id);
+    assert_eq!(positions[1].0, waiter_id);
+    assert_eq!(positions[1].1, positions[0].1 + 1);
+    (positions[0].1, positions[1].1)
+}
+
+#[derive(Clone, Copy)]
+struct RetentionGate {
+    subject_id: Uuid,
+    lease_token: Uuid,
+    now: chrono::DateTime<Utc>,
+}
+
+async fn prepare_retention_gate(
+    fixture: &Fixture,
+    resource_node_id: Uuid,
+    owner_identity_id: Uuid,
+) -> RetentionGate {
+    let gate = RetentionGate {
+        subject_id: Uuid::new_v4(),
+        lease_token: Uuid::new_v4(),
+        now: Utc::now(),
+    };
+    let deleted_at = gate.now - ChronoDuration::days(20);
+    let mut transaction = fixture.pool.begin().await.expect("begin retention gate");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *transaction)
+        .await
+        .expect("disable RLS for retention gate");
+    sqlx::query(
+        "UPDATE resource_nodes SET deleted_at = $3
+         WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(resource_node_id)
+    .bind(deleted_at)
+    .execute(&mut *transaction)
+    .await
+    .expect("soft-delete retention gate resource");
+    sqlx::query(
+        r#"
+        INSERT INTO retention_subjects (
+            id, project_id, source_kind, source_id, resource_node_id,
+            owner_identity_id, retention_class, source_at, warning_at,
+            purge_at, state, lease_owner, lease_token, leased_until
+        ) VALUES (
+            $1, $2, 'resource_deleted', $3, $3, $4,
+            'deleted_or_obsolete', $5, $6, $7, 'purging', $8, $9, $10
+        )
+        "#,
+    )
+    .bind(gate.subject_id)
+    .bind(fixture.project_id)
+    .bind(resource_node_id)
+    .bind(owner_identity_id)
+    .bind(deleted_at)
+    .bind(deleted_at + ChronoDuration::days(1))
+    .bind(deleted_at + ChronoDuration::days(15))
+    .bind(Uuid::new_v4())
+    .bind(gate.lease_token)
+    .bind(gate.now + ChronoDuration::hours(1))
+    .execute(&mut *transaction)
+    .await
+    .expect("insert retention gate subject");
+    transaction.commit().await.expect("commit retention gate");
+    gate
+}
+
+async fn controlled_append_before_purge(
+    pool: &PgPool,
+    gate: RetentionGate,
+    project_id: Uuid,
+    task_resource_id: Uuid,
+    controller_id: Uuid,
+    intent_id: Uuid,
+) -> bool {
+    let mut append = pool
+        .begin()
+        .await
+        .expect("open append-before-purge transaction");
+    let mut purge = pool.begin().await.expect("open blocked purge transaction");
+    let append_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+        .fetch_one(&mut *append)
+        .await
+        .expect("append-before-purge PID");
+    let purge_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+        .fetch_one(&mut *purge)
+        .await
+        .expect("blocked purge PID");
+    assert_ne!(append_pid, purge_pid);
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *append)
+        .await
+        .expect("disable RLS for controlled append");
+    sqlx::query("SELECT id FROM retention_subjects WHERE id = $1 FOR UPDATE")
+        .bind(gate.subject_id)
+        .execute(&mut *append)
+        .await
+        .expect("append transaction fences retention subject");
+    sqlx::query(
+        "INSERT INTO agent_task_intents (
+             id, project_id, task_resource_node_id, scope_resource_node_id,
+             required_actions, derived_by_identity_id
+         ) VALUES ($1, $2, $3, $3, '[\"assign_own_task\"]'::jsonb, $4)",
+    )
+    .bind(intent_id)
+    .bind(project_id)
+    .bind(task_resource_id)
+    .bind(controller_id)
+    .execute(&mut *append)
+    .await
+    .expect("append intent before blocked purge");
+
+    let observe_pool = pool.clone();
+    let (attempting_tx, attempting_rx) = oneshot::channel();
+    let purge_task = tokio::spawn(async move {
+        attempting_tx.send(()).expect("signal purge attempt");
+        let purged = sqlx::query_scalar::<_, bool>(
+            "SELECT sprout_private.purge_retention_subject($1, $2, $3)",
+        )
+        .bind(gate.subject_id)
+        .bind(gate.lease_token)
+        .bind(gate.now)
+        .fetch_one(&mut *purge)
+        .await
+        .expect("purge succeeds after append commit");
+        purge.commit().await.expect("commit purge after append");
+        purged
+    });
+    attempting_rx.await.expect("purge attempt started");
+    wait_for_backend_lock(&observe_pool, purge_pid).await;
+    append.commit().await.expect("commit append before purge");
+    purge_task.await.expect("join purge after append")
+}
+
+async fn controlled_purge_before_append(
+    pool: &PgPool,
+    gate: RetentionGate,
+    project_id: Uuid,
+    task_resource_id: Uuid,
+    controller_id: Uuid,
+    intent_id: Uuid,
+) -> bool {
+    let mut purge = pool
+        .begin()
+        .await
+        .expect("open purge-before-append transaction");
+    let mut append = pool.begin().await.expect("open blocked append transaction");
+    let purge_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+        .fetch_one(&mut *purge)
+        .await
+        .expect("purge-before-append PID");
+    let append_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+        .fetch_one(&mut *append)
+        .await
+        .expect("blocked append PID");
+    assert_ne!(purge_pid, append_pid);
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *append)
+        .await
+        .expect("disable RLS for blocked append");
+    sqlx::query(
+        "UPDATE sprout_private.semantic_operational_cursor
+         SET last_position = last_position WHERE singleton",
+    )
+    .execute(&mut *purge)
+    .await
+    .expect("purge transaction fences semantic cursor");
+
+    let observe_pool = pool.clone();
+    let (attempting_tx, attempting_rx) = oneshot::channel();
+    let append_task = tokio::spawn(async move {
+        attempting_tx.send(()).expect("signal append attempt");
+        sqlx::query(
+            "INSERT INTO agent_task_intents (
+                 id, project_id, task_resource_node_id, scope_resource_node_id,
+                 required_actions, derived_by_identity_id
+             ) VALUES ($1, $2, $3, $3, '[\"assign_own_task\"]'::jsonb, $4)",
+        )
+        .bind(intent_id)
+        .bind(project_id)
+        .bind(task_resource_id)
+        .bind(controller_id)
+        .execute(&mut *append)
+        .await
+        .expect("append succeeds after purge commit");
+        append.commit().await.expect("commit append after purge");
+    });
+    attempting_rx.await.expect("append attempt started");
+    wait_for_backend_lock(&observe_pool, append_pid).await;
+    let purged =
+        sqlx::query_scalar::<_, bool>("SELECT sprout_private.purge_retention_subject($1, $2, $3)")
+            .bind(gate.subject_id)
+            .bind(gate.lease_token)
+            .bind(gate.now)
+            .fetch_one(&mut *purge)
+            .await
+            .expect("purge while append is blocked");
+    purge.commit().await.expect("commit purge before append");
+    append_task.await.expect("join append after purge");
+    purged
 }
 
 async fn add_human_member(fixture: &Fixture, role: &str) -> (Uuid, Uuid, String, Uuid) {
@@ -3628,6 +4058,21 @@ async fn cross_owner_review_requires_exact_active_task_provenance_and_current_pe
     let retention_lease_token = Uuid::new_v4();
     let retention_now = Utc::now();
     let deleted_at = retention_now - ChronoDuration::days(20);
+    let (semantic_intent_list_before_purge, semantic_provenance_list_before_purge) =
+        semantic_operational_lists(
+            &fixture.pool,
+            fixture.project_id,
+            controller_id,
+            controller_device,
+        )
+        .await;
+    assert_eq!(semantic_intent_list_before_purge.len(), 2);
+    assert_eq!(semantic_provenance_list_before_purge.len(), 1);
+    assert_eq!(
+        semantic_provenance_list_before_purge[0]["agent_identity_id"],
+        agent_identity_id.to_string()
+    );
+    assert_ne!(agent_identity_id, agent_id);
     let semantic_provenance_before_purge = sqlx::query_scalar::<_, i64>(
         "SELECT count(*)
          FROM sprout_private.semantic_task_obligation_provenance_projection
@@ -3697,14 +4142,20 @@ async fn cross_owner_review_requires_exact_active_task_provenance_and_current_pe
         .commit()
         .await
         .expect("commit legitimate retention setup");
-    let purged =
-        sqlx::query_scalar::<_, bool>("SELECT sprout_private.purge_retention_subject($1, $2, $3)")
-            .bind(retention_subject_id)
-            .bind(retention_lease_token)
-            .bind(retention_now)
-            .fetch_one(&fixture.pool)
-            .await
-            .expect("execute legitimate retention purge");
+    let concurrent_intent_id = Uuid::new_v4();
+    let purged = controlled_append_before_purge(
+        &fixture.pool,
+        RetentionGate {
+            subject_id: retention_subject_id,
+            lease_token: retention_lease_token,
+            now: retention_now,
+        },
+        fixture.project_id,
+        review_task,
+        controller_id,
+        concurrent_intent_id,
+    )
+    .await;
     assert!(purged);
     let provenance_after_purge = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM agent_task_obligation_provenance
@@ -3716,6 +4167,73 @@ async fn cross_owner_review_requires_exact_active_task_provenance_and_current_pe
     .await
     .expect("count provenance after legitimate retention purge");
     assert_eq!(provenance_after_purge, 0);
+    let (semantic_intent_list_after_purge, semantic_provenance_list_after_purge) =
+        semantic_operational_lists(
+            &fixture.pool,
+            fixture.project_id,
+            controller_id,
+            controller_device,
+        )
+        .await;
+    assert_eq!(
+        semantic_intent_list_after_purge.len(),
+        semantic_intent_list_before_purge.len() + 1
+    );
+    assert_eq!(
+        semantic_intent_list_after_purge.last().unwrap()["id"],
+        concurrent_intent_id.to_string()
+    );
+    assert_eq!(
+        semantic_provenance_list_after_purge, semantic_provenance_list_before_purge,
+        "retention must preserve every provenance list element and position"
+    );
+    assert_prefix(
+        &semantic_intent_list_before_purge,
+        &semantic_intent_list_after_purge,
+    );
+    assert_prefix(
+        &semantic_provenance_list_before_purge,
+        &semantic_provenance_list_after_purge,
+    );
+    let (secondary_purge_resource, _) =
+        create_cross_owner_tasks(&fixture, requester_id, controller_id).await;
+    let secondary_gate =
+        prepare_retention_gate(&fixture, secondary_purge_resource, requester_id).await;
+    let purge_first_intent_id = Uuid::new_v4();
+    let secondary_purged = controlled_purge_before_append(
+        &fixture.pool,
+        secondary_gate,
+        fixture.project_id,
+        review_task,
+        controller_id,
+        purge_first_intent_id,
+    )
+    .await;
+    assert!(secondary_purged);
+    let (semantic_intent_list_after_purge_orders, semantic_provenance_list_after_purge_orders) =
+        semantic_operational_lists(
+            &fixture.pool,
+            fixture.project_id,
+            controller_id,
+            controller_device,
+        )
+        .await;
+    assert_prefix(
+        &semantic_intent_list_after_purge,
+        &semantic_intent_list_after_purge_orders,
+    );
+    assert_eq!(
+        semantic_intent_list_after_purge_orders.len(),
+        semantic_intent_list_after_purge.len() + 1
+    );
+    assert_eq!(
+        semantic_intent_list_after_purge_orders.last().unwrap()["id"],
+        purge_first_intent_id.to_string()
+    );
+    assert_eq!(
+        semantic_provenance_list_after_purge_orders,
+        semantic_provenance_list_after_purge
+    );
     let semantic_provenance_after_purge = sqlx::query_scalar::<_, i64>(
         "SELECT count(*)
          FROM sprout_private.semantic_task_obligation_provenance_projection
@@ -3751,4 +4269,221 @@ async fn cross_owner_review_requires_exact_active_task_provenance_and_current_pe
     .await
     .expect("count retained cross-owner effect provenance");
     assert_eq!(retained_effects, 1);
+
+    let appended_intent_id = Uuid::new_v4();
+    let appended_provenance_id = Uuid::new_v4();
+    let appended_local_goal_id = Uuid::new_v4();
+    let appended_local = local_goal_value(
+        appended_local_goal_id,
+        1,
+        agent_identity_id,
+        controller_id,
+        review_task,
+        review_task,
+        "assign_own_task",
+    );
+    let exact_obligation: Uuid = appended_local["contract"]["obligations"][0]["id"]
+        .as_str()
+        .expect("appended obligation id")
+        .parse()
+        .expect("appended obligation UUID");
+    sqlx::query(
+        "INSERT INTO agent_local_goal_contracts (
+             id, project_id, agent_id, agent_identity_id,
+             controller_identity_id, revision, contract, contract_hash
+         ) VALUES ($1, $2, $3, $4, $5, 1, $6, $7)",
+    )
+    .bind(appended_local_goal_id)
+    .bind(fixture.project_id)
+    .bind(agent_id)
+    .bind(agent_identity_id)
+    .bind(controller_id)
+    .bind(&appended_local)
+    .bind(Sha256::digest(appended_local.to_string().as_bytes()).to_vec())
+    .execute(&fixture.pool)
+    .await
+    .expect("insert unaffected post-retention LocalGoal fixture");
+    let mut append = fixture.pool.begin().await.expect("begin post-purge append");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *append)
+        .await
+        .expect("disable RLS for post-purge append fixture");
+    sqlx::query(
+        "INSERT INTO agent_task_intents (
+             id, project_id, task_resource_node_id, scope_resource_node_id,
+             required_actions, derived_by_identity_id
+         ) VALUES ($1, $2, $3, $3, '[\"assign_own_task\"]'::jsonb, $4)",
+    )
+    .bind(appended_intent_id)
+    .bind(fixture.project_id)
+    .bind(review_task)
+    .bind(controller_id)
+    .execute(&mut *append)
+    .await
+    .expect("append TaskIntent after retention");
+    sqlx::query(
+        "INSERT INTO agent_task_obligation_provenance (
+             id, project_id, task_intent_id, task_resource_node_id,
+             target_agent_id, local_goal_id, local_goal_revision,
+             obligation_id, work_spec_ordinal
+         ) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, 1)",
+    )
+    .bind(appended_provenance_id)
+    .bind(fixture.project_id)
+    .bind(appended_intent_id)
+    .bind(review_task)
+    .bind(agent_id)
+    .bind(appended_local_goal_id)
+    .bind(exact_obligation)
+    .execute(&mut *append)
+    .await
+    .expect("append task provenance after retention");
+    append.commit().await.expect("commit post-purge append");
+    let (semantic_intent_list_after_append, semantic_provenance_list_after_append) =
+        semantic_operational_lists(
+            &fixture.pool,
+            fixture.project_id,
+            controller_id,
+            controller_device,
+        )
+        .await;
+    assert_prefix(
+        &semantic_intent_list_after_purge_orders,
+        &semantic_intent_list_after_append,
+    );
+    assert_prefix(
+        &semantic_provenance_list_after_purge_orders,
+        &semantic_provenance_list_after_append,
+    );
+    assert_eq!(
+        semantic_intent_list_after_append.len(),
+        semantic_intent_list_after_purge_orders.len() + 1
+    );
+    assert_eq!(
+        semantic_provenance_list_after_append.len(),
+        semantic_provenance_list_after_purge_orders.len() + 1
+    );
+
+    let concurrent_ids = [
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    ];
+    let first_order = controlled_concurrent_intent_pair(
+        &fixture.pool,
+        fixture.project_id,
+        review_task,
+        controller_id,
+        concurrent_ids[0],
+        concurrent_ids[1],
+    )
+    .await;
+    let reverse_declared_order = controlled_concurrent_intent_pair(
+        &fixture.pool,
+        fixture.project_id,
+        review_task,
+        controller_id,
+        concurrent_ids[3],
+        concurrent_ids[2],
+    )
+    .await;
+    assert!(first_order.0 < first_order.1);
+    assert!(reverse_declared_order.0 < reverse_declared_order.1);
+    let (semantic_intent_list_after_concurrency, semantic_provenance_after_concurrency) =
+        semantic_operational_lists(
+            &fixture.pool,
+            fixture.project_id,
+            controller_id,
+            controller_device,
+        )
+        .await;
+    assert_prefix(
+        &semantic_intent_list_after_append,
+        &semantic_intent_list_after_concurrency,
+    );
+    assert_eq!(
+        semantic_intent_list_after_concurrency.len(),
+        semantic_intent_list_after_append.len() + 4
+    );
+    let mut concurrent_positions = semantic_intent_list_after_concurrency
+        .iter()
+        .filter(|entry| {
+            concurrent_ids
+                .iter()
+                .any(|id| entry["id"] == id.to_string())
+        })
+        .map(|entry| entry["semantic_position"].as_i64().expect("position"))
+        .collect::<Vec<_>>();
+    concurrent_positions.sort_unstable();
+    assert_eq!(concurrent_positions.len(), 4);
+    assert_eq!(concurrent_positions[1], concurrent_positions[0] + 1);
+    assert_eq!(concurrent_positions[2], concurrent_positions[1] + 1);
+    assert_eq!(concurrent_positions[3], concurrent_positions[2] + 1);
+    assert_eq!(
+        semantic_provenance_after_concurrency,
+        semantic_provenance_list_after_append
+    );
+
+    let retained_before_replay = retained_history_snapshot(&fixture.pool, fixture.project_id).await;
+    let ledger_before_replay = semantic_ledger_snapshot(&fixture.pool, fixture.project_id).await;
+    let second_purge =
+        sqlx::query_scalar::<_, bool>("SELECT sprout_private.purge_retention_subject($1, $2, $3)")
+            .bind(retention_subject_id)
+            .bind(retention_lease_token)
+            .bind(retention_now)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("repeat already-completed retention purge");
+    assert!(
+        second_purge,
+        "the established purge contract returns true for an already-purged subject"
+    );
+    let (semantic_intent_list_after_second_purge, semantic_provenance_after_second_purge) =
+        semantic_operational_lists(
+            &fixture.pool,
+            fixture.project_id,
+            controller_id,
+            controller_device,
+        )
+        .await;
+    assert_eq!(
+        semantic_intent_list_after_second_purge,
+        semantic_intent_list_after_concurrency
+    );
+    assert_eq!(
+        semantic_provenance_after_second_purge,
+        semantic_provenance_after_concurrency
+    );
+    assert_eq!(
+        semantic_ledger_snapshot(&fixture.pool, fixture.project_id).await,
+        ledger_before_replay
+    );
+    assert_eq!(
+        retained_history_snapshot(&fixture.pool, fixture.project_id).await,
+        retained_before_replay
+    );
+
+    let database_url = env::var("DATABASE_URL").expect("database URL for restart projection");
+    let restarted_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await
+        .expect("reconnect semantic projection after restart");
+    let (semantic_intent_list_after_restart, semantic_provenance_after_restart) =
+        semantic_operational_lists(
+            &restarted_pool,
+            fixture.project_id,
+            controller_id,
+            controller_device,
+        )
+        .await;
+    assert_eq!(
+        semantic_intent_list_after_restart,
+        semantic_intent_list_after_concurrency
+    );
+    assert_eq!(
+        semantic_provenance_after_restart,
+        semantic_provenance_after_concurrency
+    );
 }

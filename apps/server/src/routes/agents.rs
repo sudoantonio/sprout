@@ -2272,6 +2272,48 @@ pub async fn finalize_cross_owner_task_assignment(
             _ => return Err(AppError::Internal),
         },
     };
+    let projected = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT
+            EXISTS (
+                SELECT 1 FROM sprout_private.semantic_task_intent_list($1) intent
+                WHERE intent.id = $2
+                  AND intent.task_resource_node_id = $3
+                  AND intent.scope_resource_node_id = $3
+                  AND intent.required_actions = $4::jsonb
+                  AND intent.derived_by_identity_id = $5
+                  AND intent.recorded_at = $6
+            )
+            AND EXISTS (
+                SELECT 1 FROM sprout_private.semantic_task_provenance_list($1) provenance
+                WHERE provenance.task_intent_id = $2
+                  AND provenance.task_resource_node_id = $3
+                  AND provenance.agent_identity_id = $7
+                  AND provenance.local_goal_id = $8
+                  AND provenance.local_goal_revision = $9
+                  AND provenance.obligation_id = $10
+                  AND provenance.work_spec_ordinal = $11
+                  AND provenance.recorded_at = $12
+            )
+        "#,
+    )
+    .bind(project_id)
+    .bind(active.try_get::<Uuid, _>("task_intent_id")?)
+    .bind(task_resource_id)
+    .bind(serde_json::to_value(&intent.required_actions).map_err(|_| AppError::Internal)?)
+    .bind(actor.identity_id)
+    .bind(intent.recorded_at)
+    .bind(target_principal_id)
+    .bind(Uuid::from(local.id))
+    .bind(to_i64(local.revision)?)
+    .bind(provenance.obligation)
+    .bind(to_i64(provenance.work_spec_id)?)
+    .bind(provenance.recorded_at)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !projected {
+        return Err(AppError::Conflict);
+    }
     let facts = authoritative_local_condition_facts(&mut transaction, project_id, &local).await?;
     let provenance_obligation = local
         .contract
@@ -2472,6 +2514,50 @@ pub async fn materialize_cross_owner_task_assignment(
             _ => return Err(AppError::Internal),
         },
     };
+    let projected = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT
+            EXISTS (
+                SELECT 1 FROM sprout_private.semantic_task_intent_list($1) intent
+                WHERE intent.id = $2
+                  AND intent.task_resource_node_id = $3
+                  AND intent.scope_resource_node_id = $3
+                  AND intent.required_actions = $4::jsonb
+                  AND intent.derived_by_identity_id = $5
+                  AND intent.recorded_at = $6
+            )
+            AND EXISTS (
+                SELECT 1 FROM sprout_private.semantic_task_provenance_list($1) provenance
+                WHERE provenance.task_intent_id = $2
+                  AND provenance.task_resource_node_id = $3
+                  AND provenance.target_agent_id = $7
+                  AND provenance.agent_identity_id = $8
+                  AND provenance.local_goal_id = $9
+                  AND provenance.local_goal_revision = $10
+                  AND provenance.obligation_id = $11
+                  AND provenance.work_spec_ordinal = $12
+                  AND provenance.recorded_at = $13
+            )
+        "#,
+    )
+    .bind(project_id)
+    .bind(task_intent_id)
+    .bind(task_resource_id)
+    .bind(serde_json::to_value(&intent.required_actions).map_err(|_| AppError::Internal)?)
+    .bind(actor.identity_id)
+    .bind(intent.recorded_at)
+    .bind(target_agent_id)
+    .bind(target_principal_id)
+    .bind(Uuid::from(local.id))
+    .bind(to_i64(local.revision)?)
+    .bind(provenance.obligation)
+    .bind(to_i64(provenance.work_spec_id)?)
+    .bind(provenance.recorded_at)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !projected {
+        return Err(AppError::Conflict);
+    }
     let facts = authoritative_local_condition_facts(&mut transaction, project_id, &local).await?;
     if route_cross_owner_assignment(
         task_resource_id.into(),

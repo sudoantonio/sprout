@@ -2124,6 +2124,14 @@ BEGIN
         WHERE project_id = '30000000-0000-0000-0000-000000000001'
           AND identity_id = '91000000-0000-0000-0000-000000000001';
 
+        INSERT INTO devices (
+            id, identity_id, device_kind, encrypted_label, trust_state
+        ) VALUES (
+            '99600000-0000-0000-0000-000000000001',
+            '91000000-0000-0000-0000-000000000001',
+            'service', decode('9961', 'hex'), 'trusted'
+        );
+
         INSERT INTO resource_nodes (
             id, project_id, parent_id, node_kind,
             encrypted_metadata, created_by_identity_id
@@ -2217,6 +2225,19 @@ BEGIN
             '99100000-0000-0000-0000-000000000002'
         );
 
+        INSERT INTO agent_task_obligation_provenance (
+            id, project_id, task_intent_id, task_resource_node_id,
+            target_agent_id, local_goal_id, local_goal_revision,
+            obligation_id, work_spec_ordinal
+        ) VALUES (
+            '99600000-0000-0000-0000-000000000002',
+            '30000000-0000-0000-0000-000000000001', NULL,
+            '99000000-0000-0000-0000-000000000001',
+            '92000000-0000-0000-0000-000000000001',
+            '93000000-0000-0000-0000-000000000001', 1,
+            '95100000-0000-0000-0000-000000000001', 1
+        );
+
         UPDATE agent_run_claim_leases
         SET acquired_at = claim_time, expires_at = completion_time + interval '5 minutes'
         WHERE id = '98000000-0000-0000-0000-000000000001';
@@ -2293,6 +2314,32 @@ BEGIN
             '99700000-0000-0000-0000-000000000001'
         );
 
+        INSERT INTO agent_run_task_effects (
+            id, project_id, run_id, work_item_id, claim_id, attempt,
+            task_provenance_id, task_intent_id, task_resource_node_id,
+            task_id, task_assignment_id, task_completion_id,
+            target_agent_id, cross_owner_effect_id,
+            actor_identity_id, actor_device_id, idempotency_key,
+            request_hash, provenance_hash, applied_at
+        ) VALUES (
+            '99600000-0000-0000-0000-000000000003',
+            '30000000-0000-0000-0000-000000000001',
+            '94000000-0000-0000-0000-000000000001',
+            '97000000-0000-0000-0000-000000000001',
+            '98000000-0000-0000-0000-000000000001', 1,
+            '99600000-0000-0000-0000-000000000002', NULL,
+            '99000000-0000-0000-0000-000000000001',
+            '99100000-0000-0000-0000-000000000001',
+            '99200000-0000-0000-0000-000000000001',
+            '99300000-0000-0000-0000-000000000001',
+            '92000000-0000-0000-0000-000000000001', NULL,
+            '91000000-0000-0000-0000-000000000001',
+            '99600000-0000-0000-0000-000000000001',
+            '99600000-0000-0000-0000-000000000004',
+            decode(repeat('98', 32), 'hex'),
+            decode(repeat('99', 32), 'hex'), completion_time
+        );
+
         UPDATE agent_run_claim_leases
         SET status = 'released', terminal_at = completion_time
         WHERE id = '98000000-0000-0000-0000-000000000001';
@@ -2366,9 +2413,42 @@ BEGIN
             4, transition_kind, runtime_actor_kind, actor_identity_id,
             'task_completion', '99300000-0000-0000-0000-000000000001',
             decode(repeat('a3', 32), 'hex'), decode(repeat('a4', 32), 'hex'),
-            facts_hash, state_snapshot, fact_references
+            facts_hash,
+            state_snapshot || jsonb_build_object(
+                'causal_links', jsonb_build_array(jsonb_build_object(
+                    'predecessor', jsonb_build_object(
+                        'kind', 'work',
+                        'work', '97000000-0000-0000-0000-000000000001'
+                    ),
+                    'successor', jsonb_build_object(
+                        'kind', 'task',
+                        'task', '99000000-0000-0000-0000-000000000001'
+                    ),
+                    'observed_at', floor(extract(epoch FROM completion_time))::bigint
+                ))
+            ),
+            fact_references
         FROM agent_run_transitions
         WHERE id = '99700000-0000-0000-0000-000000000002';
+        INSERT INTO agent_run_causal_links (
+            project_id, run_id, goal_id, predecessor, successor,
+            observed_tick, transition_id, task_effect_id
+        ) VALUES (
+            '30000000-0000-0000-0000-000000000001',
+            '94000000-0000-0000-0000-000000000001',
+            '94100000-0000-0000-0000-000000000001',
+            jsonb_build_object(
+                'kind', 'work',
+                'work', '97000000-0000-0000-0000-000000000001'
+            ),
+            jsonb_build_object(
+                'kind', 'task',
+                'task', '99000000-0000-0000-0000-000000000001'
+            ),
+            floor(extract(epoch FROM completion_time))::bigint,
+            '99700000-0000-0000-0000-000000000003',
+            '99600000-0000-0000-0000-000000000003'
+        );
         INSERT INTO agent_run_work_outcomes (
             project_id, run_id, work_item_id, claim_id, attempt,
             outcome_kind, product_event_id, observed_at,

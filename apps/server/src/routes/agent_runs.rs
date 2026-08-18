@@ -10,13 +10,13 @@ use sha2::{Digest, Sha256};
 use sprout_api_contract::EncryptedPayloadDto;
 use sprout_domain::{
     AgentActionClass, AgentAvailabilityMode, BlockScope, BlockerId, BlockerResolutionFacts,
-    BlockerResolutionObservation, BlockerStatus, ClaimId, CollaborativeRunState,
-    CollaborativeRunStatus, ContractCondition, ContractConditionFacts, ContractEvidenceSubject,
-    CurrentLocalObligationContext, EvidenceId, EvidenceKind, EvidenceRecord, EvidenceSubject,
-    EvidenceVerificationMode, ExternalBlockerFacts, GlobalContractCandidate, GoalContract,
-    GoalStatus, GovernedAgent, LocalGoalContract, ObservedTerminalOutcome, ResourceId, RunId,
-    TaskObligationProvenance, UserId, WaitingCondition, WorkClaim, WorkItemId, WorkKind,
-    task_obligation_provenance_valid_at,
+    BlockerResolutionObservation, BlockerStatus, ClaimId, CollaborativeCausalLink,
+    CollaborativeCausalNode, CollaborativeRunState, CollaborativeRunStatus, ContractCondition,
+    ContractConditionFacts, ContractEvidenceSubject, CurrentLocalObligationContext, EvidenceId,
+    EvidenceKind, EvidenceRecord, EvidenceSubject, EvidenceVerificationMode, ExternalBlockerFacts,
+    GlobalContractCandidate, GoalContract, GoalStatus, GovernedAgent, LocalGoalContract,
+    ObservedTerminalOutcome, ResourceId, RunId, TaskObligationProvenance, UserId, WaitingCondition,
+    WorkClaim, WorkItemId, WorkKind, task_obligation_provenance_valid_at,
 };
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -335,8 +335,9 @@ pub async fn get(
     .fetch_optional(&mut *transaction)
     .await?
     .ok_or(AppError::NotFound)?;
-    let state: CollaborativeRunState =
+    let mut state: CollaborativeRunState =
         serde_json::from_value(row.try_get("state")?).map_err(|_| AppError::Internal)?;
+    state.causal_links = authoritative_causal_links(&mut transaction, project_id, run_id).await?;
     let state_version = positive_u64(row.try_get("state_version")?)?;
     transaction.commit().await?;
     Ok(Json(RunResponse {
@@ -616,6 +617,38 @@ pub async fn materialize_task_completion(
             _ => return Err(AppError::Internal),
         },
     };
+    let projected = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM sprout_private.semantic_task_provenance_list($1) provenance
+            WHERE provenance.id = $2
+              AND provenance.task_intent_id IS NOT DISTINCT FROM $3
+              AND provenance.task_resource_node_id = $4
+              AND provenance.agent_identity_id = $5
+              AND provenance.local_goal_id = $6
+              AND provenance.local_goal_revision = $7
+              AND provenance.obligation_id = $8
+              AND provenance.work_spec_ordinal = $9
+              AND provenance.recorded_at = $10
+        )
+        "#,
+    )
+    .bind(project_id)
+    .bind(task_provenance_id)
+    .bind(task_intent_id)
+    .bind(task_resource_id)
+    .bind(actor.identity_id)
+    .bind(snapshot.try_get::<Uuid, _>("local_goal_id")?)
+    .bind(to_i64(provenance.local_revision)?)
+    .bind(provenance.obligation)
+    .bind(to_i64(provenance.work_spec_id)?)
+    .bind(provenance.recorded_at)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !projected {
+        return Err(AppError::Conflict);
+    }
     if !task_obligation_provenance_valid_at(
         task_resource_id.into(),
         &governed,
@@ -736,6 +769,14 @@ pub async fn materialize_task_completion(
             UserId::from(actor.identity_id),
             &facts,
             tick,
+        )
+        .map_err(domain_error)?;
+    locked
+        .state
+        .record_task_effect_causal_link(
+            work.id,
+            ResourceId::from(task_resource_id),
+            datetime_tick(applied_at)?,
         )
         .map_err(domain_error)?;
     let transition = persist_transition(
@@ -1332,14 +1373,47 @@ async fn lock_run(
     let contract: GoalContract =
         serde_json::from_value(row.try_get("contract")?).map_err(|_| AppError::Internal)?;
     contract.validate().map_err(|_| AppError::Internal)?;
-    let state: CollaborativeRunState =
+    let mut state: CollaborativeRunState =
         serde_json::from_value(row.try_get("state")?).map_err(|_| AppError::Internal)?;
+    state.causal_links = authoritative_causal_links(transaction, project_id, run_id).await?;
     Ok(LockedRun {
         contract,
         state,
         state_hash: row.try_get("state_hash")?,
         state_version: row.try_get("state_version")?,
     })
+}
+
+async fn authoritative_causal_links(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    run_id: Uuid,
+) -> Result<Vec<CollaborativeCausalLink>, AppError> {
+    let rows = sqlx::query(
+        "SELECT goal_id, predecessor, successor, observed_tick
+         FROM sprout_private.semantic_run_causal_link_list($1, $2)",
+    )
+    .bind(project_id)
+    .bind(run_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(CollaborativeCausalLink {
+                run: RunId::from(run_id),
+                goal: row.try_get::<Uuid, _>("goal_id")?.into(),
+                predecessor: serde_json::from_value::<CollaborativeCausalNode>(
+                    row.try_get("predecessor")?,
+                )
+                .map_err(|_| AppError::Internal)?,
+                successor: serde_json::from_value::<CollaborativeCausalNode>(
+                    row.try_get("successor")?,
+                )
+                .map_err(|_| AppError::Internal)?,
+                observed_at: positive_u64(row.try_get("observed_tick")?)?,
+            })
+        })
+        .collect()
 }
 
 async fn authoritative_work_outcome(
@@ -1522,6 +1596,12 @@ async fn authoritative_evidence(
     let observed_datetime: DateTime<Utc> = row.try_get("observed_at")?;
     let observed_at = datetime_tick(observed_datetime)?;
     let task_resource_id = ResourceId::from(row.try_get::<Uuid, _>("resource_node_id")?);
+    if !locked
+        .state
+        .task_is_causal_successor(request.work_item_id, task_resource_id)
+    {
+        return Err(AppError::Conflict);
+    }
     let outcome_hash: Vec<u8> = row.try_get("provenance_hash")?;
     let provenance_hash = digest_json(&serde_json::json!({
         "project_id": project_id,
@@ -2085,12 +2165,41 @@ async fn persist_kernel_certificates(
         .await?;
     }
     for link in &state.causal_links {
+        let task_effect_id = match (&link.predecessor, &link.successor) {
+            (CollaborativeCausalNode::Work { work }, CollaborativeCausalNode::Task { task }) => {
+                sqlx::query_scalar::<_, Uuid>(
+                    r#"
+                SELECT link.task_effect_id
+                FROM agent_run_causal_links link
+                WHERE link.project_id = $1 AND link.run_id = $2
+                  AND link.predecessor = $3 AND link.successor = $4
+                UNION ALL
+                SELECT effect.id
+                FROM agent_run_task_effects effect
+                WHERE effect.project_id = $1 AND effect.run_id = $2
+                  AND effect.work_item_id = $5
+                  AND effect.task_resource_node_id = $6
+                LIMIT 1
+                "#,
+                )
+                .bind(project_id)
+                .bind(Uuid::from(state.id))
+                .bind(canonical_value(&link.predecessor)?)
+                .bind(canonical_value(&link.successor)?)
+                .bind(Uuid::from(*work))
+                .bind(Uuid::from(*task))
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or(AppError::Conflict)?
+            }
+            _ => Uuid::nil(),
+        };
         sqlx::query(
             r#"
             INSERT INTO agent_run_causal_links (
                 project_id, run_id, goal_id, predecessor, successor,
-                observed_tick, transition_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                observed_tick, transition_id, task_effect_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, $9))
             ON CONFLICT (project_id, run_id, predecessor, successor) DO NOTHING
             "#,
         )
@@ -2101,6 +2210,8 @@ async fn persist_kernel_certificates(
         .bind(canonical_value(&link.successor)?)
         .bind(to_i64(link.observed_at)?)
         .bind(transition_id)
+        .bind(task_effect_id)
+        .bind(Uuid::nil())
         .execute(&mut **transaction)
         .await?;
     }

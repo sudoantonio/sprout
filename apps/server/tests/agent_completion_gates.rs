@@ -804,13 +804,14 @@ async fn complete_task_event(
     completion_id
 }
 
-async fn bind_claim_to_task_product(
+async fn assert_global_task_materialization_without_grounding_fails_closed(
+    app: &axum::Router,
     fixture: &Fixture,
     agent: &AgentFixture,
     run_id: Uuid,
     claim: &Value,
     task: &ProductTask,
-) -> Uuid {
+) {
     let claim_id: Uuid = claim["id"]
         .as_str()
         .expect("claim id")
@@ -821,112 +822,138 @@ async fn bind_claim_to_task_product(
         .expect("work item id")
         .parse()
         .expect("UUID");
-    let attempt =
-        i32::try_from(claim["attempt"].as_u64().expect("attempt")).expect("attempt fits i32");
-    let completion_id = complete_task_event(fixture, agent, task).await;
-    let invocation_id = Uuid::new_v4();
-    let effect_id = Uuid::new_v4();
-    let mut transaction = fixture.pool.begin().await.expect("begin product binding");
+    let completion_id = Uuid::new_v4();
+    let mut transaction = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin exact task provenance");
     sqlx::query("SET LOCAL row_security = off")
         .execute(&mut *transaction)
         .await
-        .expect("disable RLS for product binding fixture");
-    let bound_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-        "SELECT completed_at FROM task_completions WHERE id = $1",
-    )
-    .bind(completion_id)
-    .fetch_one(&mut *transaction)
-    .await
-    .expect("load completion observation time");
-    let claim_transition_id = sqlx::query_scalar::<_, Uuid>(
+        .expect("disable RLS for provenance fixture");
+    let source = sqlx::query(
         r#"
-        SELECT id FROM agent_run_transitions
-        WHERE project_id = $1 AND run_id = $2
-          AND transition_kind = 'work_claimed'
-          AND state_snapshot #>> ARRAY['claims', $3::text, 'status'] = 'active'
-        ORDER BY state_version DESC LIMIT 1
-        "#,
-    )
-    .bind(fixture.project_id)
-    .bind(run_id)
-    .bind(claim_id)
-    .fetch_one(&mut *transaction)
-    .await
-    .expect("load authoritative claim transition");
-    sqlx::query(
-        r#"
-        INSERT INTO agent_invocations (
-            id, project_id, agent_id, agent_identity_id,
-            language_task, authority_envelope, encrypted_input, request_hash,
-            status, attempt, max_attempts, completed_at,
-            encrypted_output, output_hash, created_by_identity_id
-        ) VALUES ($1, $2, $3, $4, '{}'::jsonb, '{}'::jsonb,
-                  decode('05', 'hex'), $5, 'succeeded', 1, 1, $6,
-                  decode('06', 'hex'), $7, $8)
-        "#,
-    )
-    .bind(invocation_id)
-    .bind(fixture.project_id)
-    .bind(agent.agent_id)
-    .bind(agent.identity_id)
-    .bind(Sha256::digest(invocation_id.as_bytes()).to_vec())
-    .bind(bound_at)
-    .bind(Sha256::digest(effect_id.as_bytes()).to_vec())
-    .bind(fixture.owner_id)
-    .execute(&mut *transaction)
-    .await
-    .expect("insert succeeded product invocation");
-    sqlx::query(
-        r#"
-        INSERT INTO agent_effect_proposals (
-            id, project_id, invocation_id, agent_id, ordinal, effect,
-            proposal_hash, status, decided_at, applied_at
-        ) VALUES ($1, $2, $3, $4, 0, $5, $6, 'applied', $7, $7)
-        "#,
-    )
-    .bind(effect_id)
-    .bind(fixture.project_id)
-    .bind(invocation_id)
-    .bind(agent.agent_id)
-    .bind(json!({
-        "effect": {
-            "resource_id": task.resource_id,
-            "operation": "complete_assigned_task"
-        },
-        "materialization": { "kind": "complete_assigned_task" }
-    }))
-    .bind(Sha256::digest(effect_id.as_bytes()).to_vec())
-    .bind(bound_at)
-    .execute(&mut *transaction)
-    .await
-    .expect("insert applied task effect");
-    sqlx::query(
-        r#"
-        INSERT INTO agent_run_work_product_bindings (
-            project_id, run_id, work_item_id, claim_id, attempt,
-            invocation_id, effect_id, resource_node_id, bound_at,
-            claim_transition_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        SELECT source.local_goal_id, source.local_revision,
+               (spec ->> 'obligation')::uuid AS obligation_id,
+               slot.work_spec_ordinal
+        FROM agent_collaborative_runs run
+        JOIN agent_run_work_slots slot
+          ON slot.project_id = run.project_id
+         AND slot.run_id = run.id
+         AND slot.work_item_id = $3
+        JOIN agent_global_contract_sources source
+          ON source.project_id = run.project_id
+         AND source.global_contract_id = run.global_contract_id
+         AND source.global_revision = run.global_contract_revision
+         AND source.agent_id = $4
+        JOIN agent_local_goal_contracts local
+          ON local.project_id = source.project_id
+         AND local.id = source.local_goal_id
+         AND local.revision = source.local_revision
+         AND local.agent_id = source.agent_id
+         AND local.state = 'active'
+        JOIN LATERAL jsonb_array_elements(local.contract -> 'contract' -> 'work_specs') spec
+          ON (spec ->> 'id')::bigint = slot.work_spec_ordinal
+        WHERE run.project_id = $1 AND run.id = $2
         "#,
     )
     .bind(fixture.project_id)
     .bind(run_id)
     .bind(work_item_id)
-    .bind(claim_id)
-    .bind(attempt)
-    .bind(invocation_id)
-    .bind(effect_id)
+    .bind(agent.agent_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("load exact grounded local source");
+    let provenance_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO agent_task_obligation_provenance (
+            id, project_id, task_intent_id, task_resource_node_id,
+            target_agent_id, local_goal_id, local_goal_revision,
+            obligation_id, work_spec_ordinal
+        ) VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(provenance_id)
+    .bind(fixture.project_id)
     .bind(task.resource_id)
-    .bind(bound_at)
-    .bind(claim_transition_id)
+    .bind(agent.agent_id)
+    .bind(source.try_get::<Uuid, _>("local_goal_id").unwrap())
+    .bind(source.try_get::<i64, _>("local_revision").unwrap())
+    .bind(source.try_get::<Uuid, _>("obligation_id").unwrap())
+    .bind(source.try_get::<i64, _>("work_spec_ordinal").unwrap())
     .execute(&mut *transaction)
     .await
-    .expect("bind work to preexisting product provenance");
+    .expect("insert exact task-obligation provenance");
     transaction
         .commit()
         .await
-        .expect("commit product binding fixture");
-    completion_id
+        .expect("commit exact task provenance");
+
+    let (status, materialized) = request_json(
+        app.clone(),
+        Method::POST,
+        format!(
+            "/v1/projects/{}/agent-runs/{run_id}/claims/{claim_id}/materialize-task-completion",
+            fixture.project_id
+        ),
+        &agent.token,
+        json!({
+            "effect_id": Uuid::new_v4(),
+            "completion_id": completion_id,
+            "expected_payload_version": 1,
+            "encrypted_completion": {
+                "version": 1,
+                "algorithm": "aes-256-gcm",
+                "key_id": "global-causal-completion-key",
+                "nonce_b64": "AQEBAQEBAQEBAQEB",
+                "ciphertext_b64": "AgM="
+            },
+            "idempotency_key": Uuid::new_v4()
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a contribution with coincident IDs is not structured global grounding: {materialized}"
+    );
+    let residues = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        r#"
+        SELECT
+          (SELECT count(*) FROM task_completions
+           WHERE project_id = $1 AND id = $2),
+          (SELECT count(*) FROM agent_run_task_effects
+           WHERE project_id = $1 AND run_id = $3 AND work_item_id = $4),
+          (SELECT count(*) FROM agent_run_work_outcomes
+           WHERE project_id = $1 AND run_id = $3 AND work_item_id = $4),
+          (SELECT count(*) FROM agent_run_causal_links
+           WHERE project_id = $1 AND run_id = $3
+             AND predecessor = jsonb_build_object('kind', 'work', 'work', $4::uuid)
+             AND successor ->> 'kind' = 'task'),
+          (SELECT count(*) FROM agent_run_transitions
+           WHERE project_id = $1 AND run_id = $3
+             AND transition_kind = 'work_succeeded')
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(completion_id)
+    .bind(run_id)
+    .bind(work_item_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count failed-closed global materialization residues");
+    assert_eq!(residues, (0, 0, 0, 0, 0));
+    let task_state = sqlx::query_scalar::<_, String>(
+        "SELECT state FROM tasks WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(task.task_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load task after rejected global materialization");
+    assert_eq!(task_state, "open");
 }
 
 #[tokio::test]
@@ -1239,6 +1266,42 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
         materialized["state"]["work_items"][work_item_id.to_string()]["status"],
         "succeeded"
     );
+    let causal_links = materialized["state"]["causal_links"]
+        .as_array()
+        .expect("authoritative semantic causal links");
+    assert!(causal_links.iter().any(|link| {
+        link["predecessor"] == json!({ "kind": "work", "work": work_item_id })
+            && link["successor"] == json!({ "kind": "task", "task": bound_task.resource_id })
+    }));
+    assert!(!causal_links.iter().any(|link| {
+        link["predecessor"] == json!({ "kind": "task", "task": bound_task.resource_id })
+            && link["successor"] == json!({ "kind": "work", "work": work_item_id })
+    }));
+    assert!(
+        causal_links
+            .iter()
+            .any(|link| link["predecessor"]["kind"] == "obligation"),
+        "relational hydration must retain pre-existing non-task causal links"
+    );
+    let persisted_causal = sqlx::query_as::<_, (Uuid, i64, i64)>(
+        r#"
+        SELECT link.task_effect_id, link.causal_position,
+               count(*) OVER ()
+        FROM agent_run_causal_links link
+        WHERE link.project_id = $1 AND link.run_id = $2
+          AND link.predecessor = jsonb_build_object('kind', 'work', 'work', $3::uuid)
+          AND link.successor = jsonb_build_object('kind', 'task', 'task', $4::uuid)
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .bind(work_item_id)
+    .bind(bound_task.resource_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact persisted Work -> Task edge");
+    assert_eq!(persisted_causal.0, effect_id);
+    assert_eq!(persisted_causal.2, 1);
 
     let (status, replayed) = request_json(
         app.clone(),
@@ -1254,6 +1317,20 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
         "replay causal task effect: {replayed}"
     );
     assert_eq!(replayed["replayed"], true);
+    let causal_count_after_replay = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_run_causal_links
+         WHERE project_id = $1 AND run_id = $2
+           AND predecessor = jsonb_build_object('kind', 'work', 'work', $3::uuid)
+           AND successor = jsonb_build_object('kind', 'task', 'task', $4::uuid)",
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .bind(work_item_id)
+    .bind(bound_task.resource_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count causal edge after idempotent replay");
+    assert_eq!(causal_count_after_replay, 1);
     let mut mismatched = body;
     mismatched["encrypted_completion"]["ciphertext_b64"] = json!("BAU=");
     let (status, _) = request_json(
@@ -1266,8 +1343,54 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
 
+    let reloaded = read_run(&app, &fixture, run_id, &agent.token).await;
+    assert_eq!(
+        reloaded["state"]["causal_links"],
+        materialized["state"]["causal_links"]
+    );
+    let persisted_position_after_reload = sqlx::query_scalar::<_, i64>(
+        "SELECT causal_position FROM agent_run_causal_links
+         WHERE project_id = $1 AND task_effect_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(effect_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("reload stable causal position");
+    assert_eq!(persisted_position_after_reload, persisted_causal.1);
+
+    let wrong_evidence_id = Uuid::new_v4();
+    let (status, _) = request_json(
+        app.clone(),
+        Method::POST,
+        format!(
+            "/v1/projects/{}/agent-runs/{run_id}/evidence",
+            fixture.project_id
+        ),
+        &agent.token,
+        json!({
+            "id": wrong_evidence_id,
+            "rule_id": 1,
+            "work_item_id": work_item_id,
+            "source": { "kind": "task_completion", "id": unrelated_completion }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let wrong_evidence_residue = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_run_evidence_provenance
+         WHERE project_id = $1 AND run_id = $2 AND evidence_id = $3",
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .bind(wrong_evidence_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count rejected non-successor evidence");
+    assert_eq!(wrong_evidence_residue, 0);
+
     let (status, evidenced) = request_json(
-        app,
+        app.clone(),
         Method::POST,
         format!(
             "/v1/projects/{}/agent-runs/{run_id}/evidence",
@@ -1294,10 +1417,19 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
 
     let effect = sqlx::query(
         "SELECT effect.task_resource_node_id, effect.task_completion_id,
-                effect.cross_owner_effect_id, effect.applied_at, claim.expires_at
+                effect.task_intent_id, effect.cross_owner_effect_id,
+                effect.actor_identity_id, agent.principal_identity_id,
+                ledger.principal_identity_id AS projected_identity_id,
+                effect.applied_at, claim.expires_at
          FROM agent_run_task_effects effect
          JOIN agent_run_claim_leases claim
            ON claim.project_id = effect.project_id AND claim.id = effect.claim_id
+         JOIN governed_agents agent
+           ON agent.project_id = effect.project_id AND agent.id = effect.target_agent_id
+         JOIN agent_semantic_operational_ledger ledger
+           ON ledger.entry_kind = 'task_provenance'
+          AND ledger.project_id = effect.project_id
+          AND ledger.record_id = effect.task_provenance_id
          WHERE effect.project_id = $1 AND effect.id = $2",
     )
     .bind(fixture.project_id)
@@ -1314,11 +1446,29 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
         completion_id
     );
     assert_eq!(
+        effect.try_get::<Option<Uuid>, _>("task_intent_id").unwrap(),
+        None,
+        "TaskIntent remains optional on the generic bridge"
+    );
+    assert_eq!(
         effect
             .try_get::<Option<Uuid>, _>("cross_owner_effect_id")
             .unwrap(),
         None
     );
+    assert_eq!(
+        effect.try_get::<Uuid, _>("actor_identity_id").unwrap(),
+        agent.identity_id
+    );
+    assert_eq!(
+        effect.try_get::<Uuid, _>("principal_identity_id").unwrap(),
+        agent.identity_id
+    );
+    assert_eq!(
+        effect.try_get::<Uuid, _>("projected_identity_id").unwrap(),
+        agent.identity_id
+    );
+    assert_ne!(agent.identity_id, agent.agent_id);
     assert!(
         effect
             .try_get::<chrono::DateTime<chrono::Utc>, _>("applied_at")
@@ -1328,6 +1478,122 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
                 .unwrap(),
         "accepted effect must be strictly before claim expiry"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn semantic_list_security_definer_is_not_public_or_identity_spoofable() {
+    let foreign = fixture().await;
+    let fixture = fixture().await;
+    sqlx::query(
+        r#"
+        DO $role$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_roles WHERE rolname = 'sprout_semantic_list_app'
+            ) THEN
+                CREATE ROLE sprout_semantic_list_app NOSUPERUSER NOBYPASSRLS NOLOGIN;
+            END IF;
+        END
+        $role$
+        "#,
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("create unprivileged semantic-list app role");
+    let migration_owner = sqlx::query_scalar::<_, String>("SELECT current_user")
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("load migration owner");
+    sqlx::query("GRANT sprout_semantic_list_app TO CURRENT_USER")
+        .execute(&fixture.pool)
+        .await
+        .expect("allow test owner to assume semantic-list app role");
+
+    for signature in [
+        "sprout_private.semantic_task_intent_list(uuid)",
+        "sprout_private.semantic_task_provenance_list(uuid)",
+        "sprout_private.semantic_run_causal_link_list(uuid,uuid)",
+    ] {
+        let metadata = sqlx::query_as::<_, (bool, bool, String, String)>(
+            "SELECT procedure.prosecdef,
+                    has_function_privilege('sprout_semantic_list_app', procedure.oid, 'EXECUTE'),
+                    owner.rolname,
+                    COALESCE(array_to_string(procedure.proconfig, ','), '')
+             FROM pg_proc procedure
+             JOIN pg_roles owner ON owner.oid = procedure.proowner
+             WHERE procedure.oid = $1::regprocedure",
+        )
+        .bind(signature)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("load semantic-list function security metadata");
+        assert!(metadata.0, "{signature} must remain SECURITY DEFINER");
+        assert!(
+            !metadata.1,
+            "{signature} must not be executable by app/PUBLIC"
+        );
+        assert_eq!(metadata.2, migration_owner);
+        assert!(metadata.3.contains("search_path=public, pg_temp"));
+        assert!(metadata.3.contains("row_security=off"));
+    }
+
+    let mut spoof = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin identity spoof gate");
+    sqlx::query("SET LOCAL ROLE sprout_semantic_list_app")
+        .execute(&mut *spoof)
+        .await
+        .expect("assume unprivileged app role");
+    sqlx::query(
+        "SELECT set_config('app.identity_id', $1, true),
+                set_config('app.device_id', $2, true),
+                set_config('app.project_id', $3, true)",
+    )
+    .bind(foreign.owner_id.to_string())
+    .bind(foreign.owner_device_id.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *spoof)
+    .await
+    .expect("forge cross-project custom GUCs");
+    sqlx::query(
+        r#"
+        DO $spoof$
+        BEGIN
+            BEGIN
+                PERFORM 1 FROM sprout_private.semantic_task_intent_list(
+                    current_setting('app.project_id')::uuid
+                );
+                RAISE EXCEPTION 'forged identity read TaskIntent list';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+            BEGIN
+                PERFORM 1 FROM sprout_private.semantic_task_provenance_list(
+                    current_setting('app.project_id')::uuid
+                );
+                RAISE EXCEPTION 'forged identity read provenance list';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+            BEGIN
+                PERFORM 1 FROM sprout_private.semantic_run_causal_link_list(
+                    current_setting('app.project_id')::uuid, gen_random_uuid()
+                );
+                RAISE EXCEPTION 'forged identity read causal-link list';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+        END
+        $spoof$
+        "#,
+    )
+    .execute(&mut *spoof)
+    .await
+    .expect("all semantic list functions reject forged app-role identity");
+    spoof
+        .rollback()
+        .await
+        .expect("rollback identity spoof gate");
 }
 
 #[tokio::test]
@@ -1875,11 +2141,11 @@ async fn claim_concurrency_recovery_and_scheduler_bounds_are_persistent() {
 
 #[tokio::test]
 #[ignore = "requires a migrated disposable PostgreSQL database"]
-async fn global_completion_waits_for_every_participant_and_required_work() {
+async fn global_task_materialization_without_structured_grounding_fails_closed() {
     let fixture = fixture().await;
     let local_one_obligation = Uuid::new_v4();
     let local_two_obligation = Uuid::new_v4();
-    let local_one_contract = goal_contract(
+    let mut local_one_contract = goal_contract(
         fixture.scope_resource_id,
         &[(
             fixture.agents[0].identity_id,
@@ -1892,7 +2158,8 @@ async fn global_completion_waits_for_every_participant_and_required_work() {
             "task_action",
         )],
     );
-    let local_two_contract = goal_contract(
+    local_one_contract["work_specs"][0]["allowed_actions"] = json!(["mark_assigned_done"]);
+    let mut local_two_contract = goal_contract(
         fixture.scope_resource_id,
         &[(
             fixture.agents[1].identity_id,
@@ -1905,17 +2172,16 @@ async fn global_completion_waits_for_every_participant_and_required_work() {
             "task_action",
         )],
     );
+    local_two_contract["work_specs"][0]["allowed_actions"] = json!(["mark_assigned_done"]);
     let local_one = insert_local_goal(&fixture, &fixture.agents[0], local_one_contract).await;
     let local_two = insert_local_goal(&fixture, &fixture.agents[1], local_two_contract).await;
 
-    let global_one_obligation = Uuid::new_v4();
-    let global_two_obligation = Uuid::new_v4();
-    let global_contract = goal_contract(
+    let mut global_contract = goal_contract(
         fixture.scope_resource_id,
         &[
             (
                 fixture.agents[0].identity_id,
-                global_one_obligation,
+                local_one_obligation,
                 1,
                 json!({ "kind": "always" }),
                 true,
@@ -1925,7 +2191,7 @@ async fn global_completion_waits_for_every_participant_and_required_work() {
             ),
             (
                 fixture.agents[1].identity_id,
-                global_two_obligation,
+                local_two_obligation,
                 2,
                 json!({ "kind": "always" }),
                 true,
@@ -1935,6 +2201,8 @@ async fn global_completion_waits_for_every_participant_and_required_work() {
             ),
         ],
     );
+    global_contract["work_specs"][0]["allowed_actions"] = json!(["mark_assigned_done"]);
+    global_contract["work_specs"][1]["allowed_actions"] = json!(["mark_assigned_done"]);
     let global_id = insert_global_contract(
         &fixture,
         global_contract,
@@ -1966,7 +2234,8 @@ async fn global_completion_waits_for_every_participant_and_required_work() {
 
     let first_claim = claim(&test_app, &fixture, run_id, &fixture.agents[0]).await;
     let first_task = create_open_task(&fixture, &fixture.agents[0]).await;
-    let first_completion = bind_claim_to_task_product(
+    assert_global_task_materialization_without_grounding_fails_closed(
+        &test_app,
         &fixture,
         &fixture.agents[0],
         run_id,
@@ -1974,127 +2243,11 @@ async fn global_completion_waits_for_every_participant_and_required_work() {
         &first_task,
     )
     .await;
-    let first_claim_id = first_claim["id"]
-        .as_str()
-        .expect("first claim")
-        .parse()
-        .expect("first claim UUID");
-    let (status, after_first_work) = succeed(
-        &test_app,
-        &fixture,
-        run_id,
-        &fixture.agents[0],
-        first_claim_id,
-        Some(first_completion),
-    )
-    .await;
+    let reloaded = read_run(&test_app, &fixture, run_id, &fixture.owner_token).await;
+    assert_eq!(reloaded["state"]["goal_status"], "active");
+    assert_eq!(reloaded["state"]["run_status"], "running");
     assert_eq!(
-        status,
-        StatusCode::OK,
-        "first participant work: {after_first_work}"
+        reloaded["state"]["work_items"][first_claim["work"].as_str().unwrap()]["status"],
+        "claimed"
     );
-    assert_eq!(after_first_work["state"]["goal_status"], "active");
-    assert_eq!(after_first_work["state"]["run_status"], "running");
-    assert!(
-        after_first_work["state"]["work_items"]
-            .as_object()
-            .is_some_and(|items| items.values().any(|work| {
-                work["owner"] == fixture.agents[1].identity_id.to_string()
-                    && !matches!(
-                        work["status"].as_str(),
-                        Some("succeeded" | "failed" | "cancelled")
-                    )
-            }))
-    );
-    let (status, _) = request_json(
-        test_app.clone(),
-        Method::POST,
-        format!(
-            "/v1/projects/{}/agent-runs/{run_id}/complete",
-            fixture.project_id
-        ),
-        &fixture.owner_token,
-        json!({}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-
-    let second_claim = claim(&test_app, &fixture, run_id, &fixture.agents[1]).await;
-    let second_task = create_open_task(&fixture, &fixture.agents[1]).await;
-    let second_completion = bind_claim_to_task_product(
-        &fixture,
-        &fixture.agents[1],
-        run_id,
-        &second_claim,
-        &second_task,
-    )
-    .await;
-    let second_claim_id = second_claim["id"]
-        .as_str()
-        .expect("second claim")
-        .parse()
-        .expect("second claim UUID");
-    let (status, after_second_work) = succeed(
-        &test_app,
-        &fixture,
-        run_id,
-        &fixture.agents[1],
-        second_claim_id,
-        Some(second_completion),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "second participant work: {after_second_work}"
-    );
-    assert_eq!(after_second_work["state"]["goal_status"], "active");
-
-    for (rule_id, work, completion) in [
-        (1_u64, &first_claim["work"], first_completion),
-        (2_u64, &second_claim["work"], second_completion),
-    ] {
-        let (status, evidence) = request_json(
-            test_app.clone(),
-            Method::POST,
-            format!(
-                "/v1/projects/{}/agent-runs/{run_id}/evidence",
-                fixture.project_id
-            ),
-            &fixture.owner_token,
-            json!({
-                "id": Uuid::new_v4(),
-                "rule_id": rule_id,
-                "work_item_id": work,
-                "source": { "kind": "task_completion", "id": completion }
-            }),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "accept mechanical evidence: {evidence}"
-        );
-        if rule_id == 1 {
-            assert_eq!(evidence["state"]["goal_status"], "active");
-            assert_eq!(evidence["state"]["run_status"], "running");
-        } else {
-            assert_eq!(evidence["state"]["goal_status"], "completed");
-            assert_eq!(evidence["state"]["run_status"], "running");
-        }
-    }
-    let (status, completed) = request_json(
-        test_app,
-        Method::POST,
-        format!(
-            "/v1/projects/{}/agent-runs/{run_id}/complete",
-            fixture.project_id
-        ),
-        &fixture.owner_token,
-        json!({}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "complete global run: {completed}");
-    assert_eq!(completed["state"]["goal_status"], "completed");
-    assert_eq!(completed["state"]["run_status"], "completed");
 }
