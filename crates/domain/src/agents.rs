@@ -3066,6 +3066,300 @@ pub enum LocalGoalOrigin {
     GlobalMandate { global_revision: u64 },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPromptReviewDisposition {
+    Rewrite,
+    RequestAdministratorReview,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdministratorResponsibilityDecisionMode {
+    Rejected,
+    ApprovedGoalOnly,
+    ApprovedGoalAndResponsibility,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserEscalationConsent {
+    pub review_id: Uuid,
+    pub user: UserId,
+    pub source_draft_id: Uuid,
+    pub consented: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsibilityExceptionReview {
+    pub id: Uuid,
+    pub user: UserId,
+    pub agent: UserId,
+    pub administrator: UserId,
+    pub source_draft_id: Uuid,
+    pub review_task: ResourceId,
+    pub excess_summary: EncryptedPayload,
+    pub proposed_local: LocalGoalContract,
+}
+
+impl ResponsibilityExceptionReview {
+    pub fn validate(
+        &self,
+        consent: &UserEscalationConsent,
+        task_is_exact: impl Fn(ResourceId, UserId, UserId) -> bool,
+    ) -> Result<(), AgentValidationError> {
+        if consent.review_id != self.id
+            || consent.user != self.user
+            || consent.source_draft_id != self.source_draft_id
+            || !consent.consented
+            || self.proposed_local.agent != self.agent
+            || self.proposed_local.controller != self.user
+            || !task_is_exact(self.review_task, self.agent, self.administrator)
+        {
+            return Err(AgentValidationError::InvalidExceptionGovernanceChain);
+        }
+        self.proposed_local.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdministratorResponsibilityReviewDraft {
+    pub review_id: Uuid,
+    pub revision: u64,
+    pub administrator: UserId,
+    pub final_local: LocalGoalContract,
+    pub final_responsibility: Option<ResponsibilityContract>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdministratorResponsibilityDecision {
+    pub review_id: Uuid,
+    pub review_draft_revision: u64,
+    pub administrator: UserId,
+    pub mode: AdministratorResponsibilityDecisionMode,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedLocalGoalException {
+    pub review_id: Uuid,
+    pub administrator: UserId,
+    pub user: UserId,
+    pub local: LocalGoalContract,
+}
+
+pub fn validate_approved_local_goal_exception(
+    review: &ResponsibilityExceptionReview,
+    draft: &AdministratorResponsibilityReviewDraft,
+    decision: &AdministratorResponsibilityDecision,
+    approved: &ApprovedLocalGoalException,
+    review_task_done: bool,
+) -> Result<(), AgentValidationError> {
+    if !review_task_done
+        || draft.review_id != review.id
+        || decision.review_id != review.id
+        || decision.review_draft_revision != draft.revision
+        || draft.administrator != review.administrator
+        || decision.administrator != review.administrator
+        || matches!(
+            decision.mode,
+            AdministratorResponsibilityDecisionMode::Rejected
+        )
+        || (matches!(
+            decision.mode,
+            AdministratorResponsibilityDecisionMode::ApprovedGoalAndResponsibility
+        ) && draft.final_responsibility.is_none())
+        || draft.final_local.agent != review.agent
+        || draft.final_local.controller != review.user
+        || approved.review_id != review.id
+        || approved.administrator != review.administrator
+        || approved.user != review.user
+        || approved.local != draft.final_local
+        || approved.local.origin
+            != (LocalGoalOrigin::AdministratorException {
+                review_id: review.id,
+            })
+    {
+        return Err(AgentValidationError::InvalidExceptionGovernanceChain);
+    }
+    draft.final_local.validate()
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedPermissionFootprint {
+    pub resource_effects: Vec<ResourceEffect>,
+    pub tools: Vec<String>,
+}
+
+impl ProposedPermissionFootprint {
+    pub fn validate(&self) -> Result<(), AgentValidationError> {
+        ensure_unique(&self.resource_effects, "coverage resource effect")?;
+        ensure_unique(&self.tools, "coverage tool")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalCoverageNeed {
+    pub global_revision: u64,
+    pub obligation: Uuid,
+    pub required: ProposedPermissionFootprint,
+}
+
+pub fn derive_global_coverage_need(
+    candidate: &GlobalContractCandidate,
+    obligation: Uuid,
+) -> Result<GlobalCoverageNeed, AgentValidationError> {
+    if !candidate
+        .contract
+        .obligations
+        .iter()
+        .any(|candidate| candidate.id == obligation)
+    {
+        return Err(AgentValidationError::InvalidGlobalCoverageNeed);
+    }
+    let required = derive_obligation_permission_footprint(&candidate.contract, obligation)?;
+    let need = GlobalCoverageNeed {
+        global_revision: candidate.revision,
+        obligation,
+        required,
+    };
+    need.required.validate()?;
+    Ok(need)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalMandateAssignment {
+    pub global_revision: u64,
+    pub assigned_by: UserId,
+    pub need: GlobalCoverageNeed,
+    pub local: LocalGoalContract,
+}
+
+impl GlobalMandateAssignment {
+    pub fn validate(
+        &self,
+        agent: &GovernedAgent,
+        assigner_is_administrator: bool,
+        current_resource_permission: impl Fn(&ResourceEffect) -> bool,
+        current_tool_permission: impl Fn(&str) -> bool,
+    ) -> Result<(), AgentValidationError> {
+        let exact_local_footprint =
+            derive_obligation_permission_footprint(&self.local.contract, self.need.obligation)?;
+        if self.need.global_revision != self.global_revision
+            || exact_local_footprint != self.need.required
+            || self.local.origin
+                != (LocalGoalOrigin::GlobalMandate {
+                    global_revision: self.global_revision,
+                })
+            || !assigner_is_administrator
+            || agent.principal_id != self.local.agent
+            || agent.controller_id != self.local.controller
+            || agent.availability != AgentAvailabilityMode::ProjectDelegable
+            || self
+                .need
+                .required
+                .resource_effects
+                .iter()
+                .any(|effect| !current_resource_permission(effect))
+            || self
+                .need
+                .required
+                .tools
+                .iter()
+                .any(|tool| !current_tool_permission(tool))
+        {
+            return Err(AgentValidationError::InvalidGlobalMandateAssignment);
+        }
+        self.need.required.validate()?;
+        self.local.validate()
+    }
+}
+
+fn derive_obligation_permission_footprint(
+    contract: &GoalContract,
+    obligation: Uuid,
+) -> Result<ProposedPermissionFootprint, AgentValidationError> {
+    // Concrete Sprout compiler policy: a GoalContract has one resource scope
+    // and every exact PromptRequirement bound to its WorkSpecs is required by
+    // `LocalGoalCompilerOutput::validate_within_envelope` to use that same
+    // scope.  Resource actions therefore target `contract.scope`; the action
+    // class alone is never treated as a resource identity.  This is structural
+    // exactness under the endpoint compiler TCB, not a claim that the server
+    // understands the semantic plaintext.  Exact tool identity remains closed
+    // below because it is not carried by the WorkSpec action class.
+    if !contract
+        .obligations
+        .iter()
+        .any(|candidate| candidate.id == obligation)
+    {
+        return Err(AgentValidationError::InvalidGlobalCoverageNeed);
+    }
+    let mut resource_effects = Vec::new();
+    let mut found_work = false;
+    for work in contract
+        .work_specs
+        .iter()
+        .filter(|work| work.obligation == obligation)
+    {
+        found_work = true;
+        for action in &work.allowed_actions {
+            let Some(operation) = action.required_resource_operation() else {
+                // Neither a global candidate nor an assigned LocalGoal carries
+                // the exact tool identity for this action class.  Preserve the
+                // semantic boundary instead of inventing a tool binding.
+                return Err(AgentValidationError::GlobalCoverageToolNotGrounded);
+            };
+            let effect = ResourceEffect {
+                resource_id: contract.scope,
+                operation,
+            };
+            if !resource_effects.contains(&effect) {
+                resource_effects.push(effect);
+            }
+        }
+    }
+    if !found_work || resource_effects.is_empty() {
+        return Err(AgentValidationError::InvalidGlobalCoverageNeed);
+    }
+    Ok(ProposedPermissionFootprint {
+        resource_effects,
+        tools: Vec::new(),
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewAgentForGlobalNeedProposal {
+    pub proposed_agent: UserId,
+    pub controller: UserId,
+    pub need: GlobalCoverageNeed,
+    pub local: LocalGoalContract,
+    pub requested: ProposedPermissionFootprint,
+}
+
+impl NewAgentForGlobalNeedProposal {
+    pub fn validate(&self) -> Result<(), AgentValidationError> {
+        if self.local.agent != self.proposed_agent
+            || self.local.controller != self.controller
+            || self.local.origin
+                != (LocalGoalOrigin::GlobalMandate {
+                    global_revision: self.need.global_revision,
+                })
+            || self.requested != self.need.required
+        {
+            return Err(AgentValidationError::GlobalProposalFootprintMismatch);
+        }
+        self.requested.validate()?;
+        self.local.validate()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalGoalContract {
@@ -3328,7 +3622,7 @@ pub fn validate_global_synthesis(
     Ok(())
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ResourceEffect {
     pub resource_id: ResourceId,
     pub operation: ResourceOperation,
@@ -3756,18 +4050,20 @@ pub enum HumanGovernanceDecisionReason {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovernanceFactRef {
     LocalRevision { revision: u64 },
     ResponsibilityRevision { revision: u64 },
     UncoveredWorkSpec { work_spec_id: u64 },
     Task { task: ResourceId },
     Agent { agent: UserId },
+    Draft { draft_id: Uuid },
     ActionIntent { intent_id: Uuid },
     PermissionScope { resource: ResourceId },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BriefGovernanceSummary {
     pub id: Uuid,
     pub reason: HumanGovernanceDecisionReason,
@@ -3782,6 +4078,43 @@ impl BriefGovernanceSummary {
             return Err(AgentValidationError::InvalidGovernanceSummary);
         }
         ensure_unique(&self.facts, "governance fact")
+    }
+
+    pub fn validate_escalation(
+        &self,
+        source_draft_id: Uuid,
+        source_revision: u64,
+    ) -> Result<(), AgentValidationError> {
+        self.validate()?;
+        if self.reason != HumanGovernanceDecisionReason::SendResponsibilityExceptionToAdministrator
+            || !self.facts.contains(&GovernanceFactRef::Draft {
+                draft_id: source_draft_id,
+            })
+            || !self.facts.contains(&GovernanceFactRef::LocalRevision {
+                revision: source_revision,
+            })
+        {
+            return Err(AgentValidationError::InvalidGovernanceSummary);
+        }
+        Ok(())
+    }
+
+    pub fn validate_administrator_decision(
+        &self,
+        agent: UserId,
+        final_local_revision: u64,
+    ) -> Result<(), AgentValidationError> {
+        self.validate()?;
+        if self.reason
+            != HumanGovernanceDecisionReason::AdministratorResponsibilityExceptionDecision
+            || !self.facts.contains(&GovernanceFactRef::Agent { agent })
+            || !self.facts.contains(&GovernanceFactRef::LocalRevision {
+                revision: final_local_revision,
+            })
+        {
+            return Err(AgentValidationError::InvalidGovernanceSummary);
+        }
+        Ok(())
     }
 }
 
@@ -4003,6 +4336,16 @@ pub enum AgentValidationError {
     UnknownWorkSpec,
     #[error("every work specification must be classified")]
     UnclassifiedWorkSpec,
+    #[error("administrator exception governance chain is incomplete or inconsistent")]
+    InvalidExceptionGovernanceChain,
+    #[error("global coverage need is not grounded in an exact obligation/work set")]
+    InvalidGlobalCoverageNeed,
+    #[error("global coverage contains a tool action without exact tool grounding")]
+    GlobalCoverageToolNotGrounded,
+    #[error("global mandate assignment is stale, incompatible or unauthorized")]
+    InvalidGlobalMandateAssignment,
+    #[error("new-agent proposal footprint differs from the certified global need")]
+    GlobalProposalFootprintMismatch,
     #[error("local goal revision does not exactly supersede its predecessor")]
     InvalidLocalGoalRevision,
     #[error("proxy plan is not bound to its planning envelope")]
@@ -4262,12 +4605,158 @@ mod tests {
     }
 
     #[test]
+    fn local_compiler_requirement_scope_cannot_diverge_from_contract_scope() {
+        let (mut output, envelope) = local_compiler_fixture(
+            AgentActionClass::PostComment,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        output.requirements[0].scope = ResourceId::new();
+        assert_eq!(
+            output.validate_within_envelope(&envelope),
+            Err(AgentValidationError::CompilationEnvelopeMismatch)
+        );
+    }
+
+    #[test]
     fn administrator_creation_origin_never_contributes_bottom_up() {
         let mut local = local_goal(UserId::new(), UserId::new());
         local.origin = LocalGoalOrigin::AdministratorCreation {
             approval_id: Uuid::from_u128(9),
         };
         assert!(!local.can_contribute_bottom_up());
+    }
+
+    #[test]
+    fn approved_exception_requires_the_exact_terminal_chain() {
+        let administrator = UserId::new();
+        let user = UserId::new();
+        let agent = UserId::new();
+        let review_id = Uuid::now_v7();
+        let source_draft_id = Uuid::now_v7();
+        let review_task = ResourceId::new();
+        let consent = UserEscalationConsent {
+            review_id,
+            user,
+            source_draft_id,
+            consented: true,
+        };
+        let mut local = local_goal(agent, user);
+        local.origin = LocalGoalOrigin::AdministratorException { review_id };
+        let review = ResponsibilityExceptionReview {
+            id: review_id,
+            user,
+            agent,
+            administrator,
+            source_draft_id,
+            review_task,
+            excess_summary: payload(),
+            proposed_local: local.clone(),
+        };
+        review
+            .validate(&consent, |task, creator, assignee| {
+                task == review_task && creator == agent && assignee == administrator
+            })
+            .unwrap();
+        let draft = AdministratorResponsibilityReviewDraft {
+            review_id,
+            revision: 1,
+            administrator,
+            final_local: local.clone(),
+            final_responsibility: None,
+        };
+        let decision = AdministratorResponsibilityDecision {
+            review_id,
+            review_draft_revision: 1,
+            administrator,
+            mode: AdministratorResponsibilityDecisionMode::ApprovedGoalOnly,
+        };
+        let approved = ApprovedLocalGoalException {
+            review_id,
+            administrator,
+            user,
+            local,
+        };
+        assert_eq!(
+            validate_approved_local_goal_exception(&review, &draft, &decision, &approved, true),
+            Ok(())
+        );
+        let mut wrong = approved;
+        wrong.review_id = Uuid::now_v7();
+        assert_eq!(
+            validate_approved_local_goal_exception(&review, &draft, &decision, &wrong, true),
+            Err(AgentValidationError::InvalidExceptionGovernanceChain)
+        );
+        assert_eq!(
+            validate_approved_local_goal_exception(&review, &draft, &decision, &wrong, false),
+            Err(AgentValidationError::InvalidExceptionGovernanceChain)
+        );
+    }
+
+    #[test]
+    fn global_mandate_is_exact_permission_bounded_and_not_bottom_up() {
+        let administrator = UserId::new();
+        let controller = UserId::new();
+        let agent_id = UserId::new();
+        let project = ProjectId::new();
+        let mut local = local_goal(agent_id, controller);
+        local.origin = LocalGoalOrigin::GlobalMandate { global_revision: 4 };
+        let candidate = GlobalContractCandidate {
+            revision: 4,
+            contract: local.contract.clone(),
+            contributions: vec![GlobalLocalContribution {
+                agent: agent_id,
+                local_revision: local.revision,
+                local_clause_id: local.clauses[0].id,
+                global_work_spec_ids: vec![1],
+            }],
+            governance_conflicts: Vec::new(),
+        };
+        let need =
+            derive_global_coverage_need(&candidate, local.contract.obligations[0].id).unwrap();
+        let governed = GovernedAgent {
+            id: AgentId::new(),
+            principal_id: agent_id,
+            controller_id: controller,
+            project_id: project,
+            availability: AgentAvailabilityMode::ProjectDelegable,
+        };
+        let assignment = GlobalMandateAssignment {
+            global_revision: 4,
+            assigned_by: administrator,
+            need: need.clone(),
+            local: local.clone(),
+        };
+        assert_eq!(
+            assignment.validate(&governed, true, |_| true, |_| false),
+            Ok(())
+        );
+        assert!(!local.can_contribute_bottom_up());
+        assert_eq!(
+            assignment.validate(&governed, true, |_| false, |_| false),
+            Err(AgentValidationError::InvalidGlobalMandateAssignment)
+        );
+        // Exact requirements in the concrete 0029 compiler are scoped to the
+        // GoalContract.  Equal action classes on distinct contract scopes must
+        // therefore project to distinct resource effects.
+        let mut other_scope = candidate.clone();
+        other_scope.contract.scope = ResourceId::new();
+        let other_need =
+            derive_global_coverage_need(&other_scope, local.contract.obligations[0].id).unwrap();
+        assert_ne!(other_need.required, need.required);
+        assert_ne!(
+            other_need.required.resource_effects[0].resource_id,
+            need.required.resource_effects[0].resource_id
+        );
+        let proposal = NewAgentForGlobalNeedProposal {
+            proposed_agent: agent_id,
+            controller,
+            need: need.clone(),
+            local,
+            requested: need.required,
+        };
+        assert_eq!(proposal.validate(), Ok(()));
     }
 
     fn local_goal_with_conditional_continuation(

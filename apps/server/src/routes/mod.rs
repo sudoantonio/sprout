@@ -99,6 +99,26 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             axum::routing::put(agents::record_local_goal),
         )
         .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/local-goal-dispositions",
+            post(agents::record_local_draft_disposition),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/exception-consents",
+            post(agents::record_exception_consent),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/exception-reviews",
+            post(agents::record_exception_review),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/exception-reviews/{review_id}/drafts",
+            post(agents::record_exception_administrator_draft),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/exception-reviews/{review_id}/decision",
+            post(agents::decide_exception_review),
+        )
+        .route(
             "/v1/projects/{project_id}/agents/{agent_id}/local-goals/{local_goal_id}/revisions/{revision}/activate",
             post(agents::activate_local_goal),
         )
@@ -113,6 +133,18 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         .route(
             "/v1/projects/{project_id}/agent-global-contracts",
             post(agents::record_global_contract),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-global-coverage-needs",
+            post(agents::record_global_coverage_need),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/global-mandates",
+            post(agents::record_global_mandate),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-global-new-agent-proposals",
+            post(agents::record_global_agent_proposal),
         )
         .route(
             "/v1/projects/{project_id}/agent-runs",

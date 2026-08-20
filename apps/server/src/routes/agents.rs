@@ -12,23 +12,29 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sprout_api_contract::{CreateTaskRequest, EncryptedPayloadDto};
 use sprout_crypto_protocol::{canonical_governance_json, verify_ed25519_ml_dsa65_signatures};
 use sprout_domain::{
+    AdministratorResponsibilityDecisionMode, AdministratorResponsibilityReviewDraft,
     AgentActionClass, AgentAvailabilityMode, AgentId, AgentInterrogationCausalDelta,
-    AgentInterrogationSession, AuthorityEnvelope, CollaborativeRunState, ContractCondition,
-    ContractConditionFacts, CrossOwnerAssignmentRoute, CurrentLocalObligationContext,
-    EncryptedPayload, GlobalContractCandidate, GovernedAgent, InformationSource, InterrogationId,
-    InvocationId, LOCAL_GOAL_CLASSIFIER_VERSION, LocalGoalCompilationEnvelope,
-    LocalGoalCompilerOutput, LocalGoalContract, LocalGoalOrigin, ModelExposureProjection,
-    ModelInvocationContext, PersistedTaskIntent, PrincipalKind, ProjectId, ProxyExecution,
+    AgentInterrogationSession, ApprovedLocalGoalException, AuthorityEnvelope,
+    BriefGovernanceSummary, CollaborativeRunState, ContractCondition, ContractConditionFacts,
+    CrossOwnerAssignmentRoute, CurrentLocalObligationContext, EncryptedPayload,
+    GlobalContractCandidate, GlobalCoverageNeed, GlobalMandateAssignment, GovernedAgent,
+    InformationSource, InterrogationId, InvocationId, LOCAL_GOAL_CLASSIFIER_VERSION,
+    LocalGoalCompilationEnvelope, LocalGoalCompilerOutput, LocalGoalContract, LocalGoalOrigin,
+    LocalPromptReviewDisposition, ModelExposureProjection, ModelInvocationContext,
+    NewAgentForGlobalNeedProposal, PersistedTaskIntent, PrincipalKind, ProjectId, ProxyExecution,
     ProxyRequestId, ProxyThreadId, ResourceEffect, ResourceId, ResourceOperation,
     ResponsibilityCompilationEnvelope, ResponsibilityCompilerOutput, ResponsibilityContract,
-    StructuredGlobalSynthesisEnvelope, StructuredGlobalWorkGrounding, StructuredLanguageOutput,
-    StructuredLanguageTaskEnvelope, StructuredLanguageTaskKind, TaskObligationProvenance, UserId,
-    UserProxy, UserProxyActionPlan, UserProxyOutOfResponsibilityConfirmation,
-    UserProxyPlanningEnvelope, UserProxyRequest, UserProxyThread, classify_local_goal_contract,
+    ResponsibilityExceptionReview, StructuredGlobalSynthesisEnvelope,
+    StructuredGlobalWorkGrounding, StructuredLanguageOutput, StructuredLanguageTaskEnvelope,
+    StructuredLanguageTaskKind, TaskObligationProvenance, UserEscalationConsent, UserId, UserProxy,
+    UserProxyActionPlan, UserProxyOutOfResponsibilityConfirmation, UserProxyPlanningEnvelope,
+    UserProxyRequest, UserProxyThread, classify_local_goal_contract, derive_global_coverage_need,
     responsibility_operationally_covers_local_goal, route_cross_owner_assignment,
-    validate_global_synthesis, validate_information_flow, validate_state_grounded_invocation,
+    validate_approved_local_goal_exception, validate_global_synthesis, validate_information_flow,
+    validate_state_grounded_invocation,
 };
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -44,6 +50,8 @@ const COMPILATION_SIGNATURE_CONTEXT: &[u8] = b"sprout-governance-compilation-v1"
 const FINAL_PROMPT_APPROVAL_SIGNATURE_CONTEXT: &[u8] = b"sprout-final-prompt-approval-v1";
 const ADMINISTRATOR_AGENT_CREATION_SIGNATURE_CONTEXT: &[u8] =
     b"sprout-administrator-agent-creation-v1";
+const EXCEPTION_CONSENT_SIGNATURE_CONTEXT: &[u8] = b"sprout-local-goal-exception-consent-v1";
+const EXCEPTION_DECISION_SIGNATURE_CONTEXT: &[u8] = b"sprout-local-goal-exception-decision-v1";
 const LOCAL_GOAL_COMPILER_PROTOCOL_MANIFEST: &[u8] =
     include_bytes!("../../tcb/sprout-local-goal-compiler-v1.json");
 const RESPONSIBILITY_COMPILER_PROTOCOL_MANIFEST: &[u8] =
@@ -104,7 +112,7 @@ pub struct ResponsibilityCompilationStatement {
     idempotency_key: Uuid,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedResponsibilityCompilation {
     statement: ResponsibilityCompilationStatement,
@@ -132,7 +140,7 @@ pub struct LocalGoalCompilationStatement {
     idempotency_key: Uuid,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedLocalGoalCompilation {
     statement: LocalGoalCompilationStatement,
@@ -157,7 +165,7 @@ pub struct FinalPromptApprovalStatement {
     idempotency_key: Uuid,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedFinalPromptApproval {
     statement: FinalPromptApprovalStatement,
@@ -187,7 +195,7 @@ pub struct AdministratorAgentCreationApprovalStatement {
     idempotency_key: Uuid,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedAdministratorAgentCreationApproval {
     statement: AdministratorAgentCreationApprovalStatement,
@@ -852,7 +860,7 @@ pub async fn activate_local_goal(
         }
         _ => return Err(AppError::Internal),
     };
-    validate_local_authorization(
+    let responsibility_activation = validate_local_authorization(
         &mut transaction,
         project_id,
         actor,
@@ -947,6 +955,40 @@ pub async fn activate_local_goal(
     .await?;
     if updated_prompt.rows_affected() != 1 {
         return Err(AppError::Conflict);
+    }
+    if let Some((responsibility_id, responsibility_revision, supersedes_revision)) =
+        responsibility_activation
+    {
+        let superseded = sqlx::query(
+            "UPDATE agent_responsibility_contracts
+             SET state='superseded', superseded_at=clock_timestamp()
+             WHERE project_id=$1 AND user_identity_id=$2 AND id=$3
+               AND revision=$4 AND state='active'",
+        )
+        .bind(project_id)
+        .bind(actor.identity_id)
+        .bind(responsibility_id)
+        .bind(to_i64(supersedes_revision)?)
+        .execute(&mut *transaction)
+        .await?;
+        if superseded.rows_affected() != 1 {
+            return Err(AppError::Conflict);
+        }
+        let activated = sqlx::query(
+            "UPDATE agent_responsibility_contracts
+             SET state='active', activated_at=clock_timestamp()
+             WHERE project_id=$1 AND user_identity_id=$2 AND id=$3
+               AND revision=$4 AND state='draft'",
+        )
+        .bind(project_id)
+        .bind(actor.identity_id)
+        .bind(responsibility_id)
+        .bind(to_i64(responsibility_revision)?)
+        .execute(&mut *transaction)
+        .await?;
+        if activated.rows_affected() != 1 {
+            return Err(AppError::Conflict);
+        }
     }
     persist_final_prompt_approval(
         &mut transaction,
@@ -1563,12 +1605,1632 @@ pub async fn activate_user_responsibility(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordLocalGoalRequest {
     encrypted_prompt: EncryptedPayload,
     supersedes_revision: Option<u64>,
     compilation: SignedLocalGoalCompilation,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordLocalDraftDispositionRequest {
+    event_id: Uuid,
+    idempotency_key: Uuid,
+    disposition: LocalPromptReviewDisposition,
+    source: RecordLocalGoalRequest,
+    summary: Option<BriefGovernanceSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExceptionConsentStatement {
+    event_id: Uuid,
+    idempotency_key: Uuid,
+    project_id: Uuid,
+    consent: UserEscalationConsent,
+    summary: BriefGovernanceSummary,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedExceptionConsent {
+    statement: ExceptionConsentStatement,
+    signatures: CompilationSignatures,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordExceptionReviewRequest {
+    event_id: Uuid,
+    idempotency_key: Uuid,
+    review: ResponsibilityExceptionReview,
+    review_task: CreateTaskRequest,
+    review_assignment_id: Uuid,
+    review_permission_grant_id: Uuid,
+    encrypted_assignment: EncryptedPayloadDto,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordAdministratorReviewDraftRequest {
+    event_id: Uuid,
+    idempotency_key: Uuid,
+    revision: u64,
+    encrypted_prompt: EncryptedPayload,
+    local_compilation: SignedLocalGoalCompilation,
+    final_responsibility: Option<SignedResponsibilityCompilation>,
+    final_responsibility_encrypted_source: Option<EncryptedPayload>,
+    final_responsibility_supersedes_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdministratorReviewDraftEventPayload {
+    draft: AdministratorResponsibilityReviewDraft,
+    encrypted_prompt: EncryptedPayload,
+    local_compilation: SignedLocalGoalCompilation,
+    final_responsibility: Option<SignedResponsibilityCompilation>,
+    final_responsibility_encrypted_source: Option<EncryptedPayload>,
+    final_responsibility_supersedes_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExceptionDecisionStatement {
+    event_id: Uuid,
+    idempotency_key: Uuid,
+    project_id: Uuid,
+    decision: sprout_domain::AdministratorResponsibilityDecision,
+    summary: BriefGovernanceSummary,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedExceptionDecision {
+    statement: ExceptionDecisionStatement,
+    signatures: CompilationSignatures,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordGlobalCoverageNeedRequest {
+    event_id: Uuid,
+    idempotency_key: Uuid,
+    global_contract_id: Uuid,
+    global_revision: u64,
+    obligation_id: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordGlobalMandateRequest {
+    event_id: Uuid,
+    idempotency_key: Uuid,
+    need_id: Uuid,
+    supersedes_revision: u64,
+    encrypted_prompt: EncryptedPayload,
+    compilation: SignedLocalGoalCompilation,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordGlobalAgentProposalRequest {
+    event_id: Uuid,
+    idempotency_key: Uuid,
+    need_id: Uuid,
+    global_contract_id: Uuid,
+    proposal: NewAgentForGlobalNeedProposal,
+    encrypted_prompt: EncryptedPayload,
+    compilation: SignedLocalGoalCompilation,
+}
+
+fn build_certified_local_contract(
+    encrypted_prompt: EncryptedPayload,
+    compilation: &SignedLocalGoalCompilation,
+    supersedes_revision: Option<u64>,
+    origin: LocalGoalOrigin,
+) -> Result<(LocalGoalContract, [u8; 32], [u8; 32]), AppError> {
+    let statement = &compilation.statement;
+    statement
+        .output
+        .validate_within_envelope(&statement.envelope)
+        .map_err(agent_validation_error)?;
+    let prompt_bytes = serialize_ciphertext(&encrypted_prompt)?;
+    let ciphertext_commitment: [u8; 32] = Sha256::digest(&prompt_bytes).into();
+    if decode_commitment(&statement.ciphertext_commitment_hex)? != ciphertext_commitment
+        || decode_commitment(&statement.output_hash_hex)? != canonical_hash(&statement.output)?
+        || decode_commitment(&statement.envelope_hash_hex)? != canonical_hash(&statement.envelope)?
+    {
+        return Err(AppError::BadRequest(
+            "compiler artifact commitment mismatch",
+        ));
+    }
+    let clauses = classify_local_goal_contract(&statement.output.contract);
+    let classifier_output_hash = canonical_hash(&clauses)?;
+    let contract = LocalGoalContract {
+        id: statement.local_goal_id.into(),
+        revision: statement.local_revision,
+        agent: statement.agent_principal_identity_id,
+        controller: statement.controller_identity_id,
+        encrypted_prompt,
+        contract: statement.output.contract.clone(),
+        clauses,
+        origin,
+        supersedes_revision,
+    };
+    contract.validate().map_err(agent_validation_error)?;
+    Ok((contract, ciphertext_commitment, classifier_output_hash))
+}
+
+async fn require_exact_active_local_base(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    agent_id: Uuid,
+    contract: &LocalGoalContract,
+) -> Result<(), AppError> {
+    if contract.revision <= 1 {
+        return Err(AppError::Conflict);
+    }
+    let supersedes = contract.supersedes_revision.ok_or(AppError::Conflict)?;
+    let previous_json = sqlx::query_scalar::<_, String>(
+        "SELECT contract::text FROM agent_local_goal_contracts
+         WHERE project_id = $1 AND agent_id = $2 AND id = $3
+           AND revision = $4 AND state = 'active' FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(Uuid::from(contract.id))
+    .bind(to_i64(supersedes)?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let previous: LocalGoalContract =
+        serde_json::from_str(&previous_json).map_err(|_| AppError::Internal)?;
+    contract
+        .validate_revision_of(&previous)
+        .map_err(agent_validation_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_certified_local_draft(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    agent_id: Uuid,
+    expected_signer: UserId,
+    encrypted_prompt: EncryptedPayload,
+    compilation: &SignedLocalGoalCompilation,
+    supersedes_revision: Option<u64>,
+    origin: LocalGoalOrigin,
+) -> Result<LocalGoalContract, AppError> {
+    let statement = &compilation.statement;
+    let (contract, ciphertext_commitment, classifier_output_hash) =
+        build_certified_local_contract(encrypted_prompt, compilation, supersedes_revision, origin)?;
+    if statement.project_id != project_id {
+        return Err(AppError::Conflict);
+    }
+    require_exact_active_local_base(transaction, project_id, agent_id, &contract).await?;
+    let within_scope = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM resource_closure
+         WHERE project_id = $1 AND ancestor_id = $2 AND descendant_id = $3)",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(statement.envelope.project_scope))
+    .bind(Uuid::from(contract.contract.scope))
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !within_scope {
+        return Err(AppError::Forbidden);
+    }
+    let build_digest =
+        require_pinned_compiler(transaction, "local_goal", &statement.compiler).await?;
+    let certificate_hash = verify_device_statement_for_signer(
+        transaction,
+        expected_signer,
+        statement,
+        &compilation.signatures,
+        COMPILATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let (authorization_kind, authorization_id, authorization_revision) =
+        local_authorization_columns(&statement.authorization);
+    persist_compilation_certificate(
+        transaction,
+        project_id,
+        CompilationRecord {
+            id: statement.certificate_id,
+            task_kind: "local_goal",
+            compiler: &statement.compiler,
+            build_digest,
+            signer: &compilation.signatures,
+            subject_id: Uuid::from(contract.id),
+            subject_revision: contract.revision,
+            draft_id: statement.draft_id,
+            agent_principal_identity_id: Some(Uuid::from(contract.agent)),
+            controller_identity_id: Some(Uuid::from(contract.controller)),
+            administrator_identity_id: None,
+            user_identity_id: None,
+            input_commitment: decode_commitment(&statement.prompt_commitment_hex)?,
+            ciphertext_commitment,
+            output_json: governance_canonical_json(&statement.output)?,
+            output_hash: decode_commitment(&statement.output_hash_hex)?,
+            envelope_json: governance_canonical_json(&statement.envelope)?,
+            envelope_hash: decode_commitment(&statement.envelope_hash_hex)?,
+            certificate_hash,
+            idempotency_key: statement.idempotency_key,
+            classifier_version: Some(LOCAL_GOAL_CLASSIFIER_VERSION),
+            classifier_output_hash: Some(classifier_output_hash),
+            authorization_kind,
+            authorization_id,
+            authorization_revision,
+        },
+    )
+    .await?;
+    let contract_json = canonical_json(&contract)?;
+    let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
+    let existing = sqlx::query_as::<_, (Vec<u8>, Uuid, Vec<u8>)>(
+        "SELECT local.contract_hash, prompt.draft_id, prompt.prompt_hash
+         FROM agent_local_goal_contracts local
+         JOIN agent_prompt_revisions prompt ON prompt.project_id=local.project_id
+          AND prompt.agent_id=local.agent_id AND prompt.local_goal_id=local.id
+          AND prompt.local_goal_revision=local.revision
+         WHERE local.project_id=$1 AND local.agent_id=$2 AND local.id=$3
+           AND local.revision=$4 AND local.state='draft' AND prompt.state='draft'",
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(Uuid::from(contract.id))
+    .bind(to_i64(contract.revision)?)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some((stored_hash, stored_draft, stored_prompt_hash)) = existing {
+        if stored_hash == contract_hash
+            && stored_draft == statement.draft_id
+            && stored_prompt_hash == ciphertext_commitment
+        {
+            return Ok(contract);
+        }
+        return Err(AppError::Conflict);
+    }
+    sqlx::query(
+        "INSERT INTO agent_local_goal_contracts (
+            id, project_id, agent_id, agent_identity_id, controller_identity_id,
+            revision, contract, contract_hash, state, compilation_certificate_id,
+            classifier_version, classifier_output_hash
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,'draft',$9,$10,$11)",
+    )
+    .bind(Uuid::from(contract.id))
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(Uuid::from(contract.agent))
+    .bind(Uuid::from(contract.controller))
+    .bind(to_i64(contract.revision)?)
+    .bind(&contract_json)
+    .bind(contract_hash.as_slice())
+    .bind(statement.certificate_id)
+    .bind(to_i32(LOCAL_GOAL_CLASSIFIER_VERSION)?)
+    .bind(classifier_output_hash.as_slice())
+    .execute(&mut **transaction)
+    .await?;
+    append_verified_governance_revision(
+        transaction,
+        project_id,
+        "local_goal_revision",
+        Uuid::from(contract.id),
+        contract.revision,
+        statement.certificate_id,
+        contract_hash,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent_prompt_revisions (
+            project_id, agent_id, draft_id, local_goal_id, local_goal_revision,
+            encrypted_prompt, prompt_hash, state
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,'draft')",
+    )
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(statement.draft_id)
+    .bind(Uuid::from(contract.id))
+    .bind(to_i64(contract.revision)?)
+    .bind(serialize_ciphertext(&contract.encrypted_prompt)?)
+    .bind(ciphertext_commitment.as_slice())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(contract)
+}
+
+async fn persist_certified_responsibility_draft(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    expected_administrator: UserId,
+    expected_user: UserId,
+    encrypted_source: EncryptedPayload,
+    supersedes_revision: u64,
+    signed: &SignedResponsibilityCompilation,
+) -> Result<ResponsibilityContract, AppError> {
+    let statement = &signed.statement;
+    if statement.project_id != project_id
+        || statement.administrator_identity_id != expected_administrator
+        || statement.user_identity_id != expected_user
+    {
+        return Err(AppError::Conflict);
+    }
+    statement
+        .output
+        .validate_within_envelope(&statement.envelope)
+        .map_err(agent_validation_error)?;
+    let encrypted_bytes = serialize_ciphertext(&encrypted_source)?;
+    let ciphertext_commitment: [u8; 32] = Sha256::digest(&encrypted_bytes).into();
+    if decode_commitment(&statement.ciphertext_commitment_hex)? != ciphertext_commitment
+        || decode_commitment(&statement.output_hash_hex)? != canonical_hash(&statement.output)?
+        || decode_commitment(&statement.envelope_hash_hex)? != canonical_hash(&statement.envelope)?
+    {
+        return Err(AppError::BadRequest(
+            "compiler artifact commitment mismatch",
+        ));
+    }
+    let contract = ResponsibilityContract {
+        id: statement.responsibility_id.into(),
+        revision: statement.revision,
+        administrator: expected_administrator,
+        user: expected_user,
+        encrypted_source_text: encrypted_source,
+        rules: statement.output.rules.clone(),
+        supersedes_revision: Some(supersedes_revision),
+    };
+    contract
+        .validate(
+            |principal| {
+                if principal == expected_administrator {
+                    Some(PrincipalKind::Administrator)
+                } else if principal == expected_user {
+                    Some(PrincipalKind::User)
+                } else {
+                    None
+                }
+            },
+            |_, _| true,
+        )
+        .map_err(agent_validation_error)?;
+    let supersedes = contract.supersedes_revision.ok_or(AppError::Conflict)?;
+    let previous_json = sqlx::query_scalar::<_, String>(
+        "SELECT contract::text FROM agent_responsibility_contracts
+         WHERE project_id=$1 AND user_identity_id=$2 AND id=$3
+           AND revision=$4 AND state='active' FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(expected_user))
+    .bind(Uuid::from(contract.id))
+    .bind(to_i64(supersedes)?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let previous: ResponsibilityContract =
+        serde_json::from_str(&previous_json).map_err(|_| AppError::Internal)?;
+    contract
+        .validate_revision_of(&previous)
+        .map_err(agent_validation_error)?;
+    let build_digest =
+        require_pinned_compiler(transaction, "responsibility", &statement.compiler).await?;
+    let certificate_hash = verify_device_statement_for_signer(
+        transaction,
+        expected_administrator,
+        statement,
+        &signed.signatures,
+        COMPILATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    persist_compilation_certificate(
+        transaction,
+        project_id,
+        CompilationRecord {
+            id: statement.certificate_id,
+            task_kind: "responsibility",
+            compiler: &statement.compiler,
+            build_digest,
+            signer: &signed.signatures,
+            subject_id: Uuid::from(contract.id),
+            subject_revision: contract.revision,
+            draft_id: statement.draft_id,
+            agent_principal_identity_id: None,
+            controller_identity_id: None,
+            administrator_identity_id: Some(Uuid::from(expected_administrator)),
+            user_identity_id: Some(Uuid::from(expected_user)),
+            input_commitment: decode_commitment(&statement.source_text_commitment_hex)?,
+            ciphertext_commitment,
+            output_json: governance_canonical_json(&statement.output)?,
+            output_hash: decode_commitment(&statement.output_hash_hex)?,
+            envelope_json: governance_canonical_json(&statement.envelope)?,
+            envelope_hash: decode_commitment(&statement.envelope_hash_hex)?,
+            certificate_hash,
+            idempotency_key: statement.idempotency_key,
+            classifier_version: None,
+            classifier_output_hash: None,
+            authorization_kind: "responsibility_compilation",
+            authorization_id: None,
+            authorization_revision: None,
+        },
+    )
+    .await?;
+    let contract_json = canonical_json(&contract)?;
+    let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
+    let existing = sqlx::query_as::<_, (Vec<u8>, String)>(
+        "SELECT contract_hash, state FROM agent_responsibility_contracts
+         WHERE project_id=$1 AND id=$2 AND revision=$3",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(contract.id))
+    .bind(to_i64(contract.revision)?)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some((stored_hash, stored_state)) = existing {
+        if stored_hash == contract_hash && stored_state == "draft" {
+            return Ok(contract);
+        }
+        return Err(AppError::Conflict);
+    }
+    sqlx::query(
+        "INSERT INTO agent_responsibility_contracts (
+            id,project_id,revision,administrator_identity_id,user_identity_id,
+            contract,contract_hash,state,compilation_certificate_id
+         ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,'draft',$8)",
+    )
+    .bind(Uuid::from(contract.id))
+    .bind(project_id)
+    .bind(to_i64(contract.revision)?)
+    .bind(Uuid::from(expected_administrator))
+    .bind(Uuid::from(expected_user))
+    .bind(&contract_json)
+    .bind(contract_hash.as_slice())
+    .bind(statement.certificate_id)
+    .execute(&mut **transaction)
+    .await?;
+    append_verified_governance_revision(
+        transaction,
+        project_id,
+        "responsibility_revision",
+        Uuid::from(contract.id),
+        contract.revision,
+        statement.certificate_id,
+        contract_hash,
+    )
+    .await?;
+    Ok(contract)
+}
+
+pub async fn record_local_draft_disposition(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RecordLocalDraftDispositionRequest>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let agent = load_agent(&state, actor, project_id, agent_id).await?;
+    if agent.controller_id != actor.identity_id.into() {
+        return Err(AppError::Forbidden);
+    }
+    let statement = &request.source.compilation.statement;
+    let LocalCompilationAuthorization::Responsibility { id, revision } = statement.authorization
+    else {
+        return Err(AppError::BadRequest(
+            "rewrite or escalation requires the current Responsibility provenance",
+        ));
+    };
+    let (contract, _, _) = build_certified_local_contract(
+        request.source.encrypted_prompt.clone(),
+        &request.source.compilation,
+        request.source.supersedes_revision,
+        LocalGoalOrigin::ControllerPrompt {},
+    )?;
+    if statement.project_id != project_id
+        || contract.agent != agent.principal_id
+        || contract.controller != agent.controller_id
+    {
+        return Err(AppError::Forbidden);
+    }
+    if request.disposition == LocalPromptReviewDisposition::RequestAdministratorReview {
+        request
+            .summary
+            .as_ref()
+            .ok_or(AppError::BadRequest("escalation summary required"))?
+            .validate_escalation(statement.draft_id, contract.revision)
+            .map_err(agent_validation_error)?;
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 44))")
+        .bind(agent_id)
+        .execute(&mut *transaction)
+        .await?;
+    require_exact_active_local_base(&mut transaction, project_id, agent_id, &contract).await?;
+    let responsibility_json = sqlx::query_scalar::<_, String>(
+        "SELECT contract::text FROM agent_responsibility_contracts
+         WHERE project_id = $1 AND id = $2 AND revision = $3
+           AND user_identity_id = $4 AND state = 'active'
+           AND compilation_certificate_id IS NOT NULL",
+    )
+    .bind(project_id)
+    .bind(id)
+    .bind(to_i64(revision)?)
+    .bind(actor.identity_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    let responsibility: ResponsibilityContract =
+        serde_json::from_str(&responsibility_json).map_err(|_| AppError::Internal)?;
+    if responsibility_operationally_covers(&mut transaction, project_id, &responsibility, &contract)
+        .await?
+    {
+        return Err(AppError::BadRequest(
+            "covered draft must use the ordinary local-goal route",
+        ));
+    }
+    require_pinned_compiler(&mut transaction, "local_goal", &statement.compiler).await?;
+    verify_device_statement(
+        &mut transaction,
+        actor,
+        statement,
+        &request.source.compilation.signatures,
+        COMPILATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let payload = serde_json::to_value(&request).map_err(|_| AppError::Internal)?;
+    persist_governance_authorization_event(
+        &mut transaction,
+        project_id,
+        GovernanceAuthorizationEvent {
+            event_id: request.event_id,
+            event_kind: "local_draft_disposition",
+            workflow_id: statement.draft_id,
+            workflow_revision: 0,
+            actor_identity_id: actor.identity_id,
+            user_identity_id: Some(actor.identity_id),
+            administrator_identity_id: None,
+            agent_id: Some(agent_id),
+            source_draft_id: Some(statement.draft_id),
+            review_task_id: None,
+            local_goal_id: Some(Uuid::from(contract.id)),
+            local_goal_revision: Some(contract.revision),
+            global_contract_id: None,
+            global_revision: None,
+            obligation_id: None,
+            compilation_certificate_id: None,
+            responsibility_compilation_id: None,
+            idempotency_key: request.idempotency_key,
+            payload: &payload,
+        },
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: request.event_id,
+        revision: contract.revision,
+        contract_hash_hex: hex::encode(canonical_hash(&contract)?),
+    }))
+}
+
+pub async fn record_exception_consent(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(signed): Json<SignedExceptionConsent>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let agent = load_agent(&state, actor, project_id, agent_id).await?;
+    let statement = &signed.statement;
+    if agent.controller_id != actor.identity_id.into()
+        || statement.project_id != project_id
+        || statement.consent.user != actor.identity_id.into()
+    {
+        return Err(AppError::Forbidden);
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let disposition_json = sqlx::query_scalar::<_, String>(
+        "SELECT payload::text FROM agent_governance_authorization_events
+         WHERE project_id = $1 AND event_kind = 'local_draft_disposition'
+           AND source_draft_id = $2 AND user_identity_id = $3 AND agent_id = $4
+           AND payload->>'disposition' = 'request_administrator_review'",
+    )
+    .bind(project_id)
+    .bind(statement.consent.source_draft_id)
+    .bind(actor.identity_id)
+    .bind(agent_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let disposition: RecordLocalDraftDispositionRequest =
+        serde_json::from_str(&disposition_json).map_err(|_| AppError::Internal)?;
+    statement
+        .summary
+        .validate_escalation(
+            statement.consent.source_draft_id,
+            disposition.source.compilation.statement.local_revision,
+        )
+        .map_err(agent_validation_error)?;
+    verify_device_statement(
+        &mut transaction,
+        actor,
+        statement,
+        &signed.signatures,
+        EXCEPTION_CONSENT_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let payload = serde_json::to_value(&signed).map_err(|_| AppError::Internal)?;
+    persist_governance_authorization_event(
+        &mut transaction,
+        project_id,
+        GovernanceAuthorizationEvent {
+            event_id: statement.event_id,
+            event_kind: "exception_consent",
+            workflow_id: statement.consent.review_id,
+            workflow_revision: 0,
+            actor_identity_id: actor.identity_id,
+            user_identity_id: Some(actor.identity_id),
+            administrator_identity_id: None,
+            agent_id: Some(agent_id),
+            source_draft_id: Some(statement.consent.source_draft_id),
+            review_task_id: None,
+            local_goal_id: None,
+            local_goal_revision: None,
+            global_contract_id: None,
+            global_revision: None,
+            obligation_id: None,
+            compilation_certificate_id: None,
+            responsibility_compilation_id: None,
+            idempotency_key: statement.idempotency_key,
+            payload: &payload,
+        },
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: statement.consent.review_id,
+        revision: 0,
+        contract_hash_hex: hex::encode(canonical_hash(statement)?),
+    }))
+}
+
+pub async fn record_exception_review(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RecordExceptionReviewRequest>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    let agent = load_agent(&state, actor, project_id, agent_id).await?;
+    if agent.controller_id != actor.identity_id.into()
+        || request.review.user != actor.identity_id.into()
+        || request.review.agent != agent.principal_id
+    {
+        return Err(AppError::Forbidden);
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 47))")
+        .bind(request.review.id)
+        .execute(&mut *transaction)
+        .await?;
+    let consent_json = sqlx::query_scalar::<_, String>(
+        "SELECT payload::text FROM agent_governance_authorization_events
+         WHERE project_id = $1 AND event_kind = 'exception_consent'
+           AND workflow_id = $2 AND user_identity_id = $3 AND agent_id = $4",
+    )
+    .bind(project_id)
+    .bind(request.review.id)
+    .bind(actor.identity_id)
+    .bind(agent_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let consent_signed: SignedExceptionConsent =
+        serde_json::from_str(&consent_json).map_err(|_| AppError::Internal)?;
+    if !consent_signed.statement.consent.consented {
+        return Err(AppError::Conflict);
+    }
+    verify_device_statement_for_signer(
+        &mut transaction,
+        consent_signed.statement.consent.user,
+        &consent_signed.statement,
+        &consent_signed.signatures,
+        EXCEPTION_CONSENT_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let source_json = sqlx::query_scalar::<_, String>(
+        "SELECT payload::text FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_kind='local_draft_disposition'
+           AND source_draft_id=$2 AND agent_id=$3",
+    )
+    .bind(project_id)
+    .bind(request.review.source_draft_id)
+    .bind(agent_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let source: RecordLocalDraftDispositionRequest =
+        serde_json::from_str(&source_json).map_err(|_| AppError::Internal)?;
+    let (source_local, _, _) = build_certified_local_contract(
+        source.source.encrypted_prompt,
+        &source.source.compilation,
+        source.source.supersedes_revision,
+        LocalGoalOrigin::ControllerPrompt {},
+    )?;
+    if request.review.proposed_local != source_local {
+        return Err(AppError::Conflict);
+    }
+    if request.review_task.resource_node_id != Uuid::from(request.review.review_task) {
+        return Err(AppError::Conflict);
+    }
+    let existing_review = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_kind='exception_review'
+           AND workflow_id=$2)",
+    )
+    .bind(project_id)
+    .bind(request.review.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !existing_review {
+        let historical_task = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM tasks WHERE project_id=$1
+             AND (id=$2 OR resource_node_id=$3))",
+        )
+        .bind(project_id)
+        .bind(request.review_task.id)
+        .bind(request.review_task.resource_node_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if historical_task {
+            return Err(AppError::Conflict);
+        }
+        super::task_flows::materialize_governance_review_task(
+            &mut transaction,
+            actor,
+            project_id,
+            Uuid::from(request.review.agent),
+            Uuid::from(request.review.administrator),
+            &request.review_task,
+            request.review_assignment_id,
+            request.review_permission_grant_id,
+            &request.encrypted_assignment,
+        )
+        .await?;
+    }
+    let task_exact = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM tasks task
+            JOIN resource_nodes resource ON resource.project_id = task.project_id
+             AND resource.id = task.resource_node_id AND resource.node_kind = 'task'
+            JOIN task_assignments assignment ON assignment.project_id = task.project_id
+             AND assignment.task_id = task.id AND assignment.revoked_at IS NULL
+            WHERE task.project_id = $1 AND task.id=$2 AND task.resource_node_id = $3
+              AND task.created_by_identity_id = $4
+              AND assignment.id=$5 AND assignment.assignee_identity_id = $6
+              AND task.deleted_at IS NULL)",
+    )
+    .bind(project_id)
+    .bind(request.review_task.id)
+    .bind(Uuid::from(request.review.review_task))
+    .bind(Uuid::from(request.review.agent))
+    .bind(request.review_assignment_id)
+    .bind(Uuid::from(request.review.administrator))
+    .fetch_one(&mut *transaction)
+    .await?;
+    request
+        .review
+        .validate(&consent_signed.statement.consent, |_, _, _| task_exact)
+        .map_err(agent_validation_error)?;
+    let administrator = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM project_memberships membership
+         JOIN identities identity ON identity.id = membership.identity_id
+         WHERE membership.project_id = $1 AND membership.identity_id = $2
+           AND membership.state = 'active' AND membership.role IN ('owner', 'admin')
+           AND identity.status = 'active' AND identity.principal_kind = 'user')",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(request.review.administrator))
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !administrator {
+        return Err(AppError::Forbidden);
+    }
+    let payload = serde_json::to_value(&request).map_err(|_| AppError::Internal)?;
+    persist_governance_authorization_event(
+        &mut transaction,
+        project_id,
+        GovernanceAuthorizationEvent {
+            event_id: request.event_id,
+            event_kind: "exception_review",
+            workflow_id: request.review.id,
+            workflow_revision: 0,
+            actor_identity_id: actor.identity_id,
+            user_identity_id: Some(actor.identity_id),
+            administrator_identity_id: Some(Uuid::from(request.review.administrator)),
+            agent_id: Some(agent_id),
+            source_draft_id: Some(request.review.source_draft_id),
+            review_task_id: Some(Uuid::from(request.review.review_task)),
+            local_goal_id: Some(Uuid::from(request.review.proposed_local.id)),
+            local_goal_revision: Some(request.review.proposed_local.revision),
+            global_contract_id: None,
+            global_revision: None,
+            obligation_id: None,
+            compilation_certificate_id: None,
+            responsibility_compilation_id: None,
+            idempotency_key: request.idempotency_key,
+            payload: &payload,
+        },
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: request.review.id,
+        revision: 0,
+        contract_hash_hex: hex::encode(canonical_hash(&request.review)?),
+    }))
+}
+
+pub async fn record_exception_administrator_draft(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id, review_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(request): Json<RecordAdministratorReviewDraftRequest>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent || request.revision == 0 {
+        return Err(AppError::Forbidden);
+    }
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    let agent = load_agent(&state, actor, project_id, agent_id).await?;
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 45))")
+        .bind(review_id)
+        .execute(&mut *transaction)
+        .await?;
+    let review_json = sqlx::query_scalar::<_, String>(
+        "SELECT payload::text FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_kind='exception_review'
+           AND workflow_id=$2 AND agent_id=$3 FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(review_id)
+    .bind(agent_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let review_payload: Value =
+        serde_json::from_str(&review_json).map_err(|_| AppError::Internal)?;
+    let review: ResponsibilityExceptionReview = serde_json::from_value(
+        review_payload
+            .get("review")
+            .cloned()
+            .ok_or(AppError::Internal)?,
+    )
+    .map_err(|_| AppError::Internal)?;
+    if review.administrator != actor.identity_id.into()
+        || review.agent != agent.principal_id
+        || review.user != agent.controller_id
+    {
+        return Err(AppError::Forbidden);
+    }
+    let statement = &request.local_compilation.statement;
+    if statement.project_id != project_id
+        || statement.agent_principal_identity_id != agent.principal_id
+        || statement.controller_identity_id != agent.controller_id
+        || !matches!(
+            statement.authorization,
+            LocalCompilationAuthorization::AdministratorException { id, revision }
+                if id == review_id && revision == request.revision
+        )
+    {
+        return Err(AppError::Conflict);
+    }
+    let (final_local, _, _) = build_certified_local_contract(
+        request.encrypted_prompt.clone(),
+        &request.local_compilation,
+        review.proposed_local.supersedes_revision,
+        LocalGoalOrigin::AdministratorException { review_id },
+    )?;
+    require_exact_active_local_base(&mut transaction, project_id, agent_id, &final_local).await?;
+    require_pinned_compiler(&mut transaction, "local_goal", &statement.compiler).await?;
+    verify_device_statement(
+        &mut transaction,
+        actor,
+        statement,
+        &request.local_compilation.signatures,
+        COMPILATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let final_responsibility = match (
+        request.final_responsibility.as_ref(),
+        request.final_responsibility_encrypted_source.as_ref(),
+        request.final_responsibility_supersedes_revision,
+    ) {
+        (None, None, None) => None,
+        (Some(signed), Some(encrypted_source), Some(supersedes)) => {
+            let responsibility_statement = &signed.statement;
+            responsibility_statement
+                .output
+                .validate_within_envelope(&responsibility_statement.envelope)
+                .map_err(agent_validation_error)?;
+            if responsibility_statement.project_id != project_id
+                || responsibility_statement.administrator_identity_id != actor.identity_id.into()
+                || responsibility_statement.user_identity_id != agent.controller_id
+                || responsibility_statement.revision <= supersedes
+                || decode_commitment(&responsibility_statement.ciphertext_commitment_hex)?
+                    != <[u8; 32]>::from(Sha256::digest(serialize_ciphertext(encrypted_source)?))
+            {
+                return Err(AppError::Conflict);
+            }
+            require_pinned_compiler(
+                &mut transaction,
+                "responsibility",
+                &responsibility_statement.compiler,
+            )
+            .await?;
+            verify_device_statement(
+                &mut transaction,
+                actor,
+                responsibility_statement,
+                &signed.signatures,
+                COMPILATION_SIGNATURE_CONTEXT,
+            )
+            .await?;
+            Some(ResponsibilityContract {
+                id: responsibility_statement.responsibility_id.into(),
+                revision: responsibility_statement.revision,
+                administrator: responsibility_statement.administrator_identity_id,
+                user: responsibility_statement.user_identity_id,
+                encrypted_source_text: encrypted_source.clone(),
+                rules: responsibility_statement.output.rules.clone(),
+                supersedes_revision: Some(supersedes),
+            })
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "incomplete Responsibility draft artifact",
+            ));
+        }
+    };
+    let draft = AdministratorResponsibilityReviewDraft {
+        review_id,
+        revision: request.revision,
+        administrator: actor.identity_id.into(),
+        final_local,
+        final_responsibility,
+    };
+    let payload = AdministratorReviewDraftEventPayload {
+        draft: draft.clone(),
+        encrypted_prompt: request.encrypted_prompt,
+        local_compilation: request.local_compilation,
+        final_responsibility: request.final_responsibility,
+        final_responsibility_encrypted_source: request.final_responsibility_encrypted_source,
+        final_responsibility_supersedes_revision: request.final_responsibility_supersedes_revision,
+    };
+    let payload_value = serde_json::to_value(&payload).map_err(|_| AppError::Internal)?;
+    persist_governance_authorization_event(
+        &mut transaction,
+        project_id,
+        GovernanceAuthorizationEvent {
+            event_id: request.event_id,
+            event_kind: "exception_admin_draft",
+            workflow_id: review_id,
+            workflow_revision: request.revision,
+            actor_identity_id: actor.identity_id,
+            user_identity_id: Some(Uuid::from(review.user)),
+            administrator_identity_id: Some(actor.identity_id),
+            agent_id: Some(agent_id),
+            source_draft_id: Some(review.source_draft_id),
+            review_task_id: Some(Uuid::from(review.review_task)),
+            local_goal_id: Some(Uuid::from(draft.final_local.id)),
+            local_goal_revision: Some(draft.final_local.revision),
+            global_contract_id: None,
+            global_revision: None,
+            obligation_id: None,
+            compilation_certificate_id: None,
+            responsibility_compilation_id: None,
+            idempotency_key: request.idempotency_key,
+            payload: &payload_value,
+        },
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: review_id,
+        revision: request.revision,
+        contract_hash_hex: hex::encode(canonical_hash(&draft)?),
+    }))
+}
+
+pub async fn decide_exception_review(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id, review_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(signed): Json<SignedExceptionDecision>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    let agent = load_agent(&state, actor, project_id, agent_id).await?;
+    let statement = &signed.statement;
+    if statement.project_id != project_id
+        || statement.decision.review_id != review_id
+        || statement.decision.administrator != actor.identity_id.into()
+    {
+        return Err(AppError::Forbidden);
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 45))")
+        .bind(review_id)
+        .execute(&mut *transaction)
+        .await?;
+    let review_json = sqlx::query_scalar::<_, String>(
+        "SELECT payload::text FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_kind='exception_review'
+           AND workflow_id=$2 AND agent_id=$3 FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(review_id)
+    .bind(agent_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let review_payload: Value =
+        serde_json::from_str(&review_json).map_err(|_| AppError::Internal)?;
+    let review: ResponsibilityExceptionReview = serde_json::from_value(
+        review_payload
+            .get("review")
+            .cloned()
+            .ok_or(AppError::Internal)?,
+    )
+    .map_err(|_| AppError::Internal)?;
+    let draft_json = sqlx::query_scalar::<_, String>(
+        "SELECT payload::text FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_kind='exception_admin_draft'
+           AND workflow_id=$2 AND workflow_revision=$3 FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(review_id)
+    .bind(to_i64(statement.decision.review_draft_revision)?)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let payload: AdministratorReviewDraftEventPayload =
+        serde_json::from_str(&draft_json).map_err(|_| AppError::Internal)?;
+    if review.administrator != actor.identity_id.into()
+        || review.agent != agent.principal_id
+        || review.user != agent.controller_id
+        || payload.draft.administrator != actor.identity_id.into()
+    {
+        return Err(AppError::Forbidden);
+    }
+    statement
+        .summary
+        .validate_administrator_decision(agent.principal_id, payload.draft.final_local.revision)
+        .map_err(agent_validation_error)?;
+    let task_done = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM tasks task
+         WHERE task.project_id=$1 AND task.resource_node_id=$2
+           AND task.state IN ('completed','cancelled','archived')
+           AND task.completed_at IS NOT NULL)",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(review.review_task))
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !task_done {
+        return Err(AppError::Conflict);
+    }
+    verify_device_statement(
+        &mut transaction,
+        actor,
+        statement,
+        &signed.signatures,
+        EXCEPTION_DECISION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let decision_payload = serde_json::to_value(&signed).map_err(|_| AppError::Internal)?;
+    persist_governance_authorization_event(
+        &mut transaction,
+        project_id,
+        GovernanceAuthorizationEvent {
+            event_id: statement.event_id,
+            event_kind: "exception_decision",
+            workflow_id: review_id,
+            workflow_revision: statement.decision.review_draft_revision,
+            actor_identity_id: actor.identity_id,
+            user_identity_id: Some(Uuid::from(review.user)),
+            administrator_identity_id: Some(actor.identity_id),
+            agent_id: Some(agent_id),
+            source_draft_id: Some(review.source_draft_id),
+            review_task_id: Some(Uuid::from(review.review_task)),
+            local_goal_id: Some(Uuid::from(payload.draft.final_local.id)),
+            local_goal_revision: Some(payload.draft.final_local.revision),
+            global_contract_id: None,
+            global_revision: None,
+            obligation_id: None,
+            compilation_certificate_id: None,
+            responsibility_compilation_id: None,
+            idempotency_key: statement.idempotency_key,
+            payload: &decision_payload,
+        },
+    )
+    .await?;
+    let approved_event_id = derived_governance_id(
+        b"approved-local-exception",
+        &[project_id, review_id, statement.event_id],
+    );
+    let approved_replay = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_kind='approved_local_exception'
+           AND event_id=$2 AND workflow_id=$3 AND workflow_revision=$4
+           AND payload->>'decision_event_id'=$5)",
+    )
+    .bind(project_id)
+    .bind(approved_event_id)
+    .bind(review_id)
+    .bind(to_i64(statement.decision.review_draft_revision)?)
+    .bind(statement.event_id.to_string())
+    .fetch_one(&mut *transaction)
+    .await?;
+    if approved_replay {
+        transaction.commit().await?;
+        return Ok(Json(ContractRecordedResponse {
+            id: review_id,
+            revision: statement.decision.review_draft_revision,
+            contract_hash_hex: hex::encode(canonical_hash(statement)?),
+        }));
+    }
+    if matches!(
+        statement.decision.mode,
+        AdministratorResponsibilityDecisionMode::Rejected
+    ) {
+        transaction.commit().await?;
+        return Ok(Json(ContractRecordedResponse {
+            id: review_id,
+            revision: statement.decision.review_draft_revision,
+            contract_hash_hex: hex::encode(canonical_hash(statement)?),
+        }));
+    }
+    let approved = ApprovedLocalGoalException {
+        review_id,
+        administrator: actor.identity_id.into(),
+        user: review.user,
+        local: payload.draft.final_local.clone(),
+    };
+    validate_approved_local_goal_exception(
+        &review,
+        &payload.draft,
+        &statement.decision,
+        &approved,
+        task_done,
+    )
+    .map_err(agent_validation_error)?;
+    let local = persist_certified_local_draft(
+        &mut transaction,
+        project_id,
+        agent_id,
+        actor.identity_id.into(),
+        payload.encrypted_prompt,
+        &payload.local_compilation,
+        payload.draft.final_local.supersedes_revision,
+        LocalGoalOrigin::AdministratorException { review_id },
+    )
+    .await?;
+    if local != approved.local {
+        return Err(AppError::Conflict);
+    }
+    let responsibility_compilation_id = if matches!(
+        statement.decision.mode,
+        AdministratorResponsibilityDecisionMode::ApprovedGoalAndResponsibility
+    ) {
+        let responsibility_signed = payload
+            .final_responsibility
+            .as_ref()
+            .ok_or(AppError::Conflict)?;
+        let encrypted_source = payload
+            .final_responsibility_encrypted_source
+            .clone()
+            .ok_or(AppError::Conflict)?;
+        let supersedes = payload
+            .final_responsibility_supersedes_revision
+            .ok_or(AppError::Conflict)?;
+        let responsibility = persist_certified_responsibility_draft(
+            &mut transaction,
+            project_id,
+            actor.identity_id.into(),
+            review.user,
+            encrypted_source,
+            supersedes,
+            responsibility_signed,
+        )
+        .await?;
+        if payload.draft.final_responsibility.as_ref() != Some(&responsibility) {
+            return Err(AppError::Conflict);
+        }
+        Some(responsibility_signed.statement.certificate_id)
+    } else {
+        None
+    };
+    let approved_payload = json!({
+        "approved": approved,
+        "decision_event_id": statement.event_id,
+        "review_draft_revision": statement.decision.review_draft_revision,
+        "mode": statement.decision.mode,
+    });
+    persist_governance_authorization_event(
+        &mut transaction,
+        project_id,
+        GovernanceAuthorizationEvent {
+            event_id: approved_event_id,
+            event_kind: "approved_local_exception",
+            workflow_id: review_id,
+            workflow_revision: statement.decision.review_draft_revision,
+            actor_identity_id: actor.identity_id,
+            user_identity_id: Some(Uuid::from(review.user)),
+            administrator_identity_id: Some(actor.identity_id),
+            agent_id: Some(agent_id),
+            source_draft_id: Some(review.source_draft_id),
+            review_task_id: Some(Uuid::from(review.review_task)),
+            local_goal_id: Some(Uuid::from(local.id)),
+            local_goal_revision: Some(local.revision),
+            global_contract_id: None,
+            global_revision: None,
+            obligation_id: None,
+            compilation_certificate_id: Some(payload.local_compilation.statement.certificate_id),
+            responsibility_compilation_id,
+            idempotency_key: statement.event_id,
+            payload: &approved_payload,
+        },
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: review_id,
+        revision: statement.decision.review_draft_revision,
+        contract_hash_hex: hex::encode(canonical_hash(&approved)?),
+    }))
+}
+
+pub async fn record_global_coverage_need(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path(project_id): Path<Uuid>,
+    Json(request): Json<RecordGlobalCoverageNeedRequest>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let candidate_json = sqlx::query_scalar::<_, String>(
+        "SELECT candidate::text FROM agent_global_contracts
+         WHERE project_id=$1 AND id=$2 AND revision=$3
+           AND revision=(SELECT max(revision) FROM agent_global_contracts
+                         WHERE project_id=$1 AND id=$2)",
+    )
+    .bind(project_id)
+    .bind(request.global_contract_id)
+    .bind(to_i64(request.global_revision)?)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let candidate: GlobalContractCandidate =
+        serde_json::from_str(&candidate_json).map_err(|_| AppError::Internal)?;
+    let need = derive_global_coverage_need(&candidate, request.obligation_id)
+        .map_err(agent_validation_error)?;
+    if need.global_revision != request.global_revision {
+        return Err(AppError::Conflict);
+    }
+    let payload = json!({ "need": need });
+    persist_governance_authorization_event(
+        &mut transaction,
+        project_id,
+        GovernanceAuthorizationEvent {
+            event_id: request.event_id,
+            event_kind: "global_coverage_need",
+            workflow_id: request.event_id,
+            workflow_revision: request.global_revision,
+            actor_identity_id: actor.identity_id,
+            user_identity_id: None,
+            administrator_identity_id: Some(actor.identity_id),
+            agent_id: None,
+            source_draft_id: None,
+            review_task_id: None,
+            local_goal_id: None,
+            local_goal_revision: None,
+            global_contract_id: Some(request.global_contract_id),
+            global_revision: Some(request.global_revision),
+            obligation_id: Some(request.obligation_id),
+            compilation_certificate_id: None,
+            responsibility_compilation_id: None,
+            idempotency_key: request.idempotency_key,
+            payload: &payload,
+        },
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: request.event_id,
+        revision: request.global_revision,
+        contract_hash_hex: hex::encode(canonical_hash(&need)?),
+    }))
+}
+
+pub async fn record_global_mandate(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RecordGlobalMandateRequest>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    let agent = load_agent(&state, actor, project_id, agent_id).await?;
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 46))")
+        .bind(agent_id)
+        .execute(&mut *transaction)
+        .await?;
+    let need_row = sqlx::query(
+        "SELECT payload::text, global_contract_id, global_revision, obligation_id
+         FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_kind='global_coverage_need'
+           AND event_id=$2 FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(request.need_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let need_payload: Value =
+        serde_json::from_str(need_row.try_get("payload")?).map_err(|_| AppError::Internal)?;
+    let need: GlobalCoverageNeed = serde_json::from_value(
+        need_payload
+            .get("need")
+            .cloned()
+            .ok_or(AppError::Internal)?,
+    )
+    .map_err(|_| AppError::Internal)?;
+    let global_contract_id: Uuid = need_row.try_get("global_contract_id")?;
+    let statement = &request.compilation.statement;
+    if !matches!(
+        statement.authorization,
+        LocalCompilationAuthorization::GlobalMandate { id, revision }
+            if id == request.event_id && revision == need.global_revision
+    ) || statement.agent_principal_identity_id != agent.principal_id
+        || statement.controller_identity_id != agent.controller_id
+    {
+        return Err(AppError::Conflict);
+    }
+    let (local, _, _) = build_certified_local_contract(
+        request.encrypted_prompt.clone(),
+        &request.compilation,
+        Some(request.supersedes_revision),
+        LocalGoalOrigin::GlobalMandate {
+            global_revision: need.global_revision,
+        },
+    )?;
+    require_exact_active_local_base(&mut transaction, project_id, agent_id, &local).await?;
+    let administrator_current = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM project_memberships membership
+         WHERE membership.project_id=$1 AND membership.identity_id=$2
+           AND membership.state='active' AND membership.role IN ('owner','admin'))",
+    )
+    .bind(project_id)
+    .bind(actor.identity_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let mut resource_permissions = true;
+    for effect in &need.required.resource_effects {
+        resource_permissions &= resource_access_in_transaction(
+            &mut transaction,
+            project_id,
+            Uuid::from(agent.principal_id),
+            Uuid::from(effect.resource_id),
+            effect.operation,
+        )
+        .await?;
+    }
+    let assignment = GlobalMandateAssignment {
+        global_revision: need.global_revision,
+        assigned_by: actor.identity_id.into(),
+        need: need.clone(),
+        local: local.clone(),
+    };
+    assignment
+        .validate(
+            &agent,
+            administrator_current,
+            |_| resource_permissions,
+            |_| false,
+        )
+        .map_err(agent_validation_error)?;
+    let latest_global = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM agent_global_contracts
+         WHERE project_id=$1 AND id=$2 AND revision=$3
+           AND revision=(SELECT max(revision) FROM agent_global_contracts
+                         WHERE project_id=$1 AND id=$2))",
+    )
+    .bind(project_id)
+    .bind(global_contract_id)
+    .bind(to_i64(need.global_revision)?)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !latest_global || !need.required.tools.is_empty() {
+        return Err(AppError::Forbidden);
+    }
+    // Persist the exact assignment before the compilation ledger entry.  The
+    // assignment's certificate FK is deferred to transaction commit, allowing
+    // `append_verified_governance_revision` to require this causal predecessor
+    // while still rolling both records back atomically on any later failure.
+    let payload = json!({ "assignment": assignment, "need_id": request.need_id });
+    persist_governance_authorization_event(
+        &mut transaction,
+        project_id,
+        GovernanceAuthorizationEvent {
+            event_id: request.event_id,
+            event_kind: "global_mandate_assignment",
+            workflow_id: request.event_id,
+            workflow_revision: need.global_revision,
+            actor_identity_id: actor.identity_id,
+            user_identity_id: Some(Uuid::from(agent.controller_id)),
+            administrator_identity_id: Some(actor.identity_id),
+            agent_id: Some(agent_id),
+            source_draft_id: Some(statement.draft_id),
+            review_task_id: None,
+            local_goal_id: Some(Uuid::from(local.id)),
+            local_goal_revision: Some(local.revision),
+            global_contract_id: Some(global_contract_id),
+            global_revision: Some(need.global_revision),
+            obligation_id: Some(need.obligation),
+            compilation_certificate_id: Some(statement.certificate_id),
+            responsibility_compilation_id: None,
+            idempotency_key: request.idempotency_key,
+            payload: &payload,
+        },
+    )
+    .await?;
+    let materialized = persist_certified_local_draft(
+        &mut transaction,
+        project_id,
+        agent_id,
+        agent.controller_id,
+        request.encrypted_prompt,
+        &request.compilation,
+        local.supersedes_revision,
+        LocalGoalOrigin::GlobalMandate {
+            global_revision: need.global_revision,
+        },
+    )
+    .await?;
+    if materialized != local {
+        return Err(AppError::Conflict);
+    }
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: request.event_id,
+        revision: local.revision,
+        contract_hash_hex: hex::encode(canonical_hash(&local)?),
+    }))
+}
+
+pub async fn record_global_agent_proposal(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path(project_id): Path<Uuid>,
+    Json(request): Json<RecordGlobalAgentProposalRequest>,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    request
+        .proposal
+        .validate()
+        .map_err(agent_validation_error)?;
+    let statement = &request.compilation.statement;
+    if statement.project_id != project_id
+        || statement.agent_principal_identity_id != request.proposal.proposed_agent
+        || statement.controller_identity_id != request.proposal.controller
+        || !matches!(
+            statement.authorization,
+            LocalCompilationAuthorization::GlobalMandate { id, revision }
+                if id == request.event_id && revision == request.proposal.need.global_revision
+        )
+        || statement.output.contract != request.proposal.local.contract
+        || statement.local_goal_id != Uuid::from(request.proposal.local.id)
+        || statement.local_revision != request.proposal.local.revision
+    {
+        return Err(AppError::Conflict);
+    }
+    let (local, _, _) = build_certified_local_contract(
+        request.encrypted_prompt.clone(),
+        &request.compilation,
+        request.proposal.local.supersedes_revision,
+        request.proposal.local.origin.clone(),
+    )?;
+    if local != request.proposal.local {
+        return Err(AppError::Conflict);
+    }
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let need_payload = sqlx::query_scalar::<_, String>(
+        "SELECT payload::text FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_kind='global_coverage_need'
+           AND event_id=$2 AND global_contract_id=$3",
+    )
+    .bind(project_id)
+    .bind(request.need_id)
+    .bind(request.global_contract_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let need_value: Value = serde_json::from_str(&need_payload).map_err(|_| AppError::Internal)?;
+    let need: GlobalCoverageNeed =
+        serde_json::from_value(need_value.get("need").cloned().ok_or(AppError::Internal)?)
+            .map_err(|_| AppError::Internal)?;
+    if need != request.proposal.need || request.proposal.requested != need.required {
+        return Err(AppError::Conflict);
+    }
+    require_pinned_compiler(&mut transaction, "local_goal", &statement.compiler).await?;
+    verify_device_statement_for_signer(
+        &mut transaction,
+        request.proposal.controller,
+        statement,
+        &request.compilation.signatures,
+        COMPILATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let principal_absent =
+        sqlx::query_scalar::<_, bool>("SELECT NOT EXISTS (SELECT 1 FROM identities WHERE id=$1)")
+            .bind(Uuid::from(request.proposal.proposed_agent))
+            .fetch_one(&mut *transaction)
+            .await?;
+    if !principal_absent {
+        return Err(AppError::Conflict);
+    }
+    let payload = json!({
+        "proposal": request.proposal,
+        "need_id": request.need_id,
+        "compilation": request.compilation,
+    });
+    persist_governance_authorization_event(
+        &mut transaction,
+        project_id,
+        GovernanceAuthorizationEvent {
+            event_id: request.event_id,
+            event_kind: "global_agent_proposal",
+            workflow_id: request.event_id,
+            workflow_revision: need.global_revision,
+            actor_identity_id: actor.identity_id,
+            user_identity_id: Some(Uuid::from(local.controller)),
+            administrator_identity_id: Some(actor.identity_id),
+            agent_id: None,
+            source_draft_id: Some(statement.draft_id),
+            review_task_id: None,
+            local_goal_id: Some(Uuid::from(local.id)),
+            local_goal_revision: Some(local.revision),
+            global_contract_id: Some(request.global_contract_id),
+            global_revision: Some(need.global_revision),
+            obligation_id: Some(need.obligation),
+            compilation_certificate_id: None,
+            responsibility_compilation_id: None,
+            idempotency_key: request.idempotency_key,
+            payload: &payload,
+        },
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(ContractRecordedResponse {
+        id: request.event_id,
+        revision: need.global_revision,
+        contract_hash_hex: hex::encode(canonical_hash(&request.proposal)?),
+    }))
 }
 
 pub async fn record_local_goal(
@@ -5411,6 +7073,7 @@ async fn validate_initial_creation_authorization(
                     .authorization,
             )
             .await
+            .map(|_| ())
         }
         LocalCompilationAuthorization::AdministratorCreation { approval_id } => {
             if !matches!(
@@ -5621,6 +7284,100 @@ async fn append_verified_governance_revision(
     Ok(())
 }
 
+struct GovernanceAuthorizationEvent<'a> {
+    event_id: Uuid,
+    event_kind: &'static str,
+    workflow_id: Uuid,
+    workflow_revision: u64,
+    actor_identity_id: Uuid,
+    user_identity_id: Option<Uuid>,
+    administrator_identity_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    source_draft_id: Option<Uuid>,
+    review_task_id: Option<Uuid>,
+    local_goal_id: Option<Uuid>,
+    local_goal_revision: Option<u64>,
+    global_contract_id: Option<Uuid>,
+    global_revision: Option<u64>,
+    obligation_id: Option<Uuid>,
+    compilation_certificate_id: Option<Uuid>,
+    responsibility_compilation_id: Option<Uuid>,
+    idempotency_key: Uuid,
+    payload: &'a Value,
+}
+
+async fn persist_governance_authorization_event(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    event: GovernanceAuthorizationEvent<'_>,
+) -> Result<i64, AppError> {
+    let event_envelope = json!({
+        "project_id": project_id,
+        "event_id": event.event_id,
+        "event_kind": event.event_kind,
+        "workflow_id": event.workflow_id,
+        "workflow_revision": event.workflow_revision,
+        "actor_identity_id": event.actor_identity_id,
+        "user_identity_id": event.user_identity_id,
+        "administrator_identity_id": event.administrator_identity_id,
+        "agent_id": event.agent_id,
+        "source_draft_id": event.source_draft_id,
+        "review_task_id": event.review_task_id,
+        "local_goal_id": event.local_goal_id,
+        "local_goal_revision": event.local_goal_revision,
+        "global_contract_id": event.global_contract_id,
+        "global_revision": event.global_revision,
+        "obligation_id": event.obligation_id,
+        "compilation_certificate_id": event.compilation_certificate_id,
+        "responsibility_compilation_id": event.responsibility_compilation_id,
+        "idempotency_key": event.idempotency_key,
+        "payload": event.payload,
+    });
+    let event_hash = canonical_hash(&event_envelope)?;
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT sprout_private.insert_agent_governance_authorization_event(
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+            $12, $13, $14, $15, $16, $17, $18, $19, $20, $21::jsonb
+        )
+        "#,
+    )
+    .bind(project_id)
+    .bind(event.event_id)
+    .bind(event.event_kind)
+    .bind(event.workflow_id)
+    .bind(to_i64(event.workflow_revision)?)
+    .bind(event.actor_identity_id)
+    .bind(event.user_identity_id)
+    .bind(event.administrator_identity_id)
+    .bind(event.agent_id)
+    .bind(event.source_draft_id)
+    .bind(event.review_task_id)
+    .bind(event.local_goal_id)
+    .bind(event.local_goal_revision.map(to_i64).transpose()?)
+    .bind(event.global_contract_id)
+    .bind(event.global_revision.map(to_i64).transpose()?)
+    .bind(event.obligation_id)
+    .bind(event.compilation_certificate_id)
+    .bind(event.responsibility_compilation_id)
+    .bind(event.idempotency_key)
+    .bind(event_hash.as_slice())
+    .bind(governance_canonical_json(event.payload)?)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|error| {
+        if error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .is_some_and(|code| code == "40001" || code == "23505")
+        {
+            AppError::Conflict
+        } else {
+            AppError::from(error)
+        }
+    })
+}
+
 fn local_authorization_columns(
     authorization: &LocalCompilationAuthorization,
 ) -> (&'static str, Option<Uuid>, Option<u64>) {
@@ -5646,7 +7403,7 @@ async fn validate_local_authorization(
     actor: AuthSession,
     contract: &LocalGoalContract,
     authorization: &LocalCompilationAuthorization,
-) -> Result<(), AppError> {
+) -> Result<Option<(Uuid, u64, u64)>, AppError> {
     match authorization {
         LocalCompilationAuthorization::Responsibility { id, revision } => {
             let responsibility_json = sqlx::query_scalar::<_, String>(
@@ -5674,20 +7431,214 @@ async fn validate_local_authorization(
             {
                 return Err(AppError::Forbidden);
             }
+            Ok(None)
         }
-        LocalCompilationAuthorization::AdministratorException { .. }
-        | LocalCompilationAuthorization::GlobalMandate { .. }
-        | LocalCompilationAuthorization::AdministratorCreation { .. } => {
-            return Err(AppError::BadRequest(
-                "local-goal authorization adapter is not available",
-            ));
+        LocalCompilationAuthorization::AdministratorException { id, revision } => {
+            let row = sqlx::query(
+                "SELECT approved.payload::text AS approved_payload,
+                        decision.payload::text AS decision_payload,
+                        approved.responsibility_compilation_id
+                 FROM agent_governance_authorization_events approved
+                 JOIN agent_governance_authorization_events decision
+                   ON decision.project_id=approved.project_id
+                  AND decision.workflow_id=approved.workflow_id
+                  AND decision.workflow_revision=approved.workflow_revision
+                  AND decision.event_kind='exception_decision'
+                 WHERE approved.project_id=$1
+                   AND approved.event_kind='approved_local_exception'
+                   AND approved.workflow_id=$2 AND approved.workflow_revision=$3
+                   AND approved.user_identity_id=$4
+                   AND approved.agent_id=(SELECT id FROM governed_agents
+                     WHERE project_id=$1 AND principal_identity_id=$5)
+                   AND approved.local_goal_id=$6 AND approved.local_goal_revision=$7
+                   AND approved.compilation_certificate_id=(SELECT compilation_certificate_id
+                     FROM agent_local_goal_contracts WHERE project_id=$1 AND id=$6
+                       AND revision=$7)
+                 FOR UPDATE OF approved, decision",
+            )
+            .bind(project_id)
+            .bind(*id)
+            .bind(to_i64(*revision)?)
+            .bind(actor.identity_id)
+            .bind(Uuid::from(contract.agent))
+            .bind(Uuid::from(contract.id))
+            .bind(to_i64(contract.revision)?)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or(AppError::Forbidden)?;
+            let approved_payload: Value = serde_json::from_str(row.try_get("approved_payload")?)
+                .map_err(|_| AppError::Internal)?;
+            let approved: ApprovedLocalGoalException = serde_json::from_value(
+                approved_payload
+                    .get("approved")
+                    .cloned()
+                    .ok_or(AppError::Internal)?,
+            )
+            .map_err(|_| AppError::Internal)?;
+            if approved.local != *contract || approved.review_id != *id {
+                return Err(AppError::Conflict);
+            }
+            let signed_decision: SignedExceptionDecision =
+                serde_json::from_str(row.try_get("decision_payload")?)
+                    .map_err(|_| AppError::Internal)?;
+            let administrator = approved.administrator;
+            let administrator_current = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM project_memberships membership
+                 JOIN identities identity ON identity.id=membership.identity_id
+                 WHERE membership.project_id=$1 AND membership.identity_id=$2
+                   AND membership.state='active' AND membership.role IN ('owner','admin')
+                   AND identity.status='active')",
+            )
+            .bind(project_id)
+            .bind(Uuid::from(administrator))
+            .fetch_one(&mut **transaction)
+            .await?;
+            if !administrator_current
+                || !resource_access_in_transaction(
+                    transaction,
+                    project_id,
+                    Uuid::from(administrator),
+                    Uuid::from(contract.contract.scope),
+                    ResourceOperation::Manage,
+                )
+                .await?
+            {
+                return Err(AppError::Forbidden);
+            }
+            verify_device_statement_for_signer(
+                transaction,
+                administrator,
+                &signed_decision.statement,
+                &signed_decision.signatures,
+                EXCEPTION_DECISION_SIGNATURE_CONTEXT,
+            )
+            .await?;
+            let responsibility_compilation_id: Option<Uuid> =
+                row.try_get("responsibility_compilation_id")?;
+            if let Some(compilation_id) = responsibility_compilation_id {
+                let responsibility = sqlx::query_as::<_, (Uuid, i64, String)>(
+                    "SELECT id, revision, contract::text
+                     FROM agent_responsibility_contracts
+                     WHERE project_id=$1 AND compilation_certificate_id=$2
+                       AND user_identity_id=$3 AND state='draft' FOR UPDATE",
+                )
+                .bind(project_id)
+                .bind(compilation_id)
+                .bind(actor.identity_id)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or(AppError::Conflict)?;
+                let responsibility_contract: ResponsibilityContract =
+                    serde_json::from_str(&responsibility.2).map_err(|_| AppError::Internal)?;
+                Ok(Some((
+                    responsibility.0,
+                    u64::try_from(responsibility.1).map_err(|_| AppError::Internal)?,
+                    responsibility_contract
+                        .supersedes_revision
+                        .ok_or(AppError::Conflict)?,
+                )))
+            } else {
+                Ok(None)
+            }
         }
+        LocalCompilationAuthorization::GlobalMandate { id, revision } => {
+            let row = sqlx::query(
+                "SELECT assignment.payload::text AS payload,
+                        assignment.global_contract_id,
+                        assignment.global_revision,
+                        agent.id AS agent_id, agent.availability,
+                        agent.controller_identity_id
+                 FROM agent_governance_authorization_events assignment
+                 JOIN governed_agents agent ON agent.project_id=assignment.project_id
+                  AND agent.id=assignment.agent_id AND agent.state='active'
+                 WHERE assignment.project_id=$1
+                   AND assignment.event_kind='global_mandate_assignment'
+                   AND assignment.event_id=$2 AND assignment.global_revision=$3
+                   AND assignment.local_goal_id=$4
+                   AND assignment.local_goal_revision=$5
+                   AND assignment.compilation_certificate_id=(
+                     SELECT compilation_certificate_id FROM agent_local_goal_contracts
+                     WHERE project_id=$1 AND id=$4 AND revision=$5)
+                 FOR UPDATE OF assignment, agent",
+            )
+            .bind(project_id)
+            .bind(*id)
+            .bind(to_i64(*revision)?)
+            .bind(Uuid::from(contract.id))
+            .bind(to_i64(contract.revision)?)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or(AppError::Forbidden)?;
+            if row.try_get::<String, _>("availability")? != "project_delegable"
+                || row.try_get::<Uuid, _>("controller_identity_id")? != actor.identity_id
+            {
+                return Err(AppError::Forbidden);
+            }
+            let payload: Value =
+                serde_json::from_str(row.try_get("payload")?).map_err(|_| AppError::Internal)?;
+            let assignment: GlobalMandateAssignment = serde_json::from_value(
+                payload
+                    .get("assignment")
+                    .cloned()
+                    .ok_or(AppError::Internal)?,
+            )
+            .map_err(|_| AppError::Internal)?;
+            if assignment.local != *contract || assignment.global_revision != *revision {
+                return Err(AppError::Conflict);
+            }
+            let global_contract_id: Uuid = row.try_get("global_contract_id")?;
+            let latest = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM agent_global_contracts
+                 WHERE project_id=$1 AND id=$2 AND revision=$3
+                   AND revision=(SELECT max(revision) FROM agent_global_contracts
+                                 WHERE project_id=$1 AND id=$2))",
+            )
+            .bind(project_id)
+            .bind(global_contract_id)
+            .bind(to_i64(*revision)?)
+            .fetch_one(&mut **transaction)
+            .await?;
+            if !latest || !assignment.need.required.tools.is_empty() {
+                return Err(AppError::Forbidden);
+            }
+            for effect in &assignment.need.required.resource_effects {
+                if !resource_access_in_transaction(
+                    transaction,
+                    project_id,
+                    Uuid::from(contract.agent),
+                    Uuid::from(effect.resource_id),
+                    effect.operation,
+                )
+                .await?
+                {
+                    return Err(AppError::Forbidden);
+                }
+            }
+            Ok(None)
+        }
+        LocalCompilationAuthorization::AdministratorCreation { .. } => Err(AppError::BadRequest(
+            "local-goal authorization adapter is not available",
+        )),
     }
-    Ok(())
 }
 
 fn canonical_hash(value: &impl Serialize) -> Result<[u8; 32], AppError> {
     Ok(Sha256::digest(governance_canonical_bytes(value)?).into())
+}
+
+fn derived_governance_id(context: &[u8], parts: &[Uuid]) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"sprout-governance-derived-id-v1");
+    digest.update(context);
+    for part in parts {
+        digest.update(part.as_bytes());
+    }
+    let hash: [u8; 32] = digest.finalize().into();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 fn governance_canonical_bytes(value: &impl Serialize) -> Result<Vec<u8>, AppError> {
@@ -5725,6 +7676,48 @@ async fn verify_device_statement(
         "#,
     )
     .bind(Uuid::from(signatures.signer_identity_id))
+    .bind(signatures.signer_device_id)
+    .bind(key_version)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    let statement_bytes = governance_canonical_bytes(statement)?;
+    verify_ed25519_ml_dsa65_signatures(
+        &keys.0,
+        &signatures.classical_signature,
+        &keys.1,
+        &signatures.post_quantum_signature,
+        &statement_bytes,
+        context,
+    )
+    .map_err(|_| AppError::BadRequest("device attestation signature verification failed"))?;
+    Ok(Sha256::digest(statement_bytes).into())
+}
+
+async fn verify_device_statement_for_signer(
+    transaction: &mut Transaction<'_, Postgres>,
+    expected_signer: UserId,
+    statement: &impl Serialize,
+    signatures: &CompilationSignatures,
+    context: &[u8],
+) -> Result<[u8; 32], AppError> {
+    if signatures.signer_identity_id != expected_signer {
+        return Err(AppError::Forbidden);
+    }
+    let key_version = to_i32(signatures.signer_device_key_version)?;
+    let keys = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+        r#"
+        SELECT key.ed25519_public_key, key.ml_dsa_65_public_key
+        FROM device_keys key
+        JOIN devices device
+          ON device.identity_id = key.identity_id AND device.id = key.device_id
+        WHERE key.identity_id = $1 AND key.device_id = $2
+          AND key.key_version = $3 AND key.suite_version = 32769
+          AND key.revoked_at IS NULL
+          AND device.trust_state = 'trusted' AND device.retired_at IS NULL
+        "#,
+    )
+    .bind(Uuid::from(expected_signer))
     .bind(signatures.signer_device_id)
     .bind(key_version)
     .fetch_optional(&mut **transaction)

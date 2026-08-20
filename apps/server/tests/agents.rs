@@ -4,16 +4,18 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header::CONTENT_TYPE},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sprout_crypto_protocol::{
-    DeviceKeyIds, KeyAlgorithm, canonical_governance_json, generate_experimental_device_package,
-    sign_ed25519_ml_dsa65,
+    DeviceKeyIds, DevicePublicPackage, HybridWrapMetadata, KeyAlgorithm, ResourceKey,
+    canonical_governance_json, generate_experimental_device_package, hash_bytes,
+    sign_ed25519_ml_dsa65, wrap_resource_key,
 };
 use sprout_domain::{
-    GlobalContractCandidate, LocalGoalContract, StructuredGlobalSynthesisEnvelope,
-    StructuredGlobalWorkGrounding,
+    GlobalContractCandidate, LocalGoalContract, LocalGoalOrigin, StructuredGlobalSynthesisEnvelope,
+    StructuredGlobalWorkGrounding, classify_local_goal_contract,
 };
 use sprout_server::{AppState, build_router, config::Config};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
@@ -1105,6 +1107,360 @@ async fn activate_certified_local_goal_revision(
     (draft.status(), activation.status(), activation_body)
 }
 
+struct LocalRevisionArtifact {
+    prompt: Value,
+    compilation: Value,
+    local: Value,
+    draft_id: Uuid,
+    certificate_id: Uuid,
+    prompt_commitment_hex: String,
+    ciphertext_commitment_hex: String,
+    output_hash_hex: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn local_revision_artifact(
+    fixture: &Fixture,
+    created: &ProvisionedGovernanceAgent,
+    controller: &SigningMember,
+    authorization: Value,
+    origin: LocalGoalOrigin,
+    signer_identity_id: Uuid,
+    signer_device_id: Uuid,
+    signer_ed25519: &[u8],
+    signer_ml_dsa: &[u8],
+    replace_action_with_create_task: bool,
+    seed: u8,
+) -> LocalRevisionArtifact {
+    let previous = sqlx::query(
+        "SELECT certificate.canonical_output::text AS output,
+                certificate.compilation_envelope::text AS envelope
+         FROM agent_local_goal_contracts local
+         JOIN agent_compilation_certificates certificate
+           ON certificate.project_id=local.project_id
+          AND certificate.id=local.compilation_certificate_id
+         WHERE local.project_id=$1 AND local.agent_id=$2
+           AND local.id=$3 AND local.revision=1 AND local.state='active'",
+    )
+    .bind(fixture.project_id)
+    .bind(created.agent_id)
+    .bind(created.local_goal_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load initial compiled local goal");
+    let mut output: Value = serde_json::from_str(previous.try_get("output").unwrap()).unwrap();
+    let mut envelope: Value = serde_json::from_str(previous.try_get("envelope").unwrap()).unwrap();
+    if replace_action_with_create_task {
+        output["contract"]["work_specs"][0]["allowed_actions"] = json!(["create_task"]);
+        output["requirements"][0]["required_actions"] = json!(["create_task"]);
+        output["security_policies"][0]["allowed_operations"] = json!(["write"]);
+        envelope["allowed_actions"] = json!(["create_task"]);
+    }
+    let draft_id = Uuid::new_v4();
+    let certificate_id = Uuid::new_v4();
+    let prompt = encrypted(seed);
+    let typed_prompt: sprout_domain::EncryptedPayload =
+        serde_json::from_value(prompt.clone()).unwrap();
+    let ciphertext_commitment_hex =
+        sha256_hex(&serde_json::to_vec(&typed_prompt).expect("serialize revision prompt"));
+    let prompt_commitment_hex = hex::encode([seed; 32]);
+    let output_hash_hex = canonical_hash_hex(&output);
+    let statement = json!({
+        "certificate_id": certificate_id,
+        "compiler": {
+            "compiler_id": "sprout.local-goal.compiler",
+            "compiler_version": 1,
+            "compiler_build_digest_hex": "0c675e853701375c7ba5d396f4e1f9b55592339a3a4e45859b9f2c2e8fdbbfc2"
+        },
+        "project_id": fixture.project_id,
+        "local_goal_id": created.local_goal_id,
+        "local_revision": 2,
+        "draft_id": draft_id,
+        "agent_principal_identity_id": created.principal_identity_id,
+        "controller_identity_id": controller.identity_id,
+        "prompt_commitment_hex": prompt_commitment_hex,
+        "ciphertext_commitment_hex": ciphertext_commitment_hex,
+        "output": output,
+        "output_hash_hex": output_hash_hex,
+        "envelope": envelope,
+        "envelope_hash_hex": canonical_hash_hex(&envelope),
+        "authorization": authorization,
+        "idempotency_key": Uuid::new_v4()
+    });
+    let typed_output: sprout_domain::LocalGoalCompilerOutput =
+        serde_json::from_value(statement["output"].clone()).unwrap();
+    let local = LocalGoalContract {
+        id: created.local_goal_id.into(),
+        revision: 2,
+        agent: created.principal_identity_id.into(),
+        controller: controller.identity_id.into(),
+        encrypted_prompt: typed_prompt,
+        contract: typed_output.contract.clone(),
+        clauses: classify_local_goal_contract(&typed_output.contract),
+        origin,
+        supersedes_revision: Some(1),
+    };
+    LocalRevisionArtifact {
+        prompt,
+        compilation: json!({
+            "statement": statement.clone(),
+            "signatures": signed_statement_by(
+                signer_identity_id,
+                signer_device_id,
+                signer_ed25519,
+                signer_ml_dsa,
+                &statement,
+                b"sprout-governance-compilation-v1"
+            )
+        }),
+        local: serde_json::to_value(local).unwrap(),
+        draft_id,
+        certificate_id,
+        prompt_commitment_hex,
+        ciphertext_commitment_hex,
+        output_hash_hex,
+    }
+}
+
+fn opaque_encrypted(seed: u8) -> Value {
+    json!({
+        "version": 1,
+        "algorithm": "aes-256-gcm",
+        "key_id": format!("opaque-{seed}"),
+        "nonce_b64": STANDARD.encode([seed; 12]),
+        "ciphertext_b64": STANDARD.encode([seed, seed.wrapping_add(1)])
+    })
+}
+
+fn exact_final_prompt_approval(
+    fixture: &Fixture,
+    created: &ProvisionedGovernanceAgent,
+    controller: &SigningMember,
+    artifact: &LocalRevisionArtifact,
+) -> Value {
+    let approval_id = Uuid::new_v4();
+    let idempotency_key = Uuid::new_v4();
+    let approval_identity = json!({
+        "signature_context":"sprout-final-prompt-approval-v1",
+        "approval_id":approval_id,
+        "project_id":fixture.project_id,
+        "draft_id":artifact.draft_id,
+        "agent_principal_identity_id":created.principal_identity_id,
+        "controller_identity_id":controller.identity_id,
+        "local_goal_id":created.local_goal_id,
+        "local_revision":2,
+        "prompt_commitment_hex":artifact.prompt_commitment_hex,
+        "ciphertext_commitment_hex":artifact.ciphertext_commitment_hex,
+        "compilation_certificate_id":artifact.certificate_id,
+        "structured_output_hash_hex":artifact.output_hash_hex,
+        "idempotency_key":idempotency_key
+    });
+    let statement = json!({
+        "approval_id":approval_id,
+        "project_id":fixture.project_id,
+        "draft_id":artifact.draft_id,
+        "agent_principal_identity_id":created.principal_identity_id,
+        "controller_identity_id":controller.identity_id,
+        "local_goal_id":created.local_goal_id,
+        "local_revision":2,
+        "prompt_commitment_hex":artifact.prompt_commitment_hex,
+        "ciphertext_commitment_hex":artifact.ciphertext_commitment_hex,
+        "compilation_certificate_id":artifact.certificate_id,
+        "structured_output_hash_hex":artifact.output_hash_hex,
+        "approval_identity_hash_hex":canonical_hash_hex(&approval_identity),
+        "idempotency_key":idempotency_key
+    });
+    json!({
+        "statement":statement,
+        "signatures":signed_statement_by(
+            controller.identity_id,
+            controller.device_id,
+            &controller.ed25519_private_key,
+            &controller.ml_dsa_65_private_key,
+            &statement,
+            b"sprout-final-prompt-approval-v1"
+        )
+    })
+}
+
+fn resign_local_compilation(body: &mut Value, controller: &SigningMember) {
+    let statement = body["compilation"]["statement"].clone();
+    body["compilation"]["signatures"] = signed_statement_by(
+        controller.identity_id,
+        controller.device_id,
+        &controller.ed25519_private_key,
+        &controller.ml_dsa_65_private_key,
+        &statement,
+        b"sprout-governance-compilation-v1",
+    );
+}
+
+async fn governance_review_task_fixture(
+    fixture: &Fixture,
+    controller: &SigningMember,
+    agent_identity_id: Uuid,
+    administrator_identity_id: Uuid,
+) -> Value {
+    let list_resource_id = Uuid::new_v4();
+    let list_id = Uuid::new_v4();
+    let topic_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM topics WHERE project_id=$1 AND resource_node_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_nodes
+           (id,project_id,parent_id,node_kind,encrypted_metadata,created_by_identity_id)
+         VALUES ($1,$2,$3,'task_list',decode('01','hex'),$4)",
+    )
+    .bind(list_resource_id)
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(controller.identity_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_epochs (
+            project_id,resource_node_id,epoch,created_by_identity_id,
+            created_by_device_id,created_by_device_key_version,key_commitment,reason
+         ) VALUES ($1,$2,1,$3,$4,1,decode(repeat('ab',32),'hex'),'created')",
+    )
+    .bind(fixture.project_id)
+    .bind(list_resource_id)
+    .bind(controller.identity_id)
+    .bind(controller.device_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_lists
+           (id,project_id,topic_id,resource_node_id,encrypted_payload)
+         VALUES ($1,$2,$3,$4,decode('01','hex'))",
+    )
+    .bind(list_id)
+    .bind(fixture.project_id)
+    .bind(topic_id)
+    .bind(list_resource_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let task_id = Uuid::new_v4();
+    let task_resource_id = Uuid::new_v4();
+    let package_json = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT package_json FROM device_keys
+         WHERE identity_id=$1 AND device_id=$2 AND key_version=1",
+    )
+    .bind(administrator_identity_id)
+    .bind(fixture.owner_device_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    let package = DevicePublicPackage::from_json(&package_json).unwrap();
+    let x25519 = package
+        .encryption_keys
+        .iter()
+        .find(|key| key.algorithm == KeyAlgorithm::X25519)
+        .unwrap();
+    let ml_kem = package
+        .encryption_keys
+        .iter()
+        .find(|key| key.algorithm == KeyAlgorithm::MlKem768Experimental)
+        .unwrap();
+    let resource_key_bytes = [0x6b_u8; 32];
+    let resource_key = ResourceKey::from_slice(&resource_key_bytes).unwrap();
+    let previous_epoch_hash = hash_bytes(
+        format!(
+            "sprout-resource-key-genesis-v1/{}/{}",
+            fixture.project_id, task_resource_id
+        )
+        .as_bytes(),
+    );
+    let wrapped = wrap_resource_key(
+        &resource_key,
+        &x25519.public_key,
+        &ml_kem.public_key,
+        HybridWrapMetadata::new(
+            task_resource_id,
+            fixture.owner_device_id,
+            1,
+            previous_epoch_hash,
+            format!(
+                "sprout/resource-envelope/v2/{}/{}/{}/{}",
+                fixture.project_id,
+                task_resource_id,
+                administrator_identity_id,
+                fixture.owner_device_id
+            )
+            .into_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+    .to_bytes()
+    .unwrap();
+    let mut message = Vec::new();
+    message.extend_from_slice(b"sprout-resource-key-envelope-v2");
+    message.extend_from_slice(fixture.project_id.as_bytes());
+    message.extend_from_slice(&1_i16.to_be_bytes());
+    message.extend_from_slice(task_resource_id.as_bytes());
+    message.extend_from_slice(&1_i32.to_be_bytes());
+    message.extend_from_slice(administrator_identity_id.as_bytes());
+    message.extend_from_slice(fixture.owner_device_id.as_bytes());
+    message.extend_from_slice(&1_i32.to_be_bytes());
+    message.extend_from_slice(&1_i32.to_be_bytes());
+    message.extend_from_slice(&hash_bytes(&wrapped));
+    let signatures = sign_ed25519_ml_dsa65(
+        &controller.ed25519_private_key,
+        &controller.ml_dsa_65_private_key,
+        &message,
+        b"sprout-resource-key-envelope-v2",
+    )
+    .unwrap();
+    let mut commitment_input = Vec::new();
+    commitment_input.extend_from_slice(b"sprout-resource-key-commitment-v1");
+    commitment_input.extend_from_slice(fixture.project_id.as_bytes());
+    commitment_input.extend_from_slice(task_resource_id.as_bytes());
+    commitment_input.extend_from_slice(&resource_key_bytes);
+    json!({
+        "id": task_id,
+        "list_id": list_id,
+        "resource_node_id": task_resource_id,
+        "task_kind": "priority",
+        "payload": opaque_encrypted(151),
+        "header": null,
+        "selected_value_snapshot": opaque_encrypted(152),
+        "questionnaire_version_id": null,
+        "recurrence_series_id": null,
+        "occurrence_number": null,
+        "epoch": {
+            "id": Uuid::new_v4(),
+            "epoch": 1,
+            "creator_device_key_version": 1,
+            "key_commitment_b64": STANDARD.encode(hash_bytes(&commitment_input)),
+            "header_key_commitment_b64": null
+        },
+        "envelopes": [{
+            "version": 1,
+            "resource_id": task_resource_id,
+            "epoch": 1,
+            "key_purpose": "body",
+            "recipient_identity_id": administrator_identity_id,
+            "recipient_device_id": fixture.owner_device_id,
+            "recipient_device_key_version": 1,
+            "sender_device_key_version": 1,
+            "encrypted_key_b64": STANDARD.encode(wrapped),
+            "sender_signature_b64": STANDARD.encode(signatures.ed25519()),
+            "sender_post_quantum_signature_b64": STANDARD.encode(signatures.ml_dsa_65())
+        }],
+        "idempotency_key": Uuid::new_v4(),
+        "agent_identity_id": agent_identity_id
+    })
+}
+
 async fn json_body(response: axum::response::Response) -> Value {
     let bytes = to_bytes(response.into_body(), 1024 * 1024)
         .await
@@ -2101,7 +2457,7 @@ async fn responsibility_or_permission_revoked_before_creation_fails_closed() {
 async fn administrator_creation_mismatches_roll_back_every_phase() {
     let fixture = fixture().await;
     let app = app(&fixture);
-    for case in 0_u8..13 {
+    for case in 0_u8..15 {
         let (status, candidate) = provision_administrator_governed_agent(
             &fixture,
             &app,
@@ -2160,6 +2516,14 @@ async fn administrator_creation_mismatches_roll_back_every_phase() {
                 12 => {
                     body["initial_local_goal"]["compilation"]["statement"]["authorization"] =
                         json!({"kind": "project_administrator"});
+                }
+                13 => {
+                    body["initial_local_goal"]["compilation"]["statement"]["authorization"] =
+                        json!({"kind":"administrator_exception","id":Uuid::new_v4(),"revision":1});
+                }
+                14 => {
+                    body["initial_local_goal"]["compilation"]["statement"]["authorization"] =
+                        json!({"kind":"global_mandate","id":Uuid::new_v4(),"revision":1});
                 }
                 _ => unreachable!(),
             },
@@ -4304,7 +4668,7 @@ async fn governance_verified_history_rejects_app_role_dml_and_shadowing() {
     for grant in [
         "GRANT sprout_0029_untrusted_app TO sprout_test",
         "GRANT USAGE ON SCHEMA public, sprout_private TO sprout_0029_untrusted_app",
-        "GRANT SELECT ON agent_compilation_certificates, agent_prompt_final_approvals, agent_administrator_creation_approvals, agent_governance_ledger TO sprout_0029_untrusted_app",
+        "GRANT SELECT ON agent_compilation_certificates, agent_prompt_final_approvals, agent_administrator_creation_approvals, agent_governance_ledger, agent_governance_authorization_events TO sprout_0029_untrusted_app",
     ] {
         sqlx::query(grant)
             .execute(&fixture.pool)
@@ -4329,7 +4693,8 @@ async fn governance_verified_history_rejects_app_role_dml_and_shadowing() {
               'insert_verified_compilation_certificate',
               'insert_verified_administrator_creation_approval',
               'insert_verified_final_prompt_approval',
-              'append_verified_governance_revision'
+              'append_verified_governance_revision',
+              'insert_agent_governance_authorization_event'
           )
         "#,
     )
@@ -4342,6 +4707,7 @@ async fn governance_verified_history_rejects_app_role_dml_and_shadowing() {
              (SELECT count(*) FROM agent_compilation_certificates WHERE project_id = $1),
              (SELECT count(*) FROM agent_prompt_final_approvals WHERE project_id = $1),
              (SELECT count(*) FROM agent_administrator_creation_approvals WHERE project_id = $1),
+             (SELECT count(*) FROM agent_governance_authorization_events WHERE project_id = $1),
              (SELECT count(*) FROM agent_governance_ledger WHERE project_id = $1))",
     )
     .bind(fixture.project_id)
@@ -4417,10 +4783,44 @@ async fn governance_verified_history_rejects_app_role_dml_and_shadowing() {
             EXCEPTION WHEN insufficient_privilege THEN NULL;
             END;
             BEGIN
+                INSERT INTO public.agent_governance_authorization_events (
+                    project_id,event_id,event_kind,workflow_id,workflow_revision,
+                    actor_identity_id,idempotency_key,event_hash,payload,ledger_position
+                ) VALUES (
+                    current_setting('app.project_id')::uuid,gen_random_uuid(),
+                    'exception_decision',gen_random_uuid(),1,
+                    current_setting('app.identity_id')::uuid,gen_random_uuid(),
+                    decode(repeat('00',32),'hex'),'{}'::jsonb,1
+                );
+                RAISE EXCEPTION 'untrusted app inserted a governance event';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+            BEGIN
+                UPDATE public.agent_governance_authorization_events
+                SET event_hash=decode(repeat('00',32),'hex')
+                WHERE project_id=current_setting('app.project_id')::uuid;
+                RAISE EXCEPTION 'untrusted app updated a governance event';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+            BEGIN
+                DELETE FROM public.agent_governance_authorization_events
+                WHERE project_id=current_setting('app.project_id')::uuid;
+                RAISE EXCEPTION 'untrusted app deleted a governance event';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+            BEGIN
                 PERFORM sprout_private.append_verified_governance_revision(
                     NULL, NULL, NULL, NULL, NULL, NULL
                 );
                 RAISE EXCEPTION 'untrusted app executed private governance writer';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+            BEGIN
+                PERFORM sprout_private.insert_agent_governance_authorization_event(
+                    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+                    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+                );
+                RAISE EXCEPTION 'untrusted app executed private 0030 writer';
             EXCEPTION WHEN insufficient_privilege THEN NULL;
             END;
         END
@@ -4439,6 +4839,7 @@ async fn governance_verified_history_rejects_app_role_dml_and_shadowing() {
              (SELECT count(*) FROM agent_compilation_certificates WHERE project_id = $1),
              (SELECT count(*) FROM agent_prompt_final_approvals WHERE project_id = $1),
              (SELECT count(*) FROM agent_administrator_creation_approvals WHERE project_id = $1),
+             (SELECT count(*) FROM agent_governance_authorization_events WHERE project_id = $1),
              (SELECT count(*) FROM agent_governance_ledger WHERE project_id = $1))",
     )
     .bind(fixture.project_id)
@@ -4938,6 +5339,1519 @@ async fn normal_controller_can_atomically_activate_exact_local_goal_and_stale_re
     .expect("count approvals after stale retry");
     assert_eq!(audit_after, audit_before);
     assert_eq!(approvals_after, approvals_before);
+}
+
+fn certified_responsibility_revision_artifact(
+    fixture: &Fixture,
+    user_identity_id: Uuid,
+    responsibility_id: Uuid,
+    revision: u64,
+    seed: u8,
+) -> (Value, Value) {
+    let source = encrypted(seed);
+    let source_payload: sprout_domain::EncryptedPayload =
+        serde_json::from_value(source.clone()).expect("typed responsibility ciphertext");
+    let output = json!({
+        "rules": [{
+            "domain": 1,
+            "scope": fixture.profile_resource_id,
+            "allowed_actions": ["post_comment"]
+        }]
+    });
+    let envelope = json!({
+        "language_task": {
+            "id": Uuid::new_v4(),
+            "kind": "compile_responsibility_rules",
+            "input_item_count": 1,
+            "max_input_items": 1,
+            "max_output_items": 8,
+            "max_nesting_depth": 8,
+            "max_attempts": 1,
+            "closed_output_schema": true,
+            "grounded_identifiers_only": true,
+            "requires_formal_proof": false,
+            "requires_permission_decision": false,
+            "requires_exact_semantic_equivalence": false,
+            "requires_exhaustive_world_knowledge": false,
+            "allowed_resource_ids": [fixture.profile_resource_id],
+            "allowed_principal_ids": [fixture.owner_id, user_identity_id],
+            "allowed_tools": []
+        },
+        "administrator": fixture.owner_id,
+        "user": user_identity_id,
+        "project_scopes": [fixture.profile_resource_id],
+        "allowed_actions": ["post_comment"],
+        "max_rules": 8
+    });
+    let statement = json!({
+        "certificate_id": Uuid::new_v4(),
+        "compiler": {
+            "compiler_id": "sprout.responsibility.compiler",
+            "compiler_version": 1,
+            "compiler_build_digest_hex": "78bd83db79112191f81aa118512092f7ea54a87733a82e823fa83cf107e3eb73"
+        },
+        "project_id": fixture.project_id,
+        "responsibility_id": responsibility_id,
+        "revision": revision,
+        "draft_id": Uuid::new_v4(),
+        "administrator_identity_id": fixture.owner_id,
+        "user_identity_id": user_identity_id,
+        "source_text_commitment_hex": "44".repeat(32),
+        "ciphertext_commitment_hex": sha256_hex(
+            &serde_json::to_vec(&source_payload).expect("serialize responsibility ciphertext")
+        ),
+        "output": output.clone(),
+        "output_hash_hex": canonical_hash_hex(&output),
+        "envelope": envelope.clone(),
+        "envelope_hash_hex": canonical_hash_hex(&envelope),
+        "idempotency_key": Uuid::new_v4()
+    });
+    let signed = json!({
+        "statement": statement.clone(),
+        "signatures": signed_statement(
+            fixture,
+            &statement,
+            b"sprout-governance-compilation-v1"
+        )
+    });
+    (signed, source)
+}
+
+async fn exception_operational_snapshot(
+    fixture: &Fixture,
+    user_identity_id: Uuid,
+    agent_id: Uuid,
+) -> String {
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT jsonb_build_object(
+          'responsibilities', COALESCE((
+            SELECT jsonb_agg(
+              jsonb_build_object('id', id, 'revision', revision, 'state', state)
+              ORDER BY revision
+            )
+            FROM agent_responsibility_contracts
+            WHERE project_id=$1 AND user_identity_id=$2
+          ), '[]'::jsonb),
+          'locals', COALESCE((
+            SELECT jsonb_agg(
+              jsonb_build_object(
+                'id', id, 'revision', revision, 'state', state, 'contract', contract
+              ) ORDER BY revision
+            )
+            FROM agent_local_goal_contracts
+            WHERE project_id=$1 AND agent_id=$3
+          ), '[]'::jsonb),
+          'prompts', COALESCE((
+            SELECT jsonb_agg(
+              jsonb_build_object(
+                'draft', draft_id,
+                'revision', local_goal_revision,
+                'state', state,
+                'ciphertext', encrypted_prompt
+              ) ORDER BY local_goal_revision
+            )
+            FROM agent_prompt_revisions
+            WHERE project_id=$1 AND agent_id=$3
+          ), '[]'::jsonb),
+          'agent_prompt', (
+            SELECT encrypted_system_prompt FROM governed_agents
+            WHERE project_id=$1 AND id=$3
+          ),
+          'authority', jsonb_build_object(
+            'topic', (SELECT count(*) FROM topic_permissions WHERE project_id=$1),
+            'task_list', (SELECT count(*) FROM task_list_permissions WHERE project_id=$1),
+            'task', (SELECT count(*) FROM task_permissions WHERE project_id=$1),
+            'envelopes', (SELECT count(*) FROM resource_key_envelopes WHERE project_id=$1)
+          )
+        )::text
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(user_identity_id)
+    .bind(agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact exception operational snapshot")
+}
+
+async fn certified_exception_is_causal_exact_atomic_and_replay_safe(decision_mode: &str) {
+    let fixture = fixture().await;
+    let app = app(&fixture);
+    let controller = add_signing_human_member(&fixture, "member").await;
+    let (responsibility_status, responsibility_id) =
+        create_active_compiled_responsibility(&fixture, &app, controller.identity_id, 160).await;
+    assert_eq!(responsibility_status, StatusCode::OK);
+    let (creation_status, created) = provision_administrator_governed_agent(
+        &fixture,
+        &app,
+        161,
+        Some(&controller),
+        Some(responsibility_id),
+        |_| {},
+        false,
+    )
+    .await;
+    assert_eq!(creation_status, StatusCode::OK);
+
+    let source = local_revision_artifact(
+        &fixture,
+        &created,
+        &controller,
+        json!({"kind":"responsibility","id":responsibility_id,"revision":1}),
+        LocalGoalOrigin::ControllerPrompt {},
+        controller.identity_id,
+        controller.device_id,
+        &controller.ed25519_private_key,
+        &controller.ml_dsa_65_private_key,
+        true,
+        162,
+    )
+    .await;
+    let source_event_id = Uuid::new_v4();
+    let disposition_body = json!({
+        "event_id": source_event_id,
+        "idempotency_key": Uuid::new_v4(),
+        "disposition": "request_administrator_review",
+        "source": {
+            "encrypted_prompt": source.prompt,
+            "supersedes_revision": 1,
+            "compilation": source.compilation
+        },
+        "summary": {
+            "id": Uuid::new_v4(),
+            "reason": "send_responsibility_exception_to_administrator",
+            "facts": [
+                {"kind":"draft","draft_id":source.draft_id},
+                {"kind":"local_revision","revision":2}
+            ],
+            "encrypted_payload": encrypted(163),
+            "generated_at": Utc::now()
+        }
+    });
+    let disposition = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/local-goal-dispositions",
+                    fixture.project_id, created.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", controller.bearer))
+                .body(Body::from(disposition_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disposition.status(), StatusCode::OK);
+
+    let review_id = Uuid::new_v4();
+    let consent_statement = json!({
+        "event_id": Uuid::new_v4(),
+        "idempotency_key": Uuid::new_v4(),
+        "project_id": fixture.project_id,
+        "consent": {
+            "review_id": review_id,
+            "user": controller.identity_id,
+            "source_draft_id": source.draft_id,
+            "consented": true
+        },
+        "summary": {
+            "id": Uuid::new_v4(),
+            "reason": "send_responsibility_exception_to_administrator",
+            "facts": [
+                {"kind":"draft","draft_id":source.draft_id},
+                {"kind":"local_revision","revision":2}
+            ],
+            "encrypted_payload": encrypted(164),
+            "generated_at": Utc::now()
+        }
+    });
+    let consent_body = json!({
+        "statement": consent_statement,
+        "signatures": signed_statement_by(
+            controller.identity_id,
+            controller.device_id,
+            &controller.ed25519_private_key,
+            &controller.ml_dsa_65_private_key,
+            &consent_statement,
+            b"sprout-local-goal-exception-consent-v1"
+        )
+    });
+    let consent = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/exception-consents",
+                    fixture.project_id, created.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", controller.bearer))
+                .body(Body::from(consent_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(consent.status(), StatusCode::OK);
+
+    let review_task = governance_review_task_fixture(
+        &fixture,
+        &controller,
+        created.principal_identity_id,
+        fixture.owner_id,
+    )
+    .await;
+    let review_event_id = Uuid::new_v4();
+    let review_body = json!({
+        "event_id": review_event_id,
+        "idempotency_key": Uuid::new_v4(),
+        "review": {
+            "id": review_id,
+            "user": controller.identity_id,
+            "agent": created.principal_identity_id,
+            "administrator": fixture.owner_id,
+            "source_draft_id": source.draft_id,
+            "review_task": review_task["resource_node_id"],
+            "excess_summary": encrypted(165),
+            "proposed_local": source.local
+        },
+        "review_task": review_task,
+        "review_assignment_id": Uuid::new_v4(),
+        "review_permission_grant_id": Uuid::new_v4(),
+        "encrypted_assignment": opaque_encrypted(166)
+    });
+    let review_request = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/v1/projects/{}/agents/{}/exception-reviews",
+                fixture.project_id, created.agent_id
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Bearer {}", controller.bearer))
+            .body(Body::from(review_body.to_string()))
+            .unwrap()
+    };
+    let review = app.clone().oneshot(review_request()).await.unwrap();
+    assert_eq!(review.status(), StatusCode::OK);
+    let review_replay = app.clone().oneshot(review_request()).await.unwrap();
+    assert_eq!(review_replay.status(), StatusCode::OK);
+    let task_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM tasks WHERE project_id=$1 AND resource_node_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(
+        review_body["review_task"]["resource_node_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap(),
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        task_count, 1,
+        "exact review replay must not create a second task"
+    );
+
+    let mut review_equivocation = review_body.clone();
+    review_equivocation["review"]["excess_summary"] = encrypted(250);
+    let review_equivocation_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/exception-reviews",
+                    fixture.project_id, created.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", controller.bearer))
+                .body(Body::from(review_equivocation.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(review_equivocation_response.status(), StatusCode::CONFLICT);
+
+    // A real task materialized for one review cannot be rebound to another
+    // exact consent, even when agent creator and administrator assignee are
+    // otherwise identical.  It also predates the second consent, proving that
+    // a merely compatible historical R4 task is not accepted as its effect.
+    let unrelated_review_id = Uuid::new_v4();
+    let unrelated_consent_statement = json!({
+        "event_id": Uuid::new_v4(),
+        "idempotency_key": Uuid::new_v4(),
+        "project_id": fixture.project_id,
+        "consent": {
+            "review_id": unrelated_review_id,
+            "user": controller.identity_id,
+            "source_draft_id": source.draft_id,
+            "consented": true
+        },
+        "summary": consent_statement["summary"].clone()
+    });
+    let unrelated_consent_body = json!({
+        "statement": unrelated_consent_statement,
+        "signatures": signed_statement_by(
+            controller.identity_id,
+            controller.device_id,
+            &controller.ed25519_private_key,
+            &controller.ml_dsa_65_private_key,
+            &unrelated_consent_statement,
+            b"sprout-local-goal-exception-consent-v1"
+        )
+    });
+    let unrelated_consent = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/exception-consents",
+                    fixture.project_id, created.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", controller.bearer))
+                .body(Body::from(unrelated_consent_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unrelated_consent.status(), StatusCode::OK);
+    let mut unrelated_review = review_body.clone();
+    unrelated_review["event_id"] = json!(Uuid::new_v4());
+    unrelated_review["idempotency_key"] = json!(Uuid::new_v4());
+    unrelated_review["review"]["id"] = json!(unrelated_review_id);
+    let unrelated_review_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/exception-reviews",
+                    fixture.project_id, created.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", controller.bearer))
+                .body(Body::from(unrelated_review.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unrelated_review_response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tasks WHERE project_id=$1 AND resource_node_id=$2",
+        )
+        .bind(fixture.project_id)
+        .bind(
+            review_body["review_task"]["resource_node_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        )
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let completion = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/tasks/{}/complete",
+                    fixture.project_id,
+                    review_body["review_task"]["id"].as_str().unwrap()
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "completion_id":Uuid::new_v4(),
+                        "assignment_id":review_body["review_assignment_id"],
+                        "expected_payload_version":1,
+                        "encrypted_completion":opaque_encrypted(169),
+                        "completed_at":Utc::now(),
+                        "recurrence_series_id":null,
+                        "occurrence_number":null,
+                        "next_occurrence":null,
+                        "idempotency_key":Uuid::new_v4()
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completion.status(), StatusCode::OK);
+
+    let final_artifact = local_revision_artifact(
+        &fixture,
+        &created,
+        &controller,
+        json!({"kind":"administrator_exception","id":review_id,"revision":1}),
+        LocalGoalOrigin::AdministratorException { review_id },
+        fixture.owner_id,
+        fixture.owner_device_id,
+        &fixture.owner_ed25519_private_key,
+        &fixture.owner_ml_dsa_65_private_key,
+        true,
+        167,
+    )
+    .await;
+    let expected_final_prompt = final_artifact.prompt.clone();
+    let (final_responsibility, final_responsibility_source) =
+        if decision_mode == "approved_goal_and_responsibility" {
+            let (signed, source) = certified_responsibility_revision_artifact(
+                &fixture,
+                controller.identity_id,
+                responsibility_id,
+                2,
+                170,
+            );
+            (Some(signed), Some(source))
+        } else {
+            (None, None)
+        };
+    let admin_draft_body = json!({
+        "event_id": Uuid::new_v4(),
+        "idempotency_key": Uuid::new_v4(),
+        "revision": 1,
+        "encrypted_prompt": expected_final_prompt.clone(),
+        "local_compilation": final_artifact.compilation,
+        "final_responsibility": final_responsibility,
+        "final_responsibility_encrypted_source": final_responsibility_source,
+        "final_responsibility_supersedes_revision":
+            (decision_mode == "approved_goal_and_responsibility").then_some(1)
+    });
+    let admin_draft = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/exception-reviews/{review_id}/drafts",
+                    fixture.project_id, created.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(admin_draft_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    if admin_draft.status() != StatusCode::OK {
+        panic!(
+            "administrator draft failed: {}",
+            json_body(admin_draft).await
+        );
+    }
+    let operational_before_decision =
+        exception_operational_snapshot(&fixture, controller.identity_id, created.agent_id).await;
+
+    let decision_statement = json!({
+        "event_id": Uuid::new_v4(),
+        "idempotency_key": Uuid::new_v4(),
+        "project_id": fixture.project_id,
+        "decision": {
+            "review_id": review_id,
+            "review_draft_revision": 1,
+            "administrator": fixture.owner_id,
+            "mode": decision_mode
+        },
+        "summary": {
+            "id": Uuid::new_v4(),
+            "reason": "administrator_responsibility_exception_decision",
+            "facts": [
+                {"kind":"agent","agent":created.principal_identity_id},
+                {"kind":"local_revision","revision":2}
+            ],
+            "encrypted_payload": encrypted(168),
+            "generated_at": Utc::now()
+        }
+    });
+    let decision_body = json!({
+        "statement": decision_statement,
+        "signatures": signed_statement(
+            &fixture,
+            &decision_statement,
+            b"sprout-local-goal-exception-decision-v1"
+        )
+    });
+    let decision_request = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/v1/projects/{}/agents/{}/exception-reviews/{review_id}/decision",
+                fixture.project_id, created.agent_id
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Bearer {}", fixture.owner_token))
+            .body(Body::from(decision_body.to_string()))
+            .unwrap()
+    };
+    let decision_response = app.clone().oneshot(decision_request()).await.unwrap();
+    if decision_response.status() != StatusCode::OK {
+        panic!(
+            "exception decision failed: {}",
+            json_body(decision_response).await
+        );
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(decision_request())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let approved_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_kind='approved_local_exception'
+           AND workflow_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(review_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    if decision_mode == "rejected" {
+        assert_eq!(approved_count, 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM agent_governance_authorization_events
+                 WHERE project_id=$1 AND event_kind='exception_decision'
+                   AND workflow_id=$2",
+            )
+            .bind(fixture.project_id)
+            .bind(review_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            exception_operational_snapshot(&fixture, controller.identity_id, created.agent_id,)
+                .await,
+            operational_before_decision,
+            "rejection must preserve Responsibility, prompt, LocalGoal and authority projections"
+        );
+
+        let mut discordant_statement = decision_statement.clone();
+        discordant_statement["event_id"] = json!(Uuid::new_v4());
+        discordant_statement["idempotency_key"] = json!(Uuid::new_v4());
+        discordant_statement["decision"]["mode"] = json!("approved_goal_only");
+        let discordant_signatures = signed_statement(
+            &fixture,
+            &discordant_statement,
+            b"sprout-local-goal-exception-decision-v1",
+        );
+        let discordant = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/projects/{}/agents/{}/exception-reviews/{review_id}/decision",
+                        fixture.project_id, created.agent_id
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {}", fixture.owner_token))
+                    .body(Body::from(
+                        json!({
+                            "statement":discordant_statement,
+                            "signatures":discordant_signatures
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discordant.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            exception_operational_snapshot(&fixture, controller.identity_id, created.agent_id,)
+                .await,
+            operational_before_decision
+        );
+        return;
+    }
+    assert_eq!(approved_count, 1);
+
+    let approval_id = Uuid::new_v4();
+    let approval_idempotency = Uuid::new_v4();
+    let approval_identity = json!({
+        "signature_context":"sprout-final-prompt-approval-v1",
+        "approval_id":approval_id,
+        "project_id":fixture.project_id,
+        "draft_id":final_artifact.draft_id,
+        "agent_principal_identity_id":created.principal_identity_id,
+        "controller_identity_id":controller.identity_id,
+        "local_goal_id":created.local_goal_id,
+        "local_revision":2,
+        "prompt_commitment_hex":final_artifact.prompt_commitment_hex,
+        "ciphertext_commitment_hex":final_artifact.ciphertext_commitment_hex,
+        "compilation_certificate_id":final_artifact.certificate_id,
+        "structured_output_hash_hex":final_artifact.output_hash_hex,
+        "idempotency_key":approval_idempotency
+    });
+    let approval_statement = json!({
+        "approval_id":approval_id,
+        "project_id":fixture.project_id,
+        "draft_id":final_artifact.draft_id,
+        "agent_principal_identity_id":created.principal_identity_id,
+        "controller_identity_id":controller.identity_id,
+        "local_goal_id":created.local_goal_id,
+        "local_revision":2,
+        "prompt_commitment_hex":final_artifact.prompt_commitment_hex,
+        "ciphertext_commitment_hex":final_artifact.ciphertext_commitment_hex,
+        "compilation_certificate_id":final_artifact.certificate_id,
+        "structured_output_hash_hex":final_artifact.output_hash_hex,
+        "approval_identity_hash_hex":canonical_hash_hex(&approval_identity),
+        "idempotency_key":approval_idempotency
+    });
+    if decision_mode == "approved_goal_and_responsibility" {
+        let operational_before_stale =
+            exception_operational_snapshot(&fixture, controller.identity_id, created.agent_id)
+                .await;
+        let audit_before_stale = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_user_governance_audit_log
+             WHERE project_id=$1 AND subject_user_identity_id=$2
+               AND event_kind IN ('local_goal_activated','responsibility_activated')",
+        )
+        .bind(fixture.project_id)
+        .bind(controller.identity_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        let approvals_before_stale = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_prompt_final_approvals
+             WHERE project_id=$1 AND agent_id=$2",
+        )
+        .bind(fixture.project_id)
+        .bind(created.agent_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        let stale_approval_id = Uuid::new_v4();
+        let stale_idempotency = Uuid::new_v4();
+        let mut stale_identity = approval_identity.clone();
+        stale_identity["approval_id"] = json!(stale_approval_id);
+        stale_identity["local_revision"] = json!(1);
+        stale_identity["idempotency_key"] = json!(stale_idempotency);
+        let mut stale_statement = approval_statement.clone();
+        stale_statement["approval_id"] = json!(stale_approval_id);
+        stale_statement["local_revision"] = json!(1);
+        stale_statement["idempotency_key"] = json!(stale_idempotency);
+        stale_statement["approval_identity_hash_hex"] = json!(canonical_hash_hex(&stale_identity));
+        let stale_signatures = signed_statement_by(
+            controller.identity_id,
+            controller.device_id,
+            &controller.ed25519_private_key,
+            &controller.ml_dsa_65_private_key,
+            &stale_statement,
+            b"sprout-final-prompt-approval-v1",
+        );
+        let stale_activation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/projects/{}/agents/{}/local-goals/{}/revisions/2/activate",
+                        fixture.project_id, created.agent_id, created.local_goal_id
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {}", controller.bearer))
+                    .body(Body::from(
+                        json!({
+                            "statement":stale_statement,
+                            "signatures":stale_signatures
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_activation.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            exception_operational_snapshot(&fixture, controller.identity_id, created.agent_id,)
+                .await,
+            operational_before_stale
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM agent_user_governance_audit_log
+                 WHERE project_id=$1 AND subject_user_identity_id=$2
+                   AND event_kind IN ('local_goal_activated','responsibility_activated')",
+            )
+            .bind(fixture.project_id)
+            .bind(controller.identity_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap(),
+            audit_before_stale
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM agent_prompt_final_approvals
+                 WHERE project_id=$1 AND agent_id=$2",
+            )
+            .bind(fixture.project_id)
+            .bind(created.agent_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap(),
+            approvals_before_stale
+        );
+    }
+    let activation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/local-goals/{}/revisions/2/activate",
+                    fixture.project_id, created.agent_id, created.local_goal_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", controller.bearer))
+                .body(Body::from(
+                    json!({
+                        "statement":approval_statement,
+                        "signatures":signed_statement_by(
+                            controller.identity_id,
+                            controller.device_id,
+                            &controller.ed25519_private_key,
+                            &controller.ml_dsa_65_private_key,
+                            &approval_statement,
+                            b"sprout-final-prompt-approval-v1"
+                        )
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(activation.status(), StatusCode::OK);
+    let expected_responsibility_revision = if decision_mode == "approved_goal_and_responsibility" {
+        2
+    } else {
+        1
+    };
+    let expected_final_prompt_bytes = serde_json::to_vec(
+        &serde_json::from_value::<sprout_domain::EncryptedPayload>(expected_final_prompt)
+            .expect("typed final exception prompt"),
+    )
+    .expect("serialize final exception prompt");
+    let exact_atomic_state = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT
+          (SELECT count(*) = 1 FROM agent_responsibility_contracts
+           WHERE project_id=$1 AND user_identity_id=$2 AND state='active')
+          AND (SELECT count(*) = 1 FROM agent_responsibility_contracts
+               WHERE project_id=$1 AND user_identity_id=$2
+                 AND revision=$4 AND state='active')
+          AND CASE WHEN $4 = 2 THEN
+                (SELECT count(*) = 1 FROM agent_responsibility_contracts
+                 WHERE project_id=$1 AND user_identity_id=$2
+                   AND revision=1 AND state='superseded')
+              ELSE
+                (SELECT count(*) = 1 FROM agent_responsibility_contracts
+                 WHERE project_id=$1 AND user_identity_id=$2
+                   AND revision=1 AND state='active')
+              END
+          AND (SELECT count(*) = 1 FROM agent_local_goal_contracts
+               WHERE project_id=$1 AND agent_id=$3 AND state='active')
+          AND (SELECT count(*) = 1 FROM agent_local_goal_contracts
+               WHERE project_id=$1 AND agent_id=$3 AND revision=1
+                 AND state='superseded')
+          AND (SELECT count(*) = 1 FROM agent_local_goal_contracts
+               WHERE project_id=$1 AND agent_id=$3 AND revision=2
+                 AND state='active' AND contract=$5::jsonb
+                 AND contract #>> '{origin,kind}'='administrator_exception')
+          AND (SELECT count(*) = 1 FROM agent_prompt_revisions
+               WHERE project_id=$1 AND agent_id=$3 AND local_goal_revision=2
+                 AND state='active' AND encrypted_prompt=$6)
+          AND (SELECT count(*) = 1 FROM governed_agents agent
+               WHERE agent.project_id=$1 AND agent.id=$3
+                 AND agent.encrypted_system_prompt=$6)
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(controller.identity_id)
+    .bind(created.agent_id)
+    .bind(expected_responsibility_revision)
+    .bind(serde_json::to_value(&final_artifact.local).unwrap())
+    .bind(expected_final_prompt_bytes)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert!(exact_atomic_state);
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn certified_exception_goal_only_is_causal_exact_atomic_and_replay_safe() {
+    certified_exception_is_causal_exact_atomic_and_replay_safe("approved_goal_only").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn certified_exception_goal_and_responsibility_activate_atomically() {
+    certified_exception_is_causal_exact_atomic_and_replay_safe("approved_goal_and_responsibility")
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn certified_exception_rejection_is_terminal_idempotent_and_non_authorizing() {
+    certified_exception_is_causal_exact_atomic_and_replay_safe("rejected").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn certified_global_mandate_for_existing_agent_rechecks_permission_and_grants_nothing() {
+    let fixture = fixture().await;
+    let app = app(&fixture);
+    let controller = add_signing_human_member(&fixture, "member").await;
+    let (responsibility_status, responsibility_id) =
+        create_active_compiled_responsibility(&fixture, &app, controller.identity_id, 180).await;
+    assert_eq!(responsibility_status, StatusCode::OK);
+    let (creation_status, created) = provision_administrator_governed_agent(
+        &fixture,
+        &app,
+        181,
+        Some(&controller),
+        Some(responsibility_id),
+        |_| {},
+        false,
+    )
+    .await;
+    assert_eq!(creation_status, StatusCode::OK);
+
+    let permission_id = Uuid::new_v4();
+    sqlx::query(
+        "UPDATE governed_agents SET availability='project_delegable'
+         WHERE project_id=$1 AND id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(created.agent_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO topic_permissions (
+             id,project_id,topic_id,member_identity_id,access_level,visibility,
+             grant_origin,root_grant_id,access_scope,granted_by_identity_id
+         ) SELECT $2,$1,topic.id,$3,'manage','restricted','explicit',$2,'full',$4
+           FROM topics topic WHERE topic.project_id=$1 AND topic.resource_node_id=$5",
+    )
+    .bind(fixture.project_id)
+    .bind(permission_id)
+    .bind(created.principal_identity_id)
+    .bind(fixture.owner_id)
+    .bind(fixture.profile_resource_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    let source_local_json = sqlx::query_scalar::<_, String>(
+        "SELECT contract::text FROM agent_local_goal_contracts
+         WHERE project_id=$1 AND agent_id=$2 AND id=$3
+           AND revision=1 AND state='active'",
+    )
+    .bind(fixture.project_id)
+    .bind(created.agent_id)
+    .bind(created.local_goal_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    let source_local: Value = serde_json::from_str(&source_local_json).unwrap();
+    let goal_contract = source_local["contract"].clone();
+    let obligation_id = goal_contract["obligations"][0]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let global_contract_id = Uuid::new_v4();
+    let global = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-global-contracts",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id":global_contract_id,
+                        "synthesis_invocation_id":null,
+                        "envelope":{
+                            "language_task":{
+                                "id":Uuid::new_v4(),
+                                "kind":"synthesize_global_contract",
+                                "input_item_count":1,
+                                "max_input_items":1,
+                                "max_output_items":4,
+                                "max_nesting_depth":4,
+                                "max_attempts":1,
+                                "closed_output_schema":true,
+                                "grounded_identifiers_only":true,
+                                "requires_formal_proof":false,
+                                "requires_permission_decision":false,
+                                "requires_exact_semantic_equivalence":false,
+                                "requires_exhaustive_world_knowledge":false,
+                                "allowed_resource_ids":[fixture.profile_resource_id],
+                                "allowed_principal_ids":[created.principal_identity_id],
+                                "allowed_tools":[]
+                            },
+                            "source_agents":[created.principal_identity_id],
+                            "max_global_obligations":1,
+                            "max_global_work_specs":1,
+                            "max_dependencies":0,
+                            "max_conflicts":0
+                        },
+                        "candidate":{
+                            "revision":1,
+                            "contract":goal_contract,
+                            "contributions":[{
+                                "agent":created.principal_identity_id,
+                                "local_revision":1,
+                                "local_clause_id":1,
+                                "global_work_spec_ids":[1]
+                            }],
+                            "governance_conflicts":[]
+                        },
+                        "groundings":[{
+                            "global_work_spec_id":1,
+                            "source_agent":created.principal_identity_id,
+                            "source_local_revision":1,
+                            "source_work_spec_id":1
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        global.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(global).await
+    );
+
+    let need_id = Uuid::new_v4();
+    let need = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-global-coverage-needs",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "event_id":need_id,
+                        "idempotency_key":Uuid::new_v4(),
+                        "global_contract_id":global_contract_id,
+                        "global_revision":1,
+                        "obligation_id":obligation_id
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(need.status(), StatusCode::OK, "{}", json_body(need).await);
+
+    let mandate_id = Uuid::new_v4();
+    let artifact = local_revision_artifact(
+        &fixture,
+        &created,
+        &controller,
+        json!({"kind":"global_mandate","id":mandate_id,"revision":1}),
+        LocalGoalOrigin::GlobalMandate { global_revision: 1 },
+        controller.identity_id,
+        controller.device_id,
+        &controller.ed25519_private_key,
+        &controller.ml_dsa_65_private_key,
+        false,
+        182,
+    )
+    .await;
+    let mandate_body = json!({
+        "event_id":mandate_id,
+        "idempotency_key":Uuid::new_v4(),
+        "need_id":need_id,
+        "supersedes_revision":1,
+        "encrypted_prompt":artifact.prompt,
+        "compilation":artifact.compilation
+    });
+    for mut forged in [
+        {
+            let mut value = mandate_body.clone();
+            value["compilation"]["statement"]["authorization"]["id"] = json!(Uuid::new_v4());
+            value
+        },
+        {
+            let mut value = mandate_body.clone();
+            value["compilation"]["statement"]["authorization"]["revision"] = json!(2);
+            value
+        },
+        {
+            let mut value = mandate_body.clone();
+            value["compilation"]["statement"]["local_goal_id"] = json!(Uuid::new_v4());
+            value
+        },
+    ] {
+        resign_local_compilation(&mut forged, &controller);
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/projects/{}/agents/{}/global-mandates",
+                        fixture.project_id, created.agent_id
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {}", fixture.owner_token))
+                    .body(Body::from(forged.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(rejected.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT
+               (SELECT count(*) FROM agent_governance_authorization_events
+                 WHERE project_id=$1 AND event_kind='global_mandate_assignment')
+             + (SELECT count(*) FROM agent_compilation_certificates
+                 WHERE project_id=$1 AND id=$2)
+             + (SELECT count(*) FROM agent_local_goal_contracts
+                 WHERE project_id=$1 AND agent_id=$3 AND revision=2)
+             + (SELECT count(*) FROM agent_governance_ledger
+                 WHERE project_id=$1 AND entry_id=$2)",
+        )
+        .bind(fixture.project_id)
+        .bind(artifact.certificate_id)
+        .bind(created.agent_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap(),
+        0
+    );
+    let mandate_request = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/v1/projects/{}/agents/{}/global-mandates",
+                fixture.project_id, created.agent_id
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Bearer {}", fixture.owner_token))
+            .body(Body::from(mandate_body.to_string()))
+            .unwrap()
+    };
+    let mandate = app.clone().oneshot(mandate_request()).await.unwrap();
+    assert_eq!(
+        mandate.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(mandate).await
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(mandate_request())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let mut other_mandate = mandate_body.clone();
+    other_mandate["event_id"] = json!(Uuid::new_v4());
+    other_mandate["idempotency_key"] = json!(Uuid::new_v4());
+    // The compilation deliberately retains the already valid first mandate
+    // as its authorization_id; it cannot authorize this second workflow.
+    let other_mandate_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/global-mandates",
+                    fixture.project_id, created.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(other_mandate.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_mandate_response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_governance_authorization_events
+             WHERE project_id=$1 AND event_kind='global_mandate_assignment'",
+        )
+        .bind(fixture.project_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap(),
+        1
+    );
+
+    let approval = exact_final_prompt_approval(&fixture, &created, &controller, &artifact);
+    sqlx::query(
+        "UPDATE governed_agents SET availability='controller_private'
+         WHERE project_id=$1 AND id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(created.agent_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let activate = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/v1/projects/{}/agents/{}/local-goals/{}/revisions/2/activate",
+                fixture.project_id, created.agent_id, created.local_goal_id
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Bearer {}", controller.bearer))
+            .body(Body::from(approval.to_string()))
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(activate()).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    sqlx::query(
+        "UPDATE governed_agents SET availability='project_delegable'
+         WHERE project_id=$1 AND id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(created.agent_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE topic_permissions SET revoked_at=clock_timestamp()
+         WHERE project_id=$1 AND id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(permission_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        app.clone().oneshot(activate()).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_local_goal_contracts
+             WHERE project_id=$1 AND agent_id=$2 AND revision=2 AND state='active'",
+        )
+        .bind(fixture.project_id)
+        .bind(created.agent_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    sqlx::query(
+        "INSERT INTO topic_permissions (
+             id,project_id,topic_id,member_identity_id,access_level,visibility,
+             grant_origin,root_grant_id,access_scope,granted_by_identity_id
+         ) SELECT $1,$2,topic.id,$3,'manage','restricted','explicit',$1,'full',$4
+           FROM topics topic WHERE topic.project_id=$2 AND topic.resource_node_id=$5",
+    )
+    .bind(Uuid::new_v4())
+    .bind(fixture.project_id)
+    .bind(created.principal_identity_id)
+    .bind(fixture.owner_id)
+    .bind(fixture.profile_resource_id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let authority_before = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT
+           (SELECT count(*) FROM topic_permissions WHERE project_id=$1),
+           (SELECT count(*) FROM resource_key_envelopes WHERE project_id=$1)",
+    )
+    .bind(fixture.project_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    let activation = app.clone().oneshot(activate()).await.unwrap();
+    assert_eq!(
+        activation.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(activation).await
+    );
+    let authority_after = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT
+           (SELECT count(*) FROM topic_permissions WHERE project_id=$1),
+           (SELECT count(*) FROM resource_key_envelopes WHERE project_id=$1)",
+    )
+    .bind(fixture.project_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(authority_after, authority_before);
+    let active_origin = sqlx::query_scalar::<_, String>(
+        "SELECT contract->'origin'->>'kind' FROM agent_local_goal_contracts
+         WHERE project_id=$1 AND agent_id=$2 AND revision=2 AND state='active'",
+    )
+    .bind(fixture.project_id)
+    .bind(created.agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(active_origin, "global_mandate");
+
+    let compiler_source = sqlx::query(
+        "SELECT certificate.canonical_output::text AS output,
+                certificate.compilation_envelope::text AS envelope
+         FROM agent_local_goal_contracts local
+         JOIN agent_compilation_certificates certificate
+           ON certificate.project_id=local.project_id
+          AND certificate.id=local.compilation_certificate_id
+         WHERE local.project_id=$1 AND local.agent_id=$2
+           AND local.revision=1",
+    )
+    .bind(fixture.project_id)
+    .bind(created.agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    let mut proposal_output: Value =
+        serde_json::from_str(compiler_source.try_get("output").unwrap()).unwrap();
+    let mut proposal_envelope: Value =
+        serde_json::from_str(compiler_source.try_get("envelope").unwrap()).unwrap();
+    let proposed_agent = Uuid::new_v4();
+    proposal_output["contract"]["obligations"][0]["owner"] = json!(proposed_agent);
+    proposal_output["contract"]["work_specs"][0]["owner"] = json!(proposed_agent);
+    proposal_envelope["agent"] = json!(proposed_agent);
+    proposal_envelope["controller"] = json!(controller.identity_id);
+    proposal_envelope["language_task"]["allowed_principal_ids"] =
+        json!([proposed_agent, controller.identity_id]);
+    let proposal_event_id = Uuid::new_v4();
+    let proposal_local_id = Uuid::new_v4();
+    let proposal_draft_id = Uuid::new_v4();
+    let proposal_certificate_id = Uuid::new_v4();
+    let proposal_prompt = encrypted(183);
+    let typed_proposal_prompt: sprout_domain::EncryptedPayload =
+        serde_json::from_value(proposal_prompt.clone()).unwrap();
+    let proposal_prompt_commitment = "33".repeat(32);
+    let proposal_ciphertext_commitment =
+        sha256_hex(&serde_json::to_vec(&typed_proposal_prompt).expect("serialize proposal prompt"));
+    let proposal_statement = json!({
+        "certificate_id":proposal_certificate_id,
+        "compiler":{
+            "compiler_id":"sprout.local-goal.compiler","compiler_version":1,
+            "compiler_build_digest_hex":"0c675e853701375c7ba5d396f4e1f9b55592339a3a4e45859b9f2c2e8fdbbfc2"
+        },
+        "project_id":fixture.project_id,
+        "local_goal_id":proposal_local_id,
+        "local_revision":1,
+        "draft_id":proposal_draft_id,
+        "agent_principal_identity_id":proposed_agent,
+        "controller_identity_id":controller.identity_id,
+        "prompt_commitment_hex":proposal_prompt_commitment,
+        "ciphertext_commitment_hex":proposal_ciphertext_commitment,
+        "output":proposal_output,
+        "output_hash_hex":canonical_hash_hex(&proposal_output),
+        "envelope":proposal_envelope,
+        "envelope_hash_hex":canonical_hash_hex(&proposal_envelope),
+        "authorization":{"kind":"global_mandate","id":proposal_event_id,"revision":1},
+        "idempotency_key":Uuid::new_v4()
+    });
+    let proposal_compilation = json!({
+        "statement":proposal_statement,
+        "signatures":signed_statement_by(
+            controller.identity_id,controller.device_id,
+            &controller.ed25519_private_key,&controller.ml_dsa_65_private_key,
+            &proposal_statement,b"sprout-governance-compilation-v1"
+        )
+    });
+    let proposal_need = sqlx::query_scalar::<_, Value>(
+        "SELECT payload->'need' FROM agent_governance_authorization_events
+         WHERE project_id=$1 AND event_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(need_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    let proposal_local = json!({
+        "id":proposal_local_id,"revision":1,"agent":proposed_agent,
+        "controller":controller.identity_id,"encrypted_prompt":proposal_prompt,
+        "contract":proposal_output["contract"].clone(),
+        "clauses":[{"id":1,"domain":1,"scope":fixture.profile_resource_id,"work_spec_ids":[1]}],
+        "origin":{"kind":"global_mandate","global_revision":1},
+        "supersedes_revision":null
+    });
+    let proposal_body = json!({
+        "event_id":proposal_event_id,"idempotency_key":Uuid::new_v4(),
+        "need_id":need_id,"global_contract_id":global_contract_id,
+        "proposal":{
+            "proposed_agent":proposed_agent,"controller":controller.identity_id,
+            "need":proposal_need,"local":proposal_local,
+            "requested":proposal_need["required"].clone()
+        },
+        "encrypted_prompt":typed_proposal_prompt,
+        "compilation":proposal_compilation
+    });
+    let proposal = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-global-new-agent-proposals",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(proposal_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        proposal.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(proposal).await
+    );
+    let proposal_materialization = sqlx::query_scalar::<_, i64>(
+        "SELECT
+           (SELECT count(*) FROM identities WHERE id=$1)
+         + (SELECT count(*) FROM governed_agents WHERE principal_identity_id=$1)
+         + (SELECT count(*) FROM agent_runners runner JOIN governed_agents agent
+              ON agent.project_id=runner.project_id AND agent.id=runner.agent_id
+              WHERE agent.principal_identity_id=$1)",
+    )
+    .bind(proposed_agent)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(proposal_materialization, 0);
+    let mut oversized_proposal = proposal_body.clone();
+    oversized_proposal["event_id"] = json!(Uuid::new_v4());
+    oversized_proposal["idempotency_key"] = json!(Uuid::new_v4());
+    oversized_proposal["proposal"]["requested"]["resource_effects"] = json!([]);
+    let oversized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-global-new-agent-proposals",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(oversized_proposal.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+
+    let active_local_json = sqlx::query_scalar::<_, String>(
+        "SELECT contract::text FROM agent_local_goal_contracts
+         WHERE project_id=$1 AND agent_id=$2 AND revision=2 AND state='active'",
+    )
+    .bind(fixture.project_id)
+    .bind(created.agent_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    let active_local: Value = serde_json::from_str(&active_local_json).unwrap();
+    let bottom_up = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-global-contracts",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id":Uuid::new_v4(),
+                        "synthesis_invocation_id":null,
+                        "envelope":{
+                            "language_task":{
+                                "id":Uuid::new_v4(),
+                                "kind":"synthesize_global_contract",
+                                "input_item_count":1,"max_input_items":1,
+                                "max_output_items":4,"max_nesting_depth":4,"max_attempts":1,
+                                "closed_output_schema":true,"grounded_identifiers_only":true,
+                                "requires_formal_proof":false,"requires_permission_decision":false,
+                                "requires_exact_semantic_equivalence":false,
+                                "requires_exhaustive_world_knowledge":false,
+                                "allowed_resource_ids":[fixture.profile_resource_id],
+                                "allowed_principal_ids":[created.principal_identity_id],
+                                "allowed_tools":[]
+                            },
+                            "source_agents":[created.principal_identity_id],
+                            "max_global_obligations":1,"max_global_work_specs":1,
+                            "max_dependencies":0,"max_conflicts":0
+                        },
+                        "candidate":{
+                            "revision":1,"contract":active_local["contract"].clone(),
+                            "contributions":[{
+                                "agent":created.principal_identity_id,
+                                "local_revision":2,"local_clause_id":1,
+                                "global_work_spec_ids":[1]
+                            }],
+                            "governance_conflicts":[]
+                        },
+                        "groundings":[{
+                            "global_work_spec_id":1,"source_agent":created.principal_identity_id,
+                            "source_local_revision":2,"source_work_spec_id":1
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bottom_up.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
