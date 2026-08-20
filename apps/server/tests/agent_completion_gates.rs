@@ -452,6 +452,10 @@ fn goal_contract(scope: Uuid, work: &[WorkFixture<'_>]) -> Value {
 
 async fn insert_local_goal(fixture: &Fixture, agent: &AgentFixture, contract: Value) -> Uuid {
     let local_goal_id = Uuid::new_v4();
+    let compilation_certificate_id = Uuid::new_v4();
+    let draft_id = Uuid::new_v4();
+    let authorization_id = Uuid::new_v4();
+    let idempotency_key = Uuid::new_v4();
     let work_spec_ids = contract["work_specs"]
         .as_array()
         .expect("work specs")
@@ -474,6 +478,20 @@ async fn insert_local_goal(fixture: &Fixture, agent: &AgentFixture, contract: Va
         "origin": { "kind": "controller_prompt" },
         "supersedes_revision": null
     });
+    let contract_hash = Sha256::digest(local.to_string().as_bytes()).to_vec();
+    let classifier_output_hash = Sha256::digest(
+        serde_json::to_vec(&local["clauses"]).expect("serialize fixture classifier output"),
+    )
+    .to_vec();
+    let mut transaction = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin certified local goal fixture");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *transaction)
+        .await
+        .expect("set migration-owner LocalGoal fixture boundary");
     sqlx::query(
         "UPDATE agent_local_goal_contracts
          SET state = 'superseded', terminal_at = clock_timestamp()
@@ -481,15 +499,62 @@ async fn insert_local_goal(fixture: &Fixture, agent: &AgentFixture, contract: Va
     )
     .bind(fixture.project_id)
     .bind(agent.agent_id)
-    .execute(&fixture.pool)
+    .execute(&mut *transaction)
     .await
     .expect("supersede prior fixture local goal");
+    // The completion gates exercise the persistent R5.30 kernel, not endpoint
+    // signature acceptance. The migration-owner fixture supplies the minimal
+    // exact structural witness required by 0029; application roles cannot
+    // insert a verified certificate directly, and dedicated API tests cover
+    // compilation signature and initial-creation authorization end to end.
+    sqlx::query(
+        r#"
+        INSERT INTO agent_compilation_certificates (
+            id, project_id, task_kind, compiler_name, compiler_version,
+            compiler_build_digest, signer_identity_id, signer_device_id,
+            signer_device_key_version, subject_id, subject_revision, draft_id,
+            agent_principal_identity_id, controller_identity_id,
+            input_commitment, ciphertext_commitment, canonical_output, output_hash,
+            compilation_envelope, envelope_hash, certificate_hash, idempotency_key,
+            classical_signature, post_quantum_signature, classifier_version,
+            classifier_output_hash, authorization_kind, authorization_id,
+            verification_state, verified_at
+        ) VALUES (
+            $1, $2, 'local_goal', 'sprout.local-goal.compiler', 1,
+            decode('0c675e853701375c7ba5d396f4e1f9b55592339a3a4e45859b9f2c2e8fdbbfc2', 'hex'),
+            $3, $4, 1, $5, 1, $6, $7, $3,
+            decode(repeat('71', 32), 'hex'), $8, $9, $10,
+            '{}'::jsonb, decode(repeat('72', 32), 'hex'),
+            decode(repeat('73', 32), 'hex'), $11,
+            decode(repeat('74', 64), 'hex'), decode('75', 'hex'), 1,
+            $12, 'administrator_creation', $13, 'verified', clock_timestamp()
+        )
+        "#,
+    )
+    .bind(compilation_certificate_id)
+    .bind(fixture.project_id)
+    .bind(fixture.owner_id)
+    .bind(fixture.owner_device_id)
+    .bind(local_goal_id)
+    .bind(draft_id)
+    .bind(agent.identity_id)
+    .bind(&contract_hash)
+    .bind(&local)
+    .bind(&contract_hash)
+    .bind(idempotency_key)
+    .bind(&classifier_output_hash)
+    .bind(authorization_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("insert preexisting exact LocalGoal compiler witness");
     sqlx::query(
         r#"
         INSERT INTO agent_local_goal_contracts (
             id, project_id, agent_id, agent_identity_id,
-            controller_identity_id, revision, contract, contract_hash
-        ) VALUES ($1, $2, $3, $4, $5, 1, $6, $7)
+            controller_identity_id, revision, contract, contract_hash,
+            compilation_certificate_id, classifier_version,
+            classifier_output_hash
+        ) VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, 1, $9)
         "#,
     )
     .bind(local_goal_id)
@@ -498,10 +563,16 @@ async fn insert_local_goal(fixture: &Fixture, agent: &AgentFixture, contract: Va
     .bind(agent.identity_id)
     .bind(fixture.owner_id)
     .bind(&local)
-    .bind(Sha256::digest(local.to_string().as_bytes()).to_vec())
-    .execute(&fixture.pool)
+    .bind(&contract_hash)
+    .bind(compilation_certificate_id)
+    .bind(&classifier_output_hash)
+    .execute(&mut *transaction)
     .await
     .expect("insert active local goal fixture");
+    transaction
+        .commit()
+        .await
+        .expect("commit certified local goal fixture");
     local_goal_id
 }
 

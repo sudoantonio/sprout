@@ -1997,16 +1997,55 @@ INSERT INTO governed_agents (
     '40000000-0000-0000-0000-000000000003',
     decode('92', 'hex'), 1, 'controller_private'
 );
+-- This fixture exercises the completion bridge, not the endpoint signature
+-- verifier. The migration-owner test harness supplies the minimal structural
+-- witness that 0029 now requires for an active LocalGoal; application roles
+-- cannot perform this direct verified insert.
+INSERT INTO agent_compilation_certificates (
+    id, project_id, task_kind, compiler_name, compiler_version,
+    compiler_build_digest, signer_identity_id, signer_device_id,
+    signer_device_key_version, subject_id, subject_revision, draft_id,
+    agent_principal_identity_id, controller_identity_id,
+    input_commitment, ciphertext_commitment, canonical_output, output_hash,
+    compilation_envelope, envelope_hash, certificate_hash, idempotency_key,
+    classical_signature, post_quantum_signature, classifier_version,
+    classifier_output_hash, authorization_kind, authorization_id,
+    verification_state, verified_at
+) VALUES (
+    '92900000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    'local_goal', 'sprout.local-goal.compiler', 1,
+    decode('0c675e853701375c7ba5d396f4e1f9b55592339a3a4e45859b9f2c2e8fdbbfc2', 'hex'),
+    '10000000-0000-0000-0000-000000000001',
+    '20000000-0000-0000-0000-000000000001', 1,
+    '93000000-0000-0000-0000-000000000001', 1,
+    '92900000-0000-0000-0000-000000000002',
+    '91000000-0000-0000-0000-000000000001',
+    '10000000-0000-0000-0000-000000000001',
+    decode(repeat('90', 32), 'hex'), decode(repeat('91', 32), 'hex'),
+    '{}'::jsonb, decode(repeat('92', 32), 'hex'),
+    '{}'::jsonb, decode(repeat('93', 32), 'hex'),
+    decode(repeat('94', 32), 'hex'),
+    '92900000-0000-0000-0000-000000000003',
+    decode(repeat('95', 64), 'hex'), decode('96', 'hex'),
+    1, decode(repeat('97', 32), 'hex'),
+    'administrator_creation',
+    '92900000-0000-0000-0000-000000000004',
+    'verified', clock_timestamp()
+);
 INSERT INTO agent_local_goal_contracts (
     id, project_id, agent_id, agent_identity_id,
-    controller_identity_id, revision, contract, contract_hash
+    controller_identity_id, revision, contract, contract_hash, state,
+    compilation_certificate_id, classifier_version, classifier_output_hash
 ) VALUES (
     '93000000-0000-0000-0000-000000000001',
     '30000000-0000-0000-0000-000000000001',
     '92000000-0000-0000-0000-000000000001',
     '91000000-0000-0000-0000-000000000001',
     '10000000-0000-0000-0000-000000000001',
-    1, '{}'::jsonb, decode(repeat('93', 32), 'hex')
+    1, '{}'::jsonb, decode(repeat('93', 32), 'hex'), 'active',
+    '92900000-0000-0000-0000-000000000001', 1,
+    decode(repeat('97', 32), 'hex')
 );
 INSERT INTO agent_collaborative_runs (
     id, project_id, goal_id, scope_resource_node_id,

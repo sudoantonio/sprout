@@ -103,6 +103,29 @@ pub enum AgentActionClass {
     RetryTool,
 }
 
+impl AgentActionClass {
+    #[must_use]
+    pub const fn required_resource_operation(self) -> Option<ResourceOperation> {
+        match self {
+            Self::CreateTask => Some(ResourceOperation::Write),
+            Self::ReplaceOwnTask => Some(ResourceOperation::Write),
+            Self::DeleteOwnTask => Some(ResourceOperation::Write),
+            Self::AssignOwnTask => Some(ResourceOperation::DelegateAssignedWork),
+            Self::UnassignOwnTask => Some(ResourceOperation::DelegateAssignedWork),
+            Self::MarkAssignedDone => Some(ResourceOperation::CompleteAssignedTask),
+            Self::AppendAssignedNote => Some(ResourceOperation::Write),
+            Self::AddAssignedAttachment => Some(ResourceOperation::Write),
+            Self::PostComment => Some(ResourceOperation::PostComment),
+            Self::InvokeTool | Self::RetryTool => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn requires_tool_policy(self) -> bool {
+        matches!(self, Self::InvokeTool | Self::RetryTool)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ResourceAuthority {
     pub resource_id: ResourceId,
@@ -280,6 +303,73 @@ pub struct ResponsibilityContract {
     pub encrypted_source_text: EncryptedPayload,
     pub rules: Vec<ResponsibilityRule>,
     pub supersedes_revision: Option<u64>,
+}
+
+/// Closed output of the endpoint-TCB responsibility compiler. The encrypted
+/// source text remains outside this server-visible structure.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsibilityCompilerOutput {
+    pub rules: Vec<ResponsibilityRule>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsibilityCompilationEnvelope {
+    pub language_task: StructuredLanguageTaskEnvelope,
+    pub administrator: UserId,
+    pub user: UserId,
+    pub project_scopes: Vec<ResourceId>,
+    pub allowed_actions: Vec<AgentActionClass>,
+    pub max_rules: u32,
+}
+
+pub const MAX_RESPONSIBILITY_COMPILER_RULES: usize = 128;
+pub const MAX_LOCAL_COMPILER_REQUIREMENTS: usize = 128;
+pub const MAX_LOCAL_COMPILER_OBLIGATIONS: usize = 128;
+pub const MAX_LOCAL_COMPILER_WORK_SPECS: usize = 256;
+pub const MAX_LOCAL_COMPILER_DEPENDENCIES: usize = 512;
+pub const MAX_LOCAL_COMPILER_BINDINGS: usize = 1_024;
+
+impl ResponsibilityCompilerOutput {
+    pub fn validate_within_envelope(
+        &self,
+        envelope: &ResponsibilityCompilationEnvelope,
+    ) -> Result<(), AgentValidationError> {
+        envelope.language_task.validate()?;
+        if envelope.language_task.kind != StructuredLanguageTaskKind::CompileResponsibilityRules
+            || envelope.max_rules == 0
+            || self.rules.is_empty()
+            || self.rules.len() > MAX_RESPONSIBILITY_COMPILER_RULES
+            || self.rules.len() > envelope.max_rules as usize
+            || self.rules.len() > envelope.language_task.max_output_items as usize
+            || !envelope
+                .language_task
+                .allowed_principal_ids
+                .contains(&envelope.administrator)
+            || !envelope
+                .language_task
+                .allowed_principal_ids
+                .contains(&envelope.user)
+        {
+            return Err(AgentValidationError::CompilationEnvelopeMismatch);
+        }
+        ensure_unique(&envelope.project_scopes, "responsibility project scope")?;
+        ensure_unique(&envelope.allowed_actions, "responsibility action catalog")?;
+        for rule in &self.rules {
+            if !envelope.project_scopes.contains(&rule.scope)
+                || rule.allowed_actions.is_empty()
+                || rule
+                    .allowed_actions
+                    .iter()
+                    .any(|action| !envelope.allowed_actions.contains(action))
+            {
+                return Err(AgentValidationError::CompilationEnvelopeMismatch);
+            }
+            ensure_unique(&rule.allowed_actions, "responsibility action")?;
+        }
+        Ok(())
+    }
 }
 
 impl ResponsibilityContract {
@@ -2659,11 +2749,320 @@ pub struct LocalGoalClause {
     pub work_spec_ids: Vec<u64>,
 }
 
+/// Version of the deterministic server-side GoalContract classifier.
+pub const LOCAL_GOAL_CLASSIFIER_VERSION: u32 = 1;
+
+/// Stable organizational domain assigned to one WorkKind. Organizational
+/// domains never widen resource permission or action authority.
+#[must_use]
+pub const fn local_goal_work_kind_domain(kind: WorkKind) -> u64 {
+    match kind {
+        WorkKind::AgentAction => 1,
+        WorkKind::ToolInvocation => 2,
+        WorkKind::ToolRetry => 3,
+        WorkKind::TaskAction => 4,
+        WorkKind::Coordination => 5,
+        WorkKind::ExternalWait => 6,
+    }
+}
+
+/// Authoritative deterministic classifier used by both persistence and the
+/// responsibility gate. Client/model supplied clauses are never inputs.
+#[must_use]
+pub fn classify_local_goal_contract(contract: &GoalContract) -> Vec<LocalGoalClause> {
+    let mut by_domain: std::collections::BTreeMap<u64, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for work in &contract.work_specs {
+        by_domain
+            .entry(local_goal_work_kind_domain(work.kind))
+            .or_default()
+            .push(work.id);
+    }
+    by_domain
+        .into_iter()
+        .enumerate()
+        .map(|(index, (domain, mut work_spec_ids))| {
+            work_spec_ids.sort_unstable();
+            LocalGoalClause {
+                id: u64::try_from(index + 1).expect("bounded WorkSpec count fits u64"),
+                domain,
+                scope: contract.scope,
+                work_spec_ids,
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptRequirement {
+    pub id: u64,
+    pub scope: ResourceId,
+    pub required_actions: Vec<AgentActionClass>,
+    pub required_tools: Vec<String>,
+    pub required_for_completion: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptRequirementWorkBinding {
+    pub requirement_id: u64,
+    pub obligation: Uuid,
+    pub work_spec_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractWorkSecurityPolicy {
+    pub work_spec_id: u64,
+    pub allowed_operations: Vec<ResourceOperation>,
+    pub allowed_tools: Vec<String>,
+}
+
+/// Closed output produced by the pinned local compiler on a plaintext-capable
+/// controller endpoint. It deliberately excludes classifier clauses.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalGoalCompilerOutput {
+    pub contract: GoalContract,
+    pub requirements: Vec<PromptRequirement>,
+    pub bindings: Vec<PromptRequirementWorkBinding>,
+    pub security_policies: Vec<ContractWorkSecurityPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalGoalCompilationEnvelope {
+    pub language_task: StructuredLanguageTaskEnvelope,
+    pub agent: UserId,
+    pub controller: UserId,
+    pub project_scope: ResourceId,
+    pub allowed_actions: Vec<AgentActionClass>,
+    pub max_requirements: u32,
+    pub max_obligations: u32,
+    pub max_work_specs: u32,
+    pub max_dependencies: u32,
+}
+
+impl LocalGoalCompilerOutput {
+    pub fn validate_within_envelope(
+        &self,
+        envelope: &LocalGoalCompilationEnvelope,
+    ) -> Result<(), AgentValidationError> {
+        envelope.language_task.validate()?;
+        self.contract.validate()?;
+        if envelope.language_task.kind != StructuredLanguageTaskKind::CompileGoalContract
+            || envelope.max_requirements == 0
+            || envelope.max_obligations == 0
+            || envelope.max_work_specs == 0
+            || self.requirements.is_empty()
+            || self.requirements.len() > MAX_LOCAL_COMPILER_REQUIREMENTS
+            || self.contract.obligations.len() > MAX_LOCAL_COMPILER_OBLIGATIONS
+            || self.contract.work_specs.len() > MAX_LOCAL_COMPILER_WORK_SPECS
+            || self.contract.dependencies.len() > MAX_LOCAL_COMPILER_DEPENDENCIES
+            || self.bindings.len() > MAX_LOCAL_COMPILER_BINDINGS
+            || self.requirements.len() > envelope.max_requirements as usize
+            || self.requirements.len() > envelope.language_task.max_output_items as usize
+            || self.contract.obligations.len() > envelope.max_obligations as usize
+            || self.contract.work_specs.len() > envelope.max_work_specs as usize
+            || self.contract.dependencies.len() > envelope.max_dependencies as usize
+            || !envelope
+                .language_task
+                .allowed_resource_ids
+                .contains(&self.contract.scope)
+            || !envelope
+                .language_task
+                .allowed_resource_ids
+                .contains(&envelope.project_scope)
+            || !envelope
+                .language_task
+                .allowed_principal_ids
+                .contains(&envelope.agent)
+            || !envelope
+                .language_task
+                .allowed_principal_ids
+                .contains(&envelope.controller)
+        {
+            return Err(AgentValidationError::CompilationEnvelopeMismatch);
+        }
+        ensure_unique(&envelope.allowed_actions, "local compiler action catalog")?;
+        ensure_unique_by(
+            &self.requirements,
+            |requirement| requirement.id,
+            "requirement",
+        )?;
+        ensure_unique_by(
+            &self.bindings,
+            |binding| {
+                (
+                    binding.requirement_id,
+                    binding.obligation,
+                    binding.work_spec_id,
+                )
+            },
+            "requirement binding",
+        )?;
+        let requirements: HashMap<_, _> = self
+            .requirements
+            .iter()
+            .map(|requirement| (requirement.id, requirement))
+            .collect();
+        let obligations: HashMap<_, _> = self
+            .contract
+            .obligations
+            .iter()
+            .map(|obligation| (obligation.id, obligation))
+            .collect();
+        let work_specs: HashMap<_, _> = self
+            .contract
+            .work_specs
+            .iter()
+            .map(|work| (work.id, work))
+            .collect();
+        ensure_unique_by(
+            &self.security_policies,
+            |policy| policy.work_spec_id,
+            "work security policy",
+        )?;
+        for requirement in &self.requirements {
+            ensure_unique(&requirement.required_actions, "requirement action")?;
+            ensure_unique(&requirement.required_tools, "requirement tool")?;
+            if requirement.scope != self.contract.scope
+                || requirement
+                    .required_actions
+                    .iter()
+                    .any(|action| !envelope.allowed_actions.contains(action))
+                || requirement
+                    .required_tools
+                    .iter()
+                    .any(|tool| !envelope.language_task.allowed_tools.contains(tool))
+                || requirement
+                    .required_actions
+                    .contains(&AgentActionClass::InvokeTool)
+                    == requirement.required_tools.is_empty()
+            {
+                return Err(AgentValidationError::CompilationEnvelopeMismatch);
+            }
+            if !self.bindings.iter().any(|binding| {
+                binding.requirement_id == requirement.id
+                    && obligations
+                        .get(&binding.obligation)
+                        .is_some_and(|obligation| {
+                            !requirement.required_for_completion
+                                || obligation.required_for_completion != ContractCondition::Never {}
+                        })
+                    && work_specs.get(&binding.work_spec_id).is_some_and(|work| {
+                        work.obligation == binding.obligation
+                            && requirement
+                                .required_actions
+                                .iter()
+                                .all(|action| work.allowed_actions.contains(action))
+                    })
+            }) {
+                return Err(AgentValidationError::PromptWorkBindingNotExact);
+            }
+        }
+        for binding in &self.bindings {
+            if !requirements.contains_key(&binding.requirement_id)
+                || !obligations.contains_key(&binding.obligation)
+                || work_specs
+                    .get(&binding.work_spec_id)
+                    .is_none_or(|work| work.obligation != binding.obligation)
+            {
+                return Err(AgentValidationError::PromptWorkBindingNotExact);
+            }
+        }
+        for work in &self.contract.work_specs {
+            for action in &work.allowed_actions {
+                if !self.bindings.iter().any(|binding| {
+                    binding.work_spec_id == work.id
+                        && self.requirements.iter().any(|requirement| {
+                            requirement.id == binding.requirement_id
+                                && requirement.required_actions.contains(action)
+                        })
+                }) {
+                    return Err(AgentValidationError::PromptWorkBindingNotExact);
+                }
+            }
+            let policy = self
+                .security_policies
+                .iter()
+                .find(|policy| policy.work_spec_id == work.id)
+                .ok_or(AgentValidationError::CompilationEnvelopeMismatch)?;
+            ensure_unique(&policy.allowed_operations, "work security operation")?;
+            ensure_unique(&policy.allowed_tools, "work security tool")?;
+            let mut required_tools: Vec<_> = self
+                .bindings
+                .iter()
+                .filter(|binding| binding.work_spec_id == work.id)
+                .filter_map(|binding| requirements.get(&binding.requirement_id))
+                .flat_map(|requirement| requirement.required_tools.iter().cloned())
+                .collect();
+            required_tools.sort();
+            required_tools.dedup();
+            let mut policy_tools = policy.allowed_tools.clone();
+            policy_tools.sort();
+            if policy
+                .allowed_tools
+                .iter()
+                .any(|tool| !envelope.language_task.allowed_tools.contains(tool))
+                || policy_tools != required_tools
+                || work.allowed_actions.iter().any(|action| {
+                    action
+                        .required_resource_operation()
+                        .is_some_and(|operation| !policy.allowed_operations.contains(&operation))
+                        || (*action == AgentActionClass::InvokeTool
+                            && required_tools.is_empty())
+                        // A retry's exact tool is derived from the original
+                        // ToolCall at runtime. The static compiler artifact has
+                        // no such provenance and therefore fails closed.
+                        || *action == AgentActionClass::RetryTool
+                })
+            {
+                return Err(AgentValidationError::CompilationEnvelopeMismatch);
+            }
+        }
+        if self
+            .security_policies
+            .iter()
+            .any(|policy| !work_specs.contains_key(&policy.work_spec_id))
+        {
+            return Err(AgentValidationError::CompilationEnvelopeMismatch);
+        }
+        if self.contract.obligations.iter().any(|obligation| {
+            !self
+                .bindings
+                .iter()
+                .any(|binding| binding.obligation == obligation.id)
+        }) || self.contract.work_specs.iter().any(|work| {
+            !self
+                .bindings
+                .iter()
+                .any(|binding| binding.work_spec_id == work.id)
+        }) || self.contract.work_specs.iter().any(|work| {
+            work.owner != envelope.agent
+                || work
+                    .allowed_actions
+                    .iter()
+                    .any(|action| !envelope.allowed_actions.contains(action))
+        }) || self
+            .contract
+            .obligations
+            .iter()
+            .any(|obligation| obligation.owner != envelope.agent)
+        {
+            return Err(AgentValidationError::PromptWorkBindingNotExact);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LocalGoalOrigin {
     ControllerPrompt {},
     AdministratorException { review_id: Uuid },
+    AdministratorCreation { approval_id: Uuid },
     GlobalMandate { global_revision: u64 },
 }
 
@@ -2728,7 +3127,10 @@ impl LocalGoalContract {
 
     #[must_use]
     pub fn can_contribute_bottom_up(&self) -> bool {
-        !matches!(self.origin, LocalGoalOrigin::GlobalMandate { .. })
+        !matches!(
+            self.origin,
+            LocalGoalOrigin::AdministratorCreation { .. } | LocalGoalOrigin::GlobalMandate { .. }
+        )
     }
 
     pub fn validate_revision_of(&self, previous: &Self) -> Result<(), AgentValidationError> {
@@ -3467,6 +3869,10 @@ pub enum AgentValidationError {
     AdministratorDoesNotControlScope,
     #[error("responsibility revision does not exactly supersede its predecessor")]
     InvalidResponsibilityRevision,
+    #[error("compiler output does not fit its closed compilation envelope")]
+    CompilationEnvelopeMismatch,
+    #[error("prompt requirements and obligation/work bindings are not exact")]
+    PromptWorkBindingNotExact,
     #[error("language-task input bound exceeded")]
     InputBoundExceeded,
     #[error("language-task bounds must be positive")]
@@ -3732,6 +4138,136 @@ mod tests {
             origin: LocalGoalOrigin::ControllerPrompt {},
             supersedes_revision: None,
         }
+    }
+
+    fn local_compiler_fixture(
+        action: AgentActionClass,
+        required_tools: Vec<&str>,
+        policy_tools: Vec<&str>,
+        envelope_tools: Vec<&str>,
+    ) -> (LocalGoalCompilerOutput, LocalGoalCompilationEnvelope) {
+        let agent = UserId::new();
+        let controller = UserId::new();
+        let mut local = local_goal(agent, controller);
+        local.contract.work_specs[0].allowed_actions = vec![action];
+        let scope = local.contract.scope;
+        let obligation = local.contract.obligations[0].id;
+        let output = LocalGoalCompilerOutput {
+            contract: local.contract,
+            requirements: vec![PromptRequirement {
+                id: 1,
+                scope,
+                required_actions: vec![action],
+                required_tools: required_tools.into_iter().map(str::to_owned).collect(),
+                required_for_completion: true,
+            }],
+            bindings: vec![PromptRequirementWorkBinding {
+                requirement_id: 1,
+                obligation,
+                work_spec_id: 1,
+            }],
+            security_policies: vec![ContractWorkSecurityPolicy {
+                work_spec_id: 1,
+                allowed_operations: action.required_resource_operation().into_iter().collect(),
+                allowed_tools: policy_tools.into_iter().map(str::to_owned).collect(),
+            }],
+        };
+        let mut language_task = feasible_task(StructuredLanguageTaskKind::CompileGoalContract);
+        language_task.allowed_resource_ids = vec![scope];
+        language_task.allowed_principal_ids = vec![agent, controller];
+        language_task.allowed_tools = envelope_tools.into_iter().map(str::to_owned).collect();
+        let envelope = LocalGoalCompilationEnvelope {
+            language_task,
+            agent,
+            controller,
+            project_scope: scope,
+            allowed_actions: vec![action],
+            max_requirements: 4,
+            max_obligations: 4,
+            max_work_specs: 4,
+            max_dependencies: 4,
+        };
+        (output, envelope)
+    }
+
+    #[test]
+    fn local_compiler_requires_the_exact_invoked_tool_policy() {
+        let (output, envelope) = local_compiler_fixture(
+            AgentActionClass::InvokeTool,
+            vec!["tool-a"],
+            vec!["tool-b"],
+            vec!["tool-a", "tool-b"],
+        );
+        assert_eq!(
+            output.validate_within_envelope(&envelope),
+            Err(AgentValidationError::CompilationEnvelopeMismatch)
+        );
+    }
+
+    #[test]
+    fn local_compiler_rejects_exact_tool_outside_server_envelope() {
+        let (output, envelope) = local_compiler_fixture(
+            AgentActionClass::InvokeTool,
+            vec!["tool-a"],
+            vec!["tool-a"],
+            vec!["tool-b"],
+        );
+        assert_eq!(
+            output.validate_within_envelope(&envelope),
+            Err(AgentValidationError::CompilationEnvelopeMismatch)
+        );
+    }
+
+    #[test]
+    fn local_compiler_rejects_policy_for_another_work_spec() {
+        let (mut output, envelope) = local_compiler_fixture(
+            AgentActionClass::InvokeTool,
+            vec!["tool-a"],
+            vec!["tool-a"],
+            vec!["tool-a"],
+        );
+        output.security_policies[0].work_spec_id = 2;
+        assert_eq!(
+            output.validate_within_envelope(&envelope),
+            Err(AgentValidationError::CompilationEnvelopeMismatch)
+        );
+    }
+
+    #[test]
+    fn local_compiler_rejects_duplicate_policy_tools() {
+        let (output, envelope) = local_compiler_fixture(
+            AgentActionClass::InvokeTool,
+            vec!["tool-a"],
+            vec!["tool-a", "tool-a"],
+            vec!["tool-a"],
+        );
+        assert_eq!(
+            output.validate_within_envelope(&envelope),
+            Err(AgentValidationError::DuplicateValue("work security tool"))
+        );
+    }
+
+    #[test]
+    fn local_compiler_retry_without_original_tool_provenance_fails_closed() {
+        let (output, envelope) = local_compiler_fixture(
+            AgentActionClass::RetryTool,
+            Vec::new(),
+            Vec::new(),
+            vec!["tool-a"],
+        );
+        assert_eq!(
+            output.validate_within_envelope(&envelope),
+            Err(AgentValidationError::CompilationEnvelopeMismatch)
+        );
+    }
+
+    #[test]
+    fn administrator_creation_origin_never_contributes_bottom_up() {
+        let mut local = local_goal(UserId::new(), UserId::new());
+        local.origin = LocalGoalOrigin::AdministratorCreation {
+            approval_id: Uuid::from_u128(9),
+        };
+        assert!(!local.can_contribute_bottom_up());
     }
 
     fn local_goal_with_conditional_continuation(

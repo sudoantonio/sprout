@@ -12,19 +12,22 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sprout_crypto_protocol::{canonical_governance_json, verify_ed25519_ml_dsa65_signatures};
 use sprout_domain::{
     AgentActionClass, AgentAvailabilityMode, AgentId, AgentInterrogationCausalDelta,
     AgentInterrogationSession, AuthorityEnvelope, CollaborativeRunState, ContractCondition,
     ContractConditionFacts, CrossOwnerAssignmentRoute, CurrentLocalObligationContext,
     EncryptedPayload, GlobalContractCandidate, GovernedAgent, InformationSource, InterrogationId,
-    InvocationId, LocalGoalContract, LocalGoalOrigin, ModelExposureProjection,
+    InvocationId, LOCAL_GOAL_CLASSIFIER_VERSION, LocalGoalCompilationEnvelope,
+    LocalGoalCompilerOutput, LocalGoalContract, LocalGoalOrigin, ModelExposureProjection,
     ModelInvocationContext, PersistedTaskIntent, PrincipalKind, ProjectId, ProxyExecution,
     ProxyRequestId, ProxyThreadId, ResourceEffect, ResourceId, ResourceOperation,
-    ResponsibilityContract, StructuredGlobalSynthesisEnvelope, StructuredGlobalWorkGrounding,
-    StructuredLanguageOutput, StructuredLanguageTaskEnvelope, StructuredLanguageTaskKind,
-    TaskObligationProvenance, UserId, UserProxy, UserProxyActionPlan,
-    UserProxyOutOfResponsibilityConfirmation, UserProxyPlanningEnvelope, UserProxyRequest,
-    UserProxyThread, responsibility_operationally_covers_local_goal, route_cross_owner_assignment,
+    ResponsibilityCompilationEnvelope, ResponsibilityCompilerOutput, ResponsibilityContract,
+    StructuredGlobalSynthesisEnvelope, StructuredGlobalWorkGrounding, StructuredLanguageOutput,
+    StructuredLanguageTaskEnvelope, StructuredLanguageTaskKind, TaskObligationProvenance, UserId,
+    UserProxy, UserProxyActionPlan, UserProxyOutOfResponsibilityConfirmation,
+    UserProxyPlanningEnvelope, UserProxyRequest, UserProxyThread, classify_local_goal_contract,
+    responsibility_operationally_covers_local_goal, route_cross_owner_assignment,
     validate_global_synthesis, validate_information_flow, validate_state_grounded_invocation,
 };
 use sqlx::{Postgres, Row, Transaction};
@@ -37,8 +40,162 @@ use crate::{
 };
 
 const RUNNER_LEASE: Duration = Duration::from_secs(300);
+const COMPILATION_SIGNATURE_CONTEXT: &[u8] = b"sprout-governance-compilation-v1";
+const FINAL_PROMPT_APPROVAL_SIGNATURE_CONTEXT: &[u8] = b"sprout-final-prompt-approval-v1";
+const ADMINISTRATOR_AGENT_CREATION_SIGNATURE_CONTEXT: &[u8] =
+    b"sprout-administrator-agent-creation-v1";
+const LOCAL_GOAL_COMPILER_PROTOCOL_MANIFEST: &[u8] =
+    include_bytes!("../../tcb/sprout-local-goal-compiler-v1.json");
+const RESPONSIBILITY_COMPILER_PROTOCOL_MANIFEST: &[u8] =
+    include_bytes!("../../tcb/sprout-responsibility-compiler-v1.json");
+const LOCAL_GOAL_COMPILER_PROTOCOL_MANIFEST_SHA256: [u8; 32] = [
+    12, 103, 94, 133, 55, 1, 55, 92, 123, 165, 211, 150, 244, 225, 249, 181, 85, 146, 51, 154, 58,
+    78, 69, 133, 155, 159, 44, 46, 143, 219, 191, 194,
+];
+const RESPONSIBILITY_COMPILER_PROTOCOL_MANIFEST_SHA256: [u8; 32] = [
+    120, 189, 131, 219, 121, 17, 33, 145, 248, 26, 161, 24, 81, 32, 146, 247, 234, 84, 168, 119,
+    51, 168, 46, 130, 63, 168, 60, 241, 7, 227, 235, 115,
+];
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerIdentity {
+    compiler_id: String,
+    compiler_version: u32,
+    compiler_build_digest_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilationSignatures {
+    signer_identity_id: UserId,
+    signer_device_id: Uuid,
+    signer_device_key_version: u32,
+    classical_signature: Vec<u8>,
+    post_quantum_signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LocalCompilationAuthorization {
+    Responsibility { id: Uuid, revision: u64 },
+    AdministratorException { id: Uuid, revision: u64 },
+    GlobalMandate { id: Uuid, revision: u64 },
+    AdministratorCreation { approval_id: Uuid },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsibilityCompilationStatement {
+    certificate_id: Uuid,
+    compiler: CompilerIdentity,
+    project_id: Uuid,
+    responsibility_id: Uuid,
+    revision: u64,
+    draft_id: Uuid,
+    administrator_identity_id: UserId,
+    user_identity_id: UserId,
+    source_text_commitment_hex: String,
+    ciphertext_commitment_hex: String,
+    output: ResponsibilityCompilerOutput,
+    output_hash_hex: String,
+    envelope: ResponsibilityCompilationEnvelope,
+    envelope_hash_hex: String,
+    idempotency_key: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedResponsibilityCompilation {
+    statement: ResponsibilityCompilationStatement,
+    signatures: CompilationSignatures,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalGoalCompilationStatement {
+    certificate_id: Uuid,
+    compiler: CompilerIdentity,
+    project_id: Uuid,
+    local_goal_id: Uuid,
+    local_revision: u64,
+    draft_id: Uuid,
+    agent_principal_identity_id: UserId,
+    controller_identity_id: UserId,
+    prompt_commitment_hex: String,
+    ciphertext_commitment_hex: String,
+    output: LocalGoalCompilerOutput,
+    output_hash_hex: String,
+    envelope: LocalGoalCompilationEnvelope,
+    envelope_hash_hex: String,
+    authorization: LocalCompilationAuthorization,
+    idempotency_key: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedLocalGoalCompilation {
+    statement: LocalGoalCompilationStatement,
+    signatures: CompilationSignatures,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalPromptApprovalStatement {
+    approval_id: Uuid,
+    project_id: Uuid,
+    draft_id: Uuid,
+    agent_principal_identity_id: UserId,
+    controller_identity_id: UserId,
+    local_goal_id: Uuid,
+    local_revision: u64,
+    prompt_commitment_hex: String,
+    ciphertext_commitment_hex: String,
+    compilation_certificate_id: Uuid,
+    structured_output_hash_hex: String,
+    approval_identity_hash_hex: String,
+    idempotency_key: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedFinalPromptApproval {
+    statement: FinalPromptApprovalStatement,
+    signatures: CompilationSignatures,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdministratorAgentCreationApprovalStatement {
+    approval_id: Uuid,
+    project_id: Uuid,
+    administrator_identity_id: UserId,
+    signer_device_id: Uuid,
+    signer_device_key_version: u32,
+    proposed_agent_identity_id: UserId,
+    governed_agent_id: AgentId,
+    proposal_draft_id: Uuid,
+    local_goal_id: Uuid,
+    local_goal_revision: u64,
+    contract_hash_hex: String,
+    compilation_certificate_id: Uuid,
+    prompt_plaintext_commitment_hex: String,
+    ciphertext_commitment_hex: String,
+    availability: AgentAvailabilityMode,
+    scope: ResourceId,
+    canonical_proposal_hash_hex: String,
+    idempotency_key: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedAdministratorAgentCreationApproval {
+    statement: AdministratorAgentCreationApprovalStatement,
+    signatures: CompilationSignatures,
+}
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProvisionAgentRequest {
     id: AgentId,
     principal_identity_id: UserId,
@@ -46,12 +203,32 @@ pub struct ProvisionAgentRequest {
     identity_handle: String,
     encrypted_profile: EncryptedPayload,
     profile_resource_node_id: ResourceId,
-    encrypted_system_prompt: EncryptedPayload,
     key_epoch: u32,
     availability: AgentAvailabilityMode,
     runner_id: Uuid,
     runner_device_id: Uuid,
     encrypted_runner_label: EncryptedPayload,
+    initial_local_goal: RecordLocalGoalRequest,
+    final_prompt_approval: SignedFinalPromptApproval,
+    administrator_creation_approval: Option<SignedAdministratorAgentCreationApproval>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdministratorCreationProposalBinding {
+    project_id: Uuid,
+    administrator_identity_id: UserId,
+    proposed_agent_identity_id: UserId,
+    governed_agent_id: AgentId,
+    proposal_draft_id: Uuid,
+    local_goal_id: Uuid,
+    local_goal_revision: u64,
+    contract_hash_hex: String,
+    compilation_certificate_id: Uuid,
+    prompt_plaintext_commitment_hex: String,
+    ciphertext_commitment_hex: String,
+    availability: AgentAvailabilityMode,
+    scope: ResourceId,
 }
 
 #[derive(Serialize)]
@@ -84,7 +261,10 @@ pub async fn provision(
     if actor.is_agent {
         return Err(AppError::Forbidden);
     }
-    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    if request.controller_identity_id != actor.identity_id.into() {
+        return Err(AppError::Forbidden);
+    }
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Member).await?;
     validate_identity_handle(&request.identity_handle)?;
     let governed = GovernedAgent {
         id: request.id,
@@ -116,16 +296,221 @@ pub async fn provision(
     let expires_at = Utc::now()
         + chrono::Duration::from_std(state.config.session_ttl).map_err(|_| AppError::Internal)?;
     let profile = serialize_ciphertext(&request.encrypted_profile)?;
-    let system_prompt = serialize_ciphertext(&request.encrypted_system_prompt)?;
+    let local_statement = &request.initial_local_goal.compilation.statement;
+    if local_statement.project_id != project_id
+        || local_statement.local_revision != 1
+        || local_statement.agent_principal_identity_id != request.principal_identity_id
+        || local_statement.controller_identity_id != request.controller_identity_id
+        || local_statement.envelope.agent != request.principal_identity_id
+        || local_statement.envelope.controller != request.controller_identity_id
+        || request.initial_local_goal.supersedes_revision.is_some()
+    {
+        return Err(AppError::BadRequest(
+            "initial LocalGoal does not match the proposed agent",
+        ));
+    }
+    local_statement
+        .output
+        .validate_within_envelope(&local_statement.envelope)
+        .map_err(agent_validation_error)?;
+    let system_prompt = serialize_ciphertext(&request.initial_local_goal.encrypted_prompt)?;
+    let ciphertext_commitment: [u8; 32] = Sha256::digest(&system_prompt).into();
+    if decode_commitment(&local_statement.ciphertext_commitment_hex)? != ciphertext_commitment
+        || decode_commitment(&local_statement.output_hash_hex)?
+            != canonical_hash(&local_statement.output)?
+        || decode_commitment(&local_statement.envelope_hash_hex)?
+            != canonical_hash(&local_statement.envelope)?
+    {
+        return Err(AppError::BadRequest(
+            "compiler artifact commitment mismatch",
+        ));
+    }
+    let clauses = classify_local_goal_contract(&local_statement.output.contract);
+    let classifier_output_hash = canonical_hash(&clauses)?;
+    let origin = match &local_statement.authorization {
+        LocalCompilationAuthorization::Responsibility { .. } => {
+            LocalGoalOrigin::ControllerPrompt {}
+        }
+        LocalCompilationAuthorization::AdministratorCreation { approval_id } => {
+            LocalGoalOrigin::AdministratorCreation {
+                approval_id: *approval_id,
+            }
+        }
+        LocalCompilationAuthorization::AdministratorException { .. }
+        | LocalCompilationAuthorization::GlobalMandate { .. } => {
+            return Err(AppError::BadRequest(
+                "initial-agent authorization adapter is not available",
+            ));
+        }
+    };
+    let local_contract = LocalGoalContract {
+        id: local_statement.local_goal_id.into(),
+        revision: 1,
+        agent: request.principal_identity_id,
+        controller: request.controller_identity_id,
+        encrypted_prompt: request.initial_local_goal.encrypted_prompt.clone(),
+        contract: local_statement.output.contract.clone(),
+        clauses,
+        origin,
+        supersedes_revision: None,
+    };
+    local_contract.validate().map_err(agent_validation_error)?;
     let runner_label = serialize_ciphertext(&request.encrypted_runner_label)?;
     let key_epoch = to_i32(request.key_epoch)?;
 
     let mut transaction = begin(&state, actor, project_id).await?;
+    let project_scope_contains_contract = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM resource_closure
+            WHERE project_id = $1 AND ancestor_id = $2 AND descendant_id = $3)",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(local_statement.envelope.project_scope))
+    .bind(Uuid::from(local_contract.contract.scope))
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !project_scope_contains_contract
+        || !resource_access_in_transaction(
+            &mut transaction,
+            project_id,
+            actor.identity_id,
+            Uuid::from(request.profile_resource_node_id),
+            ResourceOperation::Manage,
+        )
+        .await?
+        || !resource_access_in_transaction(
+            &mut transaction,
+            project_id,
+            actor.identity_id,
+            Uuid::from(local_contract.contract.scope),
+            ResourceOperation::Manage,
+        )
+        .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    validate_initial_creation_authorization(
+        &mut transaction,
+        project_id,
+        actor,
+        &request,
+        &local_contract,
+    )
+    .await?;
+    let build_digest =
+        require_pinned_compiler(&mut transaction, "local_goal", &local_statement.compiler).await?;
+    let certificate_hash = verify_device_statement(
+        &mut transaction,
+        actor,
+        local_statement,
+        &request.initial_local_goal.compilation.signatures,
+        COMPILATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let approval_statement = &request.final_prompt_approval.statement;
+    if approval_statement.project_id != project_id
+        || approval_statement.draft_id != local_statement.draft_id
+        || approval_statement.agent_principal_identity_id != request.principal_identity_id
+        || approval_statement.controller_identity_id != request.controller_identity_id
+        || approval_statement.local_goal_id != Uuid::from(local_contract.id)
+        || approval_statement.local_revision != 1
+        || approval_statement.compilation_certificate_id != local_statement.certificate_id
+        || decode_commitment(&approval_statement.structured_output_hash_hex)?
+            != decode_commitment(&local_statement.output_hash_hex)?
+        || decode_commitment(&approval_statement.prompt_commitment_hex)?
+            != decode_commitment(&local_statement.prompt_commitment_hex)?
+        || decode_commitment(&approval_statement.ciphertext_commitment_hex)?
+            != ciphertext_commitment
+        || decode_commitment(&approval_statement.approval_identity_hash_hex)?
+            != final_prompt_approval_identity_hash(approval_statement)?
+    {
+        return Err(AppError::Conflict);
+    }
+    let approval_hash = verify_device_statement(
+        &mut transaction,
+        actor,
+        approval_statement,
+        &request.final_prompt_approval.signatures,
+        FINAL_PROMPT_APPROVAL_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let administrator_creation_approval = match &local_statement.authorization {
+        LocalCompilationAuthorization::AdministratorCreation { .. } => {
+            let signed = request
+                .administrator_creation_approval
+                .as_ref()
+                .ok_or(AppError::Forbidden)?;
+            let local_contract_hash = canonical_hash(&local_contract)?;
+            validate_administrator_creation_approval(
+                &mut transaction,
+                actor,
+                project_id,
+                &request,
+                &local_contract,
+                local_contract_hash,
+                signed,
+            )
+            .await?;
+            Some((signed, local_contract_hash))
+        }
+        _ => {
+            if request.administrator_creation_approval.is_some() {
+                return Err(AppError::BadRequest(
+                    "administrator creation approval is not applicable",
+                ));
+            }
+            None
+        }
+    };
+    let (authorization_kind, authorization_id, authorization_revision) =
+        local_authorization_columns(&local_statement.authorization);
+    persist_compilation_certificate(
+        &mut transaction,
+        project_id,
+        CompilationRecord {
+            id: local_statement.certificate_id,
+            task_kind: "local_goal",
+            compiler: &local_statement.compiler,
+            build_digest,
+            signer: &request.initial_local_goal.compilation.signatures,
+            subject_id: Uuid::from(local_contract.id),
+            subject_revision: 1,
+            draft_id: local_statement.draft_id,
+            agent_principal_identity_id: Some(Uuid::from(request.principal_identity_id)),
+            controller_identity_id: Some(Uuid::from(request.controller_identity_id)),
+            administrator_identity_id: None,
+            user_identity_id: None,
+            input_commitment: decode_commitment(&local_statement.prompt_commitment_hex)?,
+            ciphertext_commitment,
+            output_json: governance_canonical_json(&local_statement.output)?,
+            output_hash: decode_commitment(&local_statement.output_hash_hex)?,
+            envelope_json: governance_canonical_json(&local_statement.envelope)?,
+            envelope_hash: decode_commitment(&local_statement.envelope_hash_hex)?,
+            certificate_hash,
+            idempotency_key: local_statement.idempotency_key,
+            classifier_version: Some(LOCAL_GOAL_CLASSIFIER_VERSION),
+            classifier_output_hash: Some(classifier_output_hash),
+            authorization_kind,
+            authorization_id,
+            authorization_revision,
+        },
+    )
+    .await?;
+    if let Some((signed, contract_hash)) = administrator_creation_approval {
+        persist_administrator_creation_approval(
+            &mut transaction,
+            project_id,
+            signed,
+            contract_hash,
+        )
+        .await?;
+    }
     sqlx::query(
         r#"
         SELECT sprout_private.provision_edge_agent(
             $1, $2, $3, $4, $5, $6, $7, $8,
-            $9, $10, $11, $12, $13, $14, $15, $16
+            $9, $10, $11, $12, $13, $14, $15, $16,
+            $17, $18, $19, $20, $21, $22
         )
         "#,
     )
@@ -136,7 +521,7 @@ pub async fn provision(
     .bind(&request.identity_handle)
     .bind(profile)
     .bind(Uuid::from(request.profile_resource_node_id))
-    .bind(system_prompt)
+    .bind(&system_prompt)
     .bind(key_epoch)
     .bind(availability_name(request.availability))
     .bind(request.runner_id)
@@ -145,7 +530,106 @@ pub async fn provision(
     .bind(session_id)
     .bind(token_hash)
     .bind(expires_at)
+    .bind(Uuid::from(local_contract.id))
+    .bind(to_i64(local_contract.revision)?)
+    .bind(local_statement.draft_id)
+    .bind(local_statement.certificate_id)
+    .bind(authorization_kind)
+    .bind(authorization_id)
     .execute(&mut *transaction)
+    .await?;
+    let local_json = canonical_json(&local_contract)?;
+    let local_hash: [u8; 32] = Sha256::digest(local_json.as_bytes()).into();
+    sqlx::query(
+        "INSERT INTO agent_local_goal_contracts (
+            id, project_id, agent_id, agent_identity_id,
+            controller_identity_id, revision, contract, contract_hash, state,
+            compilation_certificate_id, classifier_version, classifier_output_hash,
+            administrator_creation_approval_id
+         ) VALUES ($1, $2, $3, $4, $5, 1, $6::jsonb, $7, 'draft', $8, $9, $10, $11)",
+    )
+    .bind(Uuid::from(local_contract.id))
+    .bind(project_id)
+    .bind(Uuid::from(request.id))
+    .bind(Uuid::from(request.principal_identity_id))
+    .bind(Uuid::from(request.controller_identity_id))
+    .bind(&local_json)
+    .bind(local_hash.as_slice())
+    .bind(local_statement.certificate_id)
+    .bind(to_i32(LOCAL_GOAL_CLASSIFIER_VERSION)?)
+    .bind(classifier_output_hash.as_slice())
+    .bind(match &local_statement.authorization {
+        LocalCompilationAuthorization::AdministratorCreation { approval_id } => Some(*approval_id),
+        _ => None,
+    })
+    .execute(&mut *transaction)
+    .await?;
+    append_verified_governance_revision(
+        &mut transaction,
+        project_id,
+        "local_goal_revision",
+        Uuid::from(local_contract.id),
+        1,
+        local_statement.certificate_id,
+        local_hash,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent_prompt_revisions (
+            project_id, agent_id, local_goal_id, local_goal_revision,
+            encrypted_prompt, prompt_hash, state, draft_id
+         ) VALUES ($1, $2, $3, 1, $4, $5, 'draft', $6)",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(request.id))
+    .bind(Uuid::from(local_contract.id))
+    .bind(&system_prompt)
+    .bind(ciphertext_commitment.as_slice())
+    .bind(local_statement.draft_id)
+    .execute(&mut *transaction)
+    .await?;
+    let activated_local = sqlx::query(
+        "UPDATE agent_local_goal_contracts SET state = 'active'
+         WHERE project_id = $1 AND agent_id = $2 AND id = $3
+           AND revision = 1 AND state = 'draft'",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(request.id))
+    .bind(Uuid::from(local_contract.id))
+    .execute(&mut *transaction)
+    .await?;
+    if activated_local.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
+    let activated_prompt = sqlx::query(
+        "UPDATE agent_prompt_revisions
+         SET state = 'active', approved_by_identity_id = $4,
+             activated_at = clock_timestamp()
+         WHERE project_id = $1 AND agent_id = $2 AND draft_id = $3
+           AND state = 'draft'",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(request.id))
+    .bind(local_statement.draft_id)
+    .bind(actor.identity_id)
+    .execute(&mut *transaction)
+    .await?;
+    if activated_prompt.rows_affected() != 1 {
+        return Err(AppError::Conflict);
+    }
+    persist_final_prompt_approval(
+        &mut transaction,
+        project_id,
+        local_statement.draft_id,
+        Uuid::from(request.id),
+        actor.identity_id,
+        Uuid::from(local_contract.id),
+        1,
+        ciphertext_commitment,
+        request.principal_identity_id,
+        &request.final_prompt_approval,
+        approval_hash,
+    )
     .await?;
     append_audit(
         &mut transaction,
@@ -161,6 +645,40 @@ pub async fn provision(
             "runner_device_id": request.runner_device_id,
             "profile_resource_node_id": request.profile_resource_node_id,
             "key_epoch": request.key_epoch,
+        }),
+    )
+    .await?;
+    append_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        request.id,
+        None,
+        "local_goal_recorded",
+        json!({
+            "local_goal_id": local_contract.id,
+            "revision": 1,
+            "state": "active",
+            "compilation_certificate_id": local_statement.certificate_id,
+            "prompt_approval_id": approval_statement.approval_id,
+            "classifier_version": LOCAL_GOAL_CLASSIFIER_VERSION,
+        }),
+    )
+    .await?;
+    append_user_governance_audit(
+        &mut transaction,
+        actor,
+        project_id,
+        actor.identity_id,
+        Some(Uuid::from(request.id)),
+        "local_goal_activated",
+        json!({
+            "local_goal_id": local_contract.id,
+            "revision": 1,
+            "initial_creation": true,
+            "compilation_certificate_id": local_statement.certificate_id,
+            "prompt_approval_id": approval_statement.approval_id,
+            "authorization_kind": authorization_kind,
         }),
     )
     .await?;
@@ -181,6 +699,7 @@ pub async fn activate_local_goal(
     State(state): State<Arc<AppState>>,
     actor: AuthSession,
     Path((project_id, agent_id, local_goal_id, revision)): Path<(Uuid, Uuid, Uuid, u64)>,
+    Json(approval): Json<SignedFinalPromptApproval>,
 ) -> Result<Json<ContractRecordedResponse>, AppError> {
     if actor.is_agent {
         return Err(AppError::Forbidden);
@@ -197,13 +716,41 @@ pub async fn activate_local_goal(
     let row = sqlx::query(
         r#"
         SELECT local.contract::text AS contract, local.contract_hash,
-               prompt.draft_id, prompt.encrypted_prompt, prompt.prompt_hash
+               local.compilation_certificate_id,
+               prompt.draft_id, prompt.encrypted_prompt, prompt.prompt_hash,
+               certificate.input_commitment, certificate.ciphertext_commitment,
+               certificate.output_hash,
+               certificate.authorization_kind, certificate.authorization_id,
+               certificate.authorization_revision
         FROM agent_local_goal_contracts local
         JOIN agent_prompt_revisions prompt
           ON prompt.project_id = local.project_id
          AND prompt.agent_id = local.agent_id
          AND prompt.local_goal_id = local.id
          AND prompt.local_goal_revision = local.revision
+        JOIN agent_compilation_certificates certificate
+          ON certificate.project_id = local.project_id
+         AND certificate.id = local.compilation_certificate_id
+         AND certificate.task_kind = 'local_goal'
+         AND certificate.subject_id = local.id
+         AND certificate.subject_revision = local.revision
+         AND certificate.verification_state = 'verified'
+        JOIN agent_compiler_builds compiler_build
+          ON compiler_build.task_kind = certificate.task_kind
+         AND compiler_build.compiler_name = certificate.compiler_name
+         AND compiler_build.compiler_version = certificate.compiler_version
+         AND compiler_build.build_digest = certificate.compiler_build_digest
+         AND compiler_build.enabled
+        JOIN device_keys compiler_key
+          ON compiler_key.identity_id = certificate.signer_identity_id
+         AND compiler_key.device_id = certificate.signer_device_id
+         AND compiler_key.key_version = certificate.signer_device_key_version
+         AND compiler_key.revoked_at IS NULL
+        JOIN devices compiler_device
+          ON compiler_device.identity_id = compiler_key.identity_id
+         AND compiler_device.id = compiler_key.device_id
+         AND compiler_device.trust_state = 'trusted'
+         AND compiler_device.retired_at IS NULL
         WHERE local.project_id = $1 AND local.agent_id = $2
           AND local.id = $3 AND local.revision = $4
           AND local.state = 'draft' AND prompt.state = 'draft'
@@ -231,10 +778,39 @@ pub async fn activate_local_goal(
     let stored_prompt: Vec<u8> = row.try_get("encrypted_prompt")?;
     let stored_prompt_hash: Vec<u8> = row.try_get("prompt_hash")?;
     let prompt_draft_id: Uuid = row.try_get("draft_id")?;
+    let compilation_certificate_id: Uuid = row.try_get("compilation_certificate_id")?;
     let expected_prompt_hash: [u8; 32] = Sha256::digest(&prompt_bytes).into();
     if stored_prompt != prompt_bytes || stored_prompt_hash != expected_prompt_hash {
         return Err(AppError::Conflict);
     }
+    let approval_statement = &approval.statement;
+    let prompt_input_commitment: Vec<u8> = row.try_get("input_commitment")?;
+    let compilation_output_hash: Vec<u8> = row.try_get("output_hash")?;
+    if approval_statement.project_id != project_id
+        || approval_statement.draft_id != prompt_draft_id
+        || approval_statement.agent_principal_identity_id != agent.principal_id
+        || approval_statement.controller_identity_id != agent.controller_id
+        || approval_statement.local_goal_id != local_goal_id
+        || approval_statement.local_revision != revision
+        || approval_statement.compilation_certificate_id != compilation_certificate_id
+        || decode_commitment(&approval_statement.structured_output_hash_hex)?.as_slice()
+            != compilation_output_hash
+        || decode_commitment(&approval_statement.prompt_commitment_hex)?.as_slice()
+            != prompt_input_commitment
+        || decode_commitment(&approval_statement.ciphertext_commitment_hex)? != expected_prompt_hash
+        || decode_commitment(&approval_statement.approval_identity_hash_hex)?
+            != final_prompt_approval_identity_hash(approval_statement)?
+    {
+        return Err(AppError::Conflict);
+    }
+    let approval_hash = verify_device_statement(
+        &mut transaction,
+        actor,
+        approval_statement,
+        &approval.signatures,
+        FINAL_PROMPT_APPROVAL_SIGNATURE_CONTEXT,
+    )
+    .await?;
     for clause in &contract.clauses {
         if !resource_access_in_transaction(
             &mut transaction,
@@ -248,46 +824,42 @@ pub async fn activate_local_goal(
             return Err(AppError::Forbidden);
         }
     }
-    let controller_role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM project_memberships
-         WHERE project_id = $1 AND identity_id = $2 AND state = 'active'",
-    )
-    .bind(project_id)
-    .bind(actor.identity_id)
-    .fetch_optional(&mut *transaction)
-    .await?
-    .ok_or(AppError::Forbidden)?;
-    let admin_governed = matches!(controller_role.as_str(), "owner" | "admin");
-    if !admin_governed {
-        let responsibility = load_current_responsibility(
-            &mut transaction,
-            project_id,
-            Uuid::from(contract.controller),
-        )
-        .await?
-        .ok_or(AppError::Forbidden)?;
-        if !responsibility_operationally_covers(
-            &mut transaction,
-            project_id,
-            &responsibility,
-            &contract,
-        )
-        .await?
-        {
-            return Err(AppError::Forbidden);
+    let authorization_kind: String = row.try_get("authorization_kind")?;
+    let authorization_id: Option<Uuid> = row.try_get("authorization_id")?;
+    let authorization_revision: Option<i64> = row.try_get("authorization_revision")?;
+    let persisted_authorization = match (
+        authorization_kind.as_str(),
+        authorization_id,
+        authorization_revision,
+    ) {
+        ("responsibility", Some(id), Some(revision)) => {
+            LocalCompilationAuthorization::Responsibility {
+                id,
+                revision: u64::try_from(revision).map_err(|_| AppError::Internal)?,
+            }
         }
-    } else if !resource_access_in_transaction(
+        ("administrator_exception", Some(id), Some(revision)) => {
+            LocalCompilationAuthorization::AdministratorException {
+                id,
+                revision: u64::try_from(revision).map_err(|_| AppError::Internal)?,
+            }
+        }
+        ("global_mandate", Some(id), Some(revision)) => {
+            LocalCompilationAuthorization::GlobalMandate {
+                id,
+                revision: u64::try_from(revision).map_err(|_| AppError::Internal)?,
+            }
+        }
+        _ => return Err(AppError::Internal),
+    };
+    validate_local_authorization(
         &mut transaction,
         project_id,
-        actor.identity_id,
-        Uuid::from(contract.contract.scope),
-        ResourceOperation::Manage,
+        actor,
+        &contract,
+        &persisted_authorization,
     )
-    .await?
-    {
-        return Err(AppError::Forbidden);
-    }
-
+    .await?;
     if revision > 1 {
         let supersedes_revision = contract.supersedes_revision.ok_or(AppError::Conflict)?;
         let superseded = sqlx::query(
@@ -376,24 +948,20 @@ pub async fn activate_local_goal(
     if updated_prompt.rows_affected() != 1 {
         return Err(AppError::Conflict);
     }
-    let final_approval = sqlx::query(
-        "INSERT INTO agent_prompt_final_approvals (
-             project_id, draft_id, agent_id, controller_identity_id,
-             local_goal_id, local_goal_revision, prompt_hash
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    persist_final_prompt_approval(
+        &mut transaction,
+        project_id,
+        prompt_draft_id,
+        agent_id,
+        actor.identity_id,
+        local_goal_id,
+        revision,
+        expected_prompt_hash,
+        agent.principal_id,
+        &approval,
+        approval_hash,
     )
-    .bind(project_id)
-    .bind(prompt_draft_id)
-    .bind(agent_id)
-    .bind(actor.identity_id)
-    .bind(local_goal_id)
-    .bind(to_i64(revision)?)
-    .bind(expected_prompt_hash.as_slice())
-    .execute(&mut *transaction)
     .await?;
-    if final_approval.rows_affected() != 1 {
-        return Err(AppError::Conflict);
-    }
     persist_cross_owner_task_provenance(&mut transaction, project_id, agent_id, &contract).await?;
     append_audit(
         &mut transaction,
@@ -408,7 +976,7 @@ pub async fn activate_local_goal(
             "state": "active",
             "prompt_draft_id": prompt_draft_id,
             "prompt_hash": hex::encode(expected_prompt_hash),
-            "governance": if admin_governed { "project_administrator" } else { "responsibility" },
+            "governance": authorization_kind,
         }),
     )
     .await?;
@@ -424,7 +992,7 @@ pub async fn activate_local_goal(
             "revision": revision,
             "prompt_draft_id": prompt_draft_id,
             "prompt_hash": hex::encode(expected_prompt_hash),
-            "governance": if admin_governed { "project_administrator" } else { "responsibility" },
+            "governance": authorization_kind,
         }),
     )
     .await?;
@@ -530,8 +1098,11 @@ pub async fn activate_runner(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordResponsibilityRequest {
-    contract: ResponsibilityContract,
+    encrypted_source_text: EncryptedPayload,
+    supersedes_revision: Option<u64>,
+    compilation: SignedResponsibilityCompilation,
 }
 
 #[derive(Serialize)]
@@ -547,127 +1118,20 @@ pub async fn record_responsibility(
     Path((project_id, agent_id, responsibility_id)): Path<(Uuid, Uuid, Uuid)>,
     Json(request): Json<RecordResponsibilityRequest>,
 ) -> Result<Json<ContractRecordedResponse>, AppError> {
-    if actor.is_agent
-        || request.contract.id != responsibility_id.into()
-        || request.contract.administrator != actor.identity_id.into()
-    {
+    if actor.is_agent {
         return Err(AppError::Forbidden);
     }
-    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
     let agent = load_agent(&state, actor, project_id, agent_id).await?;
-    if request.contract.user != agent.controller_id {
-        return Err(AppError::BadRequest(
-            "responsibility user must be the agent controller",
-        ));
-    }
-    for rule in &request.contract.rules {
-        if !resource_access(
-            &state,
-            actor,
-            project_id,
-            Uuid::from(rule.scope),
-            ResourceOperation::Manage,
-        )
-        .await?
-        {
-            return Err(AppError::Forbidden);
-        }
-    }
-    request
-        .contract
-        .validate(
-            |principal| {
-                if principal == request.contract.administrator {
-                    Some(PrincipalKind::Administrator)
-                } else if principal == request.contract.user {
-                    Some(PrincipalKind::User)
-                } else {
-                    None
-                }
-            },
-            |_, _| true,
-        )
-        .map_err(agent_validation_error)?;
-
-    let contract_json = canonical_json(&request.contract)?;
-    let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
-    let mut transaction = begin(&state, actor, project_id).await?;
-    if request.contract.revision > 1 {
-        let previous_json = sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT contract::text
-            FROM agent_responsibility_contracts
-            WHERE project_id = $1 AND id = $2 AND revision = $3
-              AND state = 'active'
-            "#,
-        )
-        .bind(project_id)
-        .bind(responsibility_id)
-        .bind(to_i64(request.contract.revision - 1)?)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(AppError::Conflict)?;
-        let previous: ResponsibilityContract =
-            serde_json::from_str(&previous_json).map_err(|_| AppError::Internal)?;
-        request
-            .contract
-            .validate_revision_of(&previous)
-            .map_err(agent_validation_error)?;
-    } else {
-        if request.contract.supersedes_revision.is_some() {
-            return Err(AppError::BadRequest(
-                "first responsibility revision cannot supersede another revision",
-            ));
-        }
-        let existing_for_user = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM agent_responsibility_contracts
-             WHERE project_id = $1 AND user_identity_id = $2)",
-        )
-        .bind(project_id)
-        .bind(Uuid::from(request.contract.user))
-        .fetch_one(&mut *transaction)
-        .await?;
-        if existing_for_user {
-            return Err(AppError::Conflict);
-        }
-    }
-    sqlx::query(
-        r#"
-        INSERT INTO agent_responsibility_contracts (
-            id, project_id, revision, administrator_identity_id,
-            user_identity_id, contract, contract_hash, state
-        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft')
-        "#,
-    )
-    .bind(responsibility_id)
-    .bind(project_id)
-    .bind(to_i64(request.contract.revision)?)
-    .bind(actor.identity_id)
-    .bind(Uuid::from(request.contract.user))
-    .bind(&contract_json)
-    .bind(contract_hash.as_slice())
-    .execute(&mut *transaction)
-    .await?;
-    append_audit(
-        &mut transaction,
+    record_responsibility_common(
+        &state,
         actor,
         project_id,
-        AgentId::from(agent_id),
-        None,
-        "responsibility_recorded",
-        json!({
-            "responsibility_id": responsibility_id,
-            "revision": request.contract.revision,
-            "contract_hash": hex::encode(contract_hash),
-        }),
+        Uuid::from(agent.controller_id),
+        responsibility_id,
+        Some(agent_id),
+        request,
     )
-    .await?;
-    transaction.commit().await?;
-    Ok(Json(ContractRecordedResponse {
-        id: responsibility_id,
-        revision: request.contract.revision,
-        contract_hash_hex: hex::encode(contract_hash),
-    }))
+    .await
 }
 
 /// Authoritative user-level Responsibility endpoint. The agent-scoped route
@@ -679,38 +1143,81 @@ pub async fn record_user_responsibility(
     Path((project_id, user_id, responsibility_id)): Path<(Uuid, Uuid, Uuid)>,
     Json(request): Json<RecordResponsibilityRequest>,
 ) -> Result<Json<ContractRecordedResponse>, AppError> {
-    if actor.is_agent
-        || request.contract.id != responsibility_id.into()
-        || request.contract.administrator != actor.identity_id.into()
-        || request.contract.user != user_id.into()
+    if actor.is_agent {
+        return Err(AppError::Forbidden);
+    }
+    record_responsibility_common(
+        &state,
+        actor,
+        project_id,
+        user_id,
+        responsibility_id,
+        None,
+        request,
+    )
+    .await
+}
+
+async fn record_responsibility_common(
+    state: &AppState,
+    actor: AuthSession,
+    project_id: Uuid,
+    user_id: Uuid,
+    responsibility_id: Uuid,
+    audit_agent_id: Option<Uuid>,
+    request: RecordResponsibilityRequest,
+) -> Result<Json<ContractRecordedResponse>, AppError> {
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    let statement = &request.compilation.statement;
+    if statement.project_id != project_id
+        || statement.responsibility_id != responsibility_id
+        || statement.administrator_identity_id != actor.identity_id.into()
+        || statement.user_identity_id != user_id.into()
+        || statement.envelope.administrator != actor.identity_id.into()
+        || statement.envelope.user != user_id.into()
     {
         return Err(AppError::Forbidden);
     }
-    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    statement
+        .output
+        .validate_within_envelope(&statement.envelope)
+        .map_err(agent_validation_error)?;
+    let encrypted_source = serialize_ciphertext(&request.encrypted_source_text)?;
+    let ciphertext_commitment: [u8; 32] = Sha256::digest(&encrypted_source).into();
+    if decode_commitment(&statement.ciphertext_commitment_hex)? != ciphertext_commitment
+        || decode_commitment(&statement.output_hash_hex)? != canonical_hash(&statement.output)?
+        || decode_commitment(&statement.envelope_hash_hex)? != canonical_hash(&statement.envelope)?
+    {
+        return Err(AppError::BadRequest(
+            "compiler artifact commitment mismatch",
+        ));
+    }
+    let mut transaction = begin(state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 35))")
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await?;
     let user_is_human_member = sqlx::query_scalar::<_, bool>(
-        r#"
-        SELECT EXISTS (
+        "SELECT EXISTS (
             SELECT 1 FROM project_memberships membership
             JOIN identities identity ON identity.id = membership.identity_id
             WHERE membership.project_id = $1 AND membership.identity_id = $2
               AND membership.state = 'active' AND identity.status = 'active'
-              AND identity.principal_kind = 'user'
-        )
-        "#,
+              AND identity.principal_kind = 'user')",
     )
     .bind(project_id)
     .bind(user_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *transaction)
     .await?;
     if !user_is_human_member {
         return Err(AppError::Forbidden);
     }
-    for rule in &request.contract.rules {
-        if !resource_access(
-            &state,
-            actor,
+    for project_scope in &statement.envelope.project_scopes {
+        if !resource_access_in_transaction(
+            &mut transaction,
             project_id,
-            Uuid::from(rule.scope),
+            actor.identity_id,
+            Uuid::from(*project_scope),
             ResourceOperation::Manage,
         )
         .await?
@@ -718,13 +1225,64 @@ pub async fn record_user_responsibility(
             return Err(AppError::Forbidden);
         }
     }
-    request
-        .contract
+    for rule in &statement.output.rules {
+        let within_envelope = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM resource_closure
+                WHERE project_id = $1 AND descendant_id = $2
+                  AND ancestor_id = ANY($3::uuid[]))",
+        )
+        .bind(project_id)
+        .bind(Uuid::from(rule.scope))
+        .bind(
+            statement
+                .envelope
+                .project_scopes
+                .iter()
+                .copied()
+                .map(Uuid::from)
+                .collect::<Vec<_>>(),
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !within_envelope
+            || !resource_access_in_transaction(
+                &mut transaction,
+                project_id,
+                actor.identity_id,
+                Uuid::from(rule.scope),
+                ResourceOperation::Manage,
+            )
+            .await?
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
+    let build_digest =
+        require_pinned_compiler(&mut transaction, "responsibility", &statement.compiler).await?;
+    let certificate_hash = verify_device_statement(
+        &mut transaction,
+        actor,
+        statement,
+        &request.compilation.signatures,
+        COMPILATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    let contract = ResponsibilityContract {
+        id: responsibility_id.into(),
+        revision: statement.revision,
+        administrator: statement.administrator_identity_id,
+        user: statement.user_identity_id,
+        encrypted_source_text: request.encrypted_source_text,
+        rules: statement.output.rules.clone(),
+        supersedes_revision: request.supersedes_revision,
+    };
+    contract
         .validate(
             |principal| {
-                if principal == request.contract.administrator {
+                if principal == contract.administrator {
                     Some(PrincipalKind::Administrator)
-                } else if principal == request.contract.user {
+                } else if principal == contract.user {
                     Some(PrincipalKind::User)
                 } else {
                     None
@@ -733,32 +1291,24 @@ pub async fn record_user_responsibility(
             |_, _| true,
         )
         .map_err(agent_validation_error)?;
-
-    let contract_json = canonical_json(&request.contract)?;
-    let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
-    let mut transaction = begin(&state, actor, project_id).await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 35))")
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
-    if request.contract.revision > 1 {
+    if contract.revision > 1 {
+        let supersedes = contract.supersedes_revision.ok_or(AppError::Conflict)?;
         let previous_json = sqlx::query_scalar::<_, String>(
             "SELECT contract::text FROM agent_responsibility_contracts
              WHERE project_id = $1 AND id = $2 AND revision = $3 AND state = 'active'",
         )
         .bind(project_id)
         .bind(responsibility_id)
-        .bind(to_i64(request.contract.revision - 1)?)
+        .bind(to_i64(supersedes)?)
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(AppError::Conflict)?;
         let previous: ResponsibilityContract =
             serde_json::from_str(&previous_json).map_err(|_| AppError::Internal)?;
-        request
-            .contract
+        contract
             .validate_revision_of(&previous)
             .map_err(agent_validation_error)?;
-    } else if request.contract.supersedes_revision.is_some()
+    } else if contract.supersedes_revision.is_some()
         || sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM agent_responsibility_contracts
              WHERE project_id = $1 AND user_identity_id = $2)",
@@ -770,41 +1320,89 @@ pub async fn record_user_responsibility(
     {
         return Err(AppError::Conflict);
     }
+    let output_hash = decode_commitment(&statement.output_hash_hex)?;
+    let envelope_hash = decode_commitment(&statement.envelope_hash_hex)?;
+    persist_compilation_certificate(
+        &mut transaction,
+        project_id,
+        CompilationRecord {
+            id: statement.certificate_id,
+            task_kind: "responsibility",
+            compiler: &statement.compiler,
+            build_digest,
+            signer: &request.compilation.signatures,
+            subject_id: responsibility_id,
+            subject_revision: statement.revision,
+            draft_id: statement.draft_id,
+            agent_principal_identity_id: None,
+            controller_identity_id: None,
+            administrator_identity_id: Some(actor.identity_id),
+            user_identity_id: Some(user_id),
+            input_commitment: decode_commitment(&statement.source_text_commitment_hex)?,
+            ciphertext_commitment,
+            output_json: governance_canonical_json(&statement.output)?,
+            output_hash,
+            envelope_json: governance_canonical_json(&statement.envelope)?,
+            envelope_hash,
+            certificate_hash,
+            idempotency_key: statement.idempotency_key,
+            classifier_version: None,
+            classifier_output_hash: None,
+            authorization_kind: "responsibility_compilation",
+            authorization_id: None,
+            authorization_revision: None,
+        },
+    )
+    .await?;
+    let contract_json = canonical_json(&contract)?;
+    let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
     sqlx::query(
-        r#"
-        INSERT INTO agent_responsibility_contracts (
+        "INSERT INTO agent_responsibility_contracts (
             id, project_id, revision, administrator_identity_id,
-            user_identity_id, contract, contract_hash, state
-        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft')
-        "#,
+            user_identity_id, contract, contract_hash, state,
+            compilation_certificate_id
+         ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft', $8)",
     )
     .bind(responsibility_id)
     .bind(project_id)
-    .bind(to_i64(request.contract.revision)?)
+    .bind(to_i64(contract.revision)?)
     .bind(actor.identity_id)
     .bind(user_id)
     .bind(&contract_json)
     .bind(contract_hash.as_slice())
+    .bind(statement.certificate_id)
     .execute(&mut *transaction)
+    .await?;
+    append_verified_governance_revision(
+        &mut transaction,
+        project_id,
+        "responsibility_revision",
+        responsibility_id,
+        contract.revision,
+        statement.certificate_id,
+        contract_hash,
+    )
     .await?;
     append_user_governance_audit(
         &mut transaction,
         actor,
         project_id,
         user_id,
-        None,
+        audit_agent_id,
         "responsibility_drafted",
         json!({
             "responsibility_id": responsibility_id,
-            "revision": request.contract.revision,
+            "revision": contract.revision,
             "contract_hash": hex::encode(contract_hash),
+            "compilation_certificate_id": statement.certificate_id,
+            "compiler_build_digest": statement.compiler.compiler_build_digest_hex,
         }),
     )
     .await?;
     transaction.commit().await?;
     Ok(Json(ContractRecordedResponse {
         id: responsibility_id,
-        revision: request.contract.revision,
+        revision: contract.revision,
         contract_hash_hex: hex::encode(contract_hash),
     }))
 }
@@ -824,11 +1422,37 @@ pub async fn activate_user_responsibility(
         .execute(&mut *transaction)
         .await?;
     let row = sqlx::query(
-        "SELECT contract::text AS contract, contract_hash
-         FROM agent_responsibility_contracts
-         WHERE project_id = $1 AND user_identity_id = $2 AND id = $3
-           AND revision = $4 AND state = 'draft'
-         FOR UPDATE",
+        "SELECT responsibility.contract::text AS contract,
+                responsibility.contract_hash
+         FROM agent_responsibility_contracts responsibility
+         JOIN agent_compilation_certificates certificate
+           ON certificate.project_id = responsibility.project_id
+          AND certificate.id = responsibility.compilation_certificate_id
+          AND certificate.task_kind = 'responsibility'
+          AND certificate.subject_id = responsibility.id
+          AND certificate.subject_revision = responsibility.revision
+          AND certificate.verification_state = 'verified'
+         JOIN device_keys signer_key
+           ON signer_key.identity_id = certificate.signer_identity_id
+          AND signer_key.device_id = certificate.signer_device_id
+          AND signer_key.key_version = certificate.signer_device_key_version
+          AND signer_key.revoked_at IS NULL
+         JOIN devices signer_device
+           ON signer_device.identity_id = signer_key.identity_id
+          AND signer_device.id = signer_key.device_id
+          AND signer_device.trust_state = 'trusted'
+          AND signer_device.retired_at IS NULL
+         JOIN agent_compiler_builds compiler_build
+           ON compiler_build.task_kind = certificate.task_kind
+          AND compiler_build.compiler_name = certificate.compiler_name
+          AND compiler_build.compiler_version = certificate.compiler_version
+          AND compiler_build.build_digest = certificate.compiler_build_digest
+          AND compiler_build.enabled
+         WHERE responsibility.project_id = $1
+           AND responsibility.user_identity_id = $2
+           AND responsibility.id = $3 AND responsibility.revision = $4
+           AND responsibility.state = 'draft'
+         FOR UPDATE OF responsibility",
     )
     .bind(project_id)
     .bind(user_id)
@@ -940,8 +1564,11 @@ pub async fn activate_user_responsibility(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordLocalGoalRequest {
-    contract: LocalGoalContract,
+    encrypted_prompt: EncryptedPayload,
+    supersedes_revision: Option<u64>,
+    compilation: SignedLocalGoalCompilation,
 }
 
 pub async fn record_local_goal(
@@ -954,41 +1581,103 @@ pub async fn record_local_goal(
         return Err(AppError::Forbidden);
     }
     let agent = load_agent(&state, actor, project_id, agent_id).await?;
+    let statement = &request.compilation.statement;
     if agent.controller_id != actor.identity_id.into()
-        || request.contract.agent != agent.principal_id
-        || request.contract.controller != agent.controller_id
+        || statement.project_id != project_id
+        || statement.agent_principal_identity_id != agent.principal_id
+        || statement.controller_identity_id != agent.controller_id
+        || statement.envelope.agent != agent.principal_id
+        || statement.envelope.controller != agent.controller_id
     {
         return Err(AppError::Forbidden);
     }
-    request
-        .contract
-        .validate()
+    statement
+        .output
+        .validate_within_envelope(&statement.envelope)
         .map_err(agent_validation_error)?;
-    if !matches!(
-        request.contract.origin,
-        LocalGoalOrigin::ControllerPrompt {}
-    ) {
+    let prompt_bytes = serialize_ciphertext(&request.encrypted_prompt)?;
+    let ciphertext_commitment: [u8; 32] = Sha256::digest(&prompt_bytes).into();
+    if decode_commitment(&statement.ciphertext_commitment_hex)? != ciphertext_commitment
+        || decode_commitment(&statement.output_hash_hex)? != canonical_hash(&statement.output)?
+        || decode_commitment(&statement.envelope_hash_hex)? != canonical_hash(&statement.envelope)?
+    {
         return Err(AppError::BadRequest(
-            "local-goal origin requires a persisted governance certificate adapter",
+            "compiler artifact commitment mismatch",
         ));
     }
-    for clause in &request.contract.clauses {
-        if !resource_access(
-            &state,
-            actor,
+    let clauses = classify_local_goal_contract(&statement.output.contract);
+    let classifier_output_hash = canonical_hash(&clauses)?;
+    let origin = match &statement.authorization {
+        LocalCompilationAuthorization::Responsibility { .. } => {
+            LocalGoalOrigin::ControllerPrompt {}
+        }
+        LocalCompilationAuthorization::AdministratorException { .. }
+        | LocalCompilationAuthorization::GlobalMandate { .. }
+        | LocalCompilationAuthorization::AdministratorCreation { .. } => {
+            return Err(AppError::BadRequest(
+                "local-goal authorization adapter is not available",
+            ));
+        }
+    };
+    let contract = LocalGoalContract {
+        id: statement.local_goal_id.into(),
+        revision: statement.local_revision,
+        agent: statement.agent_principal_identity_id,
+        controller: statement.controller_identity_id,
+        encrypted_prompt: request.encrypted_prompt,
+        contract: statement.output.contract.clone(),
+        clauses,
+        origin,
+        supersedes_revision: request.supersedes_revision,
+    };
+    contract.validate().map_err(agent_validation_error)?;
+    let mut transaction = begin(&state, actor, project_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 36))")
+        .bind(agent_id)
+        .execute(&mut *transaction)
+        .await?;
+    let project_scope_contains_contract = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM resource_closure
+            WHERE project_id = $1 AND ancestor_id = $2 AND descendant_id = $3)",
+    )
+    .bind(project_id)
+    .bind(Uuid::from(statement.envelope.project_scope))
+    .bind(Uuid::from(contract.contract.scope))
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !project_scope_contains_contract
+        || !resource_access_in_transaction(
+            &mut transaction,
             project_id,
-            Uuid::from(clause.scope),
+            actor.identity_id,
+            Uuid::from(contract.contract.scope),
             ResourceOperation::Read,
         )
         .await?
-        {
-            return Err(AppError::Forbidden);
-        }
+    {
+        return Err(AppError::Forbidden);
     }
-    let contract_json = canonical_json(&request.contract)?;
-    let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
-    let mut transaction = begin(&state, actor, project_id).await?;
-    if request.contract.revision > 1 {
+    validate_local_authorization(
+        &mut transaction,
+        project_id,
+        actor,
+        &contract,
+        &statement.authorization,
+    )
+    .await?;
+    let build_digest =
+        require_pinned_compiler(&mut transaction, "local_goal", &statement.compiler).await?;
+    let certificate_hash = verify_device_statement(
+        &mut transaction,
+        actor,
+        statement,
+        &request.compilation.signatures,
+        COMPILATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    if contract.revision > 1 {
+        let supersedes = contract.supersedes_revision.ok_or(AppError::Conflict)?;
         let previous_json = sqlx::query_scalar::<_, String>(
             r#"
             SELECT contract::text
@@ -998,56 +1687,108 @@ pub async fn record_local_goal(
             "#,
         )
         .bind(project_id)
-        .bind(Uuid::from(request.contract.id))
-        .bind(to_i64(request.contract.revision - 1)?)
+        .bind(Uuid::from(contract.id))
+        .bind(to_i64(supersedes)?)
         .bind(agent_id)
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(AppError::Conflict)?;
         let previous: LocalGoalContract =
             serde_json::from_str(&previous_json).map_err(|_| AppError::Internal)?;
-        request
-            .contract
+        contract
             .validate_revision_of(&previous)
             .map_err(agent_validation_error)?;
-    } else if request.contract.supersedes_revision.is_some() {
+    } else if contract.supersedes_revision.is_some() {
         return Err(AppError::BadRequest(
             "first local-goal revision cannot supersede another revision",
         ));
     }
+    let (authorization_kind, authorization_id, authorization_revision) =
+        local_authorization_columns(&statement.authorization);
+    persist_compilation_certificate(
+        &mut transaction,
+        project_id,
+        CompilationRecord {
+            id: statement.certificate_id,
+            task_kind: "local_goal",
+            compiler: &statement.compiler,
+            build_digest,
+            signer: &request.compilation.signatures,
+            subject_id: Uuid::from(contract.id),
+            subject_revision: contract.revision,
+            draft_id: statement.draft_id,
+            agent_principal_identity_id: Some(Uuid::from(contract.agent)),
+            controller_identity_id: Some(Uuid::from(contract.controller)),
+            administrator_identity_id: None,
+            user_identity_id: None,
+            input_commitment: decode_commitment(&statement.prompt_commitment_hex)?,
+            ciphertext_commitment,
+            output_json: governance_canonical_json(&statement.output)?,
+            output_hash: decode_commitment(&statement.output_hash_hex)?,
+            envelope_json: governance_canonical_json(&statement.envelope)?,
+            envelope_hash: decode_commitment(&statement.envelope_hash_hex)?,
+            certificate_hash,
+            idempotency_key: statement.idempotency_key,
+            classifier_version: Some(LOCAL_GOAL_CLASSIFIER_VERSION),
+            classifier_output_hash: Some(classifier_output_hash),
+            authorization_kind,
+            authorization_id,
+            authorization_revision,
+        },
+    )
+    .await?;
+    let contract_json = canonical_json(&contract)?;
+    let contract_hash: [u8; 32] = Sha256::digest(contract_json.as_bytes()).into();
     sqlx::query(
         r#"
         INSERT INTO agent_local_goal_contracts (
             id, project_id, agent_id, agent_identity_id,
-            controller_identity_id, revision, contract, contract_hash, state
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, 'draft')
+            controller_identity_id, revision, contract, contract_hash, state,
+            compilation_certificate_id, classifier_version,
+            classifier_output_hash
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7::jsonb, $8, 'draft', $9, $10, $11
+        )
         "#,
     )
-    .bind(Uuid::from(request.contract.id))
+    .bind(Uuid::from(contract.id))
     .bind(project_id)
     .bind(agent_id)
-    .bind(Uuid::from(request.contract.agent))
-    .bind(Uuid::from(request.contract.controller))
-    .bind(to_i64(request.contract.revision)?)
+    .bind(Uuid::from(contract.agent))
+    .bind(Uuid::from(contract.controller))
+    .bind(to_i64(contract.revision)?)
     .bind(&contract_json)
     .bind(contract_hash.as_slice())
+    .bind(statement.certificate_id)
+    .bind(to_i32(LOCAL_GOAL_CLASSIFIER_VERSION)?)
+    .bind(classifier_output_hash.as_slice())
     .execute(&mut *transaction)
     .await?;
-    let encrypted_prompt = serialize_ciphertext(&request.contract.encrypted_prompt)?;
-    let prompt_hash: [u8; 32] = Sha256::digest(&encrypted_prompt).into();
+    append_verified_governance_revision(
+        &mut transaction,
+        project_id,
+        "local_goal_revision",
+        Uuid::from(contract.id),
+        contract.revision,
+        statement.certificate_id,
+        contract_hash,
+    )
+    .await?;
+    let prompt_hash = ciphertext_commitment;
     sqlx::query(
         r#"
         INSERT INTO agent_prompt_revisions (
-            project_id, agent_id, local_goal_id, local_goal_revision,
+            project_id, agent_id, draft_id, local_goal_id, local_goal_revision,
             encrypted_prompt, prompt_hash, state
-        ) VALUES ($1, $2, $3, $4, $5, $6, 'draft')
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft')
         "#,
     )
     .bind(project_id)
     .bind(agent_id)
-    .bind(Uuid::from(request.contract.id))
-    .bind(to_i64(request.contract.revision)?)
-    .bind(encrypted_prompt)
+    .bind(statement.draft_id)
+    .bind(Uuid::from(contract.id))
+    .bind(to_i64(contract.revision)?)
+    .bind(prompt_bytes)
     .bind(prompt_hash.as_slice())
     .execute(&mut *transaction)
     .await?;
@@ -1059,11 +1800,13 @@ pub async fn record_local_goal(
         None,
         "local_goal_recorded",
         json!({
-            "local_goal_id": request.contract.id,
-            "revision": request.contract.revision,
+            "local_goal_id": contract.id,
+            "revision": contract.revision,
             "contract_hash": hex::encode(contract_hash),
             "state": "draft",
             "prompt_hash": hex::encode(prompt_hash),
+            "compilation_certificate_id": statement.certificate_id,
+            "classifier_version": LOCAL_GOAL_CLASSIFIER_VERSION,
         }),
     )
     .await?;
@@ -1071,21 +1814,23 @@ pub async fn record_local_goal(
         &mut transaction,
         actor,
         project_id,
-        Uuid::from(request.contract.controller),
+        Uuid::from(contract.controller),
         Some(agent_id),
         "local_goal_drafted",
         json!({
-            "local_goal_id": request.contract.id,
-            "revision": request.contract.revision,
+            "local_goal_id": contract.id,
+            "revision": contract.revision,
             "contract_hash": hex::encode(contract_hash),
             "prompt_hash": hex::encode(prompt_hash),
+            "compilation_certificate_id": statement.certificate_id,
+            "classifier_output_hash": hex::encode(classifier_output_hash),
         }),
     )
     .await?;
     transaction.commit().await?;
     Ok(Json(ContractRecordedResponse {
-        id: Uuid::from(request.contract.id),
-        revision: request.contract.revision,
+        id: Uuid::from(contract.id),
+        revision: contract.revision,
         contract_hash_hex: hex::encode(contract_hash),
     }))
 }
@@ -4584,6 +5329,577 @@ fn serialize_ciphertext(payload: &EncryptedPayload) -> Result<Vec<u8>, AppError>
     serde_json::to_vec(payload).map_err(|_| AppError::BadRequest("invalid encrypted payload"))
 }
 
+fn decode_commitment(value: &str) -> Result<[u8; 32], AppError> {
+    let bytes = hex::decode(value).map_err(|_| AppError::BadRequest("invalid commitment"))?;
+    bytes
+        .try_into()
+        .map_err(|_| AppError::BadRequest("invalid commitment"))
+}
+
+fn final_prompt_approval_identity_hash(
+    statement: &FinalPromptApprovalStatement,
+) -> Result<[u8; 32], AppError> {
+    canonical_hash(&json!({
+        "signature_context": "sprout-final-prompt-approval-v1",
+        "approval_id": statement.approval_id,
+        "project_id": statement.project_id,
+        "draft_id": statement.draft_id,
+        "agent_principal_identity_id": statement.agent_principal_identity_id,
+        "controller_identity_id": statement.controller_identity_id,
+        "local_goal_id": statement.local_goal_id,
+        "local_revision": statement.local_revision,
+        "prompt_commitment_hex": statement.prompt_commitment_hex,
+        "ciphertext_commitment_hex": statement.ciphertext_commitment_hex,
+        "compilation_certificate_id": statement.compilation_certificate_id,
+        "structured_output_hash_hex": statement.structured_output_hash_hex,
+        "idempotency_key": statement.idempotency_key,
+    }))
+}
+
+fn administrator_creation_proposal_binding(
+    project_id: Uuid,
+    request: &ProvisionAgentRequest,
+    local: &LocalGoalContract,
+    contract_hash: [u8; 32],
+) -> AdministratorCreationProposalBinding {
+    let statement = &request.initial_local_goal.compilation.statement;
+    AdministratorCreationProposalBinding {
+        project_id,
+        administrator_identity_id: request.controller_identity_id,
+        proposed_agent_identity_id: request.principal_identity_id,
+        governed_agent_id: request.id,
+        proposal_draft_id: statement.draft_id,
+        local_goal_id: Uuid::from(local.id),
+        local_goal_revision: local.revision,
+        contract_hash_hex: hex::encode(contract_hash),
+        compilation_certificate_id: statement.certificate_id,
+        prompt_plaintext_commitment_hex: statement.prompt_commitment_hex.clone(),
+        ciphertext_commitment_hex: statement.ciphertext_commitment_hex.clone(),
+        availability: request.availability,
+        scope: local.contract.scope,
+    }
+}
+
+async fn validate_initial_creation_authorization(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    actor: AuthSession,
+    request: &ProvisionAgentRequest,
+    local: &LocalGoalContract,
+) -> Result<(), AppError> {
+    match &request
+        .initial_local_goal
+        .compilation
+        .statement
+        .authorization
+    {
+        LocalCompilationAuthorization::Responsibility { .. } => {
+            if request.administrator_creation_approval.is_some()
+                || !matches!(local.origin, LocalGoalOrigin::ControllerPrompt {})
+            {
+                return Err(AppError::Conflict);
+            }
+            validate_local_authorization(
+                transaction,
+                project_id,
+                actor,
+                local,
+                &request
+                    .initial_local_goal
+                    .compilation
+                    .statement
+                    .authorization,
+            )
+            .await
+        }
+        LocalCompilationAuthorization::AdministratorCreation { approval_id } => {
+            if !matches!(
+                local.origin,
+                LocalGoalOrigin::AdministratorCreation {
+                    approval_id: origin_id
+                } if origin_id == *approval_id
+            ) || request
+                .administrator_creation_approval
+                .as_ref()
+                .is_none_or(|approval| approval.statement.approval_id != *approval_id)
+            {
+                return Err(AppError::Conflict);
+            }
+            let administrator = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                    SELECT 1 FROM project_memberships membership
+                    JOIN identities identity ON identity.id = membership.identity_id
+                    WHERE membership.project_id = $1 AND membership.identity_id = $2
+                      AND membership.state = 'active'
+                      AND membership.role IN ('owner', 'admin')
+                      AND identity.status = 'active'
+                      AND identity.principal_kind = 'user')",
+            )
+            .bind(project_id)
+            .bind(actor.identity_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            if !administrator
+                || !resource_access_in_transaction(
+                    transaction,
+                    project_id,
+                    actor.identity_id,
+                    Uuid::from(local.contract.scope),
+                    ResourceOperation::Manage,
+                )
+                .await?
+            {
+                return Err(AppError::Forbidden);
+            }
+            Ok(())
+        }
+        LocalCompilationAuthorization::AdministratorException { .. }
+        | LocalCompilationAuthorization::GlobalMandate { .. } => Err(AppError::BadRequest(
+            "initial-agent authorization adapter is not available",
+        )),
+    }
+}
+
+async fn validate_administrator_creation_approval(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: AuthSession,
+    project_id: Uuid,
+    request: &ProvisionAgentRequest,
+    local: &LocalGoalContract,
+    contract_hash: [u8; 32],
+    signed: &SignedAdministratorAgentCreationApproval,
+) -> Result<(), AppError> {
+    let statement = &signed.statement;
+    let compiler_statement = &request.initial_local_goal.compilation.statement;
+    let LocalCompilationAuthorization::AdministratorCreation {
+        approval_id: expected_approval_id,
+    } = &compiler_statement.authorization
+    else {
+        return Err(AppError::Conflict);
+    };
+    let expected_binding =
+        administrator_creation_proposal_binding(project_id, request, local, contract_hash);
+    if statement.approval_id != *expected_approval_id
+        || statement.project_id != project_id
+        || statement.administrator_identity_id != actor.identity_id.into()
+        || statement.administrator_identity_id != request.controller_identity_id
+        || statement.signer_device_id != signed.signatures.signer_device_id
+        || statement.signer_device_key_version != signed.signatures.signer_device_key_version
+        || signed.signatures.signer_identity_id != statement.administrator_identity_id
+        || statement.proposed_agent_identity_id != request.principal_identity_id
+        || statement.governed_agent_id != request.id
+        || statement.proposal_draft_id != compiler_statement.draft_id
+        || statement.local_goal_id != Uuid::from(local.id)
+        || statement.local_goal_revision != local.revision
+        || decode_commitment(&statement.contract_hash_hex)? != contract_hash
+        || statement.compilation_certificate_id != compiler_statement.certificate_id
+        || statement.prompt_plaintext_commitment_hex != compiler_statement.prompt_commitment_hex
+        || statement.ciphertext_commitment_hex != compiler_statement.ciphertext_commitment_hex
+        || statement.availability != request.availability
+        || statement.scope != local.contract.scope
+        || decode_commitment(&statement.canonical_proposal_hash_hex)?
+            != canonical_hash(&expected_binding)?
+    {
+        return Err(AppError::Conflict);
+    }
+    verify_device_statement(
+        transaction,
+        actor,
+        statement,
+        &signed.signatures,
+        ADMINISTRATOR_AGENT_CREATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn persist_administrator_creation_approval(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    signed: &SignedAdministratorAgentCreationApproval,
+    contract_hash: [u8; 32],
+) -> Result<(), AppError> {
+    let statement = &signed.statement;
+    let approval_hash = canonical_hash(statement)?;
+    sqlx::query(
+        "SELECT sprout_private.insert_verified_administrator_creation_approval(
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+            $14, $15, $16, $17, $18, $19, $20, $21)",
+    )
+    .bind(project_id)
+    .bind(statement.approval_id)
+    .bind(Uuid::from(statement.administrator_identity_id))
+    .bind(statement.signer_device_id)
+    .bind(to_i32(statement.signer_device_key_version)?)
+    .bind(Uuid::from(statement.proposed_agent_identity_id))
+    .bind(Uuid::from(statement.governed_agent_id))
+    .bind(statement.proposal_draft_id)
+    .bind(statement.local_goal_id)
+    .bind(to_i64(statement.local_goal_revision)?)
+    .bind(contract_hash.as_slice())
+    .bind(statement.compilation_certificate_id)
+    .bind(decode_commitment(&statement.prompt_plaintext_commitment_hex)?.as_slice())
+    .bind(decode_commitment(&statement.ciphertext_commitment_hex)?.as_slice())
+    .bind(availability_name(statement.availability))
+    .bind(Uuid::from(statement.scope))
+    .bind(decode_commitment(&statement.canonical_proposal_hash_hex)?.as_slice())
+    .bind(statement.idempotency_key)
+    .bind(approval_hash.as_slice())
+    .bind(&signed.signatures.classical_signature)
+    .bind(&signed.signatures.post_quantum_signature)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_final_prompt_approval(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    draft_id: Uuid,
+    agent_id: Uuid,
+    controller_identity_id: Uuid,
+    local_goal_id: Uuid,
+    local_goal_revision: u64,
+    prompt_hash: [u8; 32],
+    agent_principal_identity_id: UserId,
+    signed: &SignedFinalPromptApproval,
+    approval_hash: [u8; 32],
+) -> Result<(), AppError> {
+    let statement = &signed.statement;
+    sqlx::query(
+        "SELECT sprout_private.insert_verified_final_prompt_approval(
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            $13, $14, $15, $16, $17, $18, $19, $20)",
+    )
+    .bind(project_id)
+    .bind(draft_id)
+    .bind(agent_id)
+    .bind(controller_identity_id)
+    .bind(local_goal_id)
+    .bind(to_i64(local_goal_revision)?)
+    .bind(prompt_hash.as_slice())
+    .bind(statement.approval_id)
+    .bind(statement.idempotency_key)
+    .bind(Uuid::from(agent_principal_identity_id))
+    .bind(signed.signatures.signer_device_id)
+    .bind(to_i32(signed.signatures.signer_device_key_version)?)
+    .bind(decode_commitment(&statement.prompt_commitment_hex)?.as_slice())
+    .bind(decode_commitment(&statement.ciphertext_commitment_hex)?.as_slice())
+    .bind(statement.compilation_certificate_id)
+    .bind(decode_commitment(&statement.structured_output_hash_hex)?.as_slice())
+    .bind(decode_commitment(&statement.approval_identity_hash_hex)?.as_slice())
+    .bind(approval_hash.as_slice())
+    .bind(&signed.signatures.classical_signature)
+    .bind(&signed.signatures.post_quantum_signature)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn append_verified_governance_revision(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    entry_kind: &'static str,
+    subject_id: Uuid,
+    subject_revision: u64,
+    compilation_id: Uuid,
+    contract_hash: [u8; 32],
+) -> Result<(), AppError> {
+    sqlx::query(
+        "SELECT sprout_private.append_verified_governance_revision(
+            $1, $2, $3, $4, $5, $6)",
+    )
+    .bind(project_id)
+    .bind(entry_kind)
+    .bind(subject_id)
+    .bind(to_i64(subject_revision)?)
+    .bind(compilation_id)
+    .bind(contract_hash.as_slice())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+fn local_authorization_columns(
+    authorization: &LocalCompilationAuthorization,
+) -> (&'static str, Option<Uuid>, Option<u64>) {
+    match authorization {
+        LocalCompilationAuthorization::Responsibility { id, revision } => {
+            ("responsibility", Some(*id), Some(*revision))
+        }
+        LocalCompilationAuthorization::AdministratorException { id, revision } => {
+            ("administrator_exception", Some(*id), Some(*revision))
+        }
+        LocalCompilationAuthorization::GlobalMandate { id, revision } => {
+            ("global_mandate", Some(*id), Some(*revision))
+        }
+        LocalCompilationAuthorization::AdministratorCreation { approval_id } => {
+            ("administrator_creation", Some(*approval_id), None)
+        }
+    }
+}
+
+async fn validate_local_authorization(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    actor: AuthSession,
+    contract: &LocalGoalContract,
+    authorization: &LocalCompilationAuthorization,
+) -> Result<(), AppError> {
+    match authorization {
+        LocalCompilationAuthorization::Responsibility { id, revision } => {
+            let responsibility_json = sqlx::query_scalar::<_, String>(
+                "SELECT contract::text FROM agent_responsibility_contracts
+                 WHERE project_id = $1 AND id = $2 AND revision = $3
+                   AND user_identity_id = $4 AND state = 'active'
+                   AND compilation_certificate_id IS NOT NULL",
+            )
+            .bind(project_id)
+            .bind(*id)
+            .bind(to_i64(*revision)?)
+            .bind(actor.identity_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or(AppError::Forbidden)?;
+            let responsibility: ResponsibilityContract =
+                serde_json::from_str(&responsibility_json).map_err(|_| AppError::Internal)?;
+            if !responsibility_operationally_covers(
+                transaction,
+                project_id,
+                &responsibility,
+                contract,
+            )
+            .await?
+            {
+                return Err(AppError::Forbidden);
+            }
+        }
+        LocalCompilationAuthorization::AdministratorException { .. }
+        | LocalCompilationAuthorization::GlobalMandate { .. }
+        | LocalCompilationAuthorization::AdministratorCreation { .. } => {
+            return Err(AppError::BadRequest(
+                "local-goal authorization adapter is not available",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_hash(value: &impl Serialize) -> Result<[u8; 32], AppError> {
+    Ok(Sha256::digest(governance_canonical_bytes(value)?).into())
+}
+
+fn governance_canonical_bytes(value: &impl Serialize) -> Result<Vec<u8>, AppError> {
+    canonical_governance_json(value)
+        .map_err(|_| AppError::BadRequest("invalid canonical governance payload"))
+}
+
+fn governance_canonical_json(value: &impl Serialize) -> Result<String, AppError> {
+    String::from_utf8(governance_canonical_bytes(value)?)
+        .map_err(|_| AppError::BadRequest("invalid canonical governance payload"))
+}
+
+async fn verify_device_statement(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: AuthSession,
+    statement: &impl Serialize,
+    signatures: &CompilationSignatures,
+    context: &[u8],
+) -> Result<[u8; 32], AppError> {
+    if signatures.signer_identity_id != actor.identity_id.into() {
+        return Err(AppError::Forbidden);
+    }
+    let key_version = to_i32(signatures.signer_device_key_version)?;
+    let keys = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+        r#"
+        SELECT key.ed25519_public_key, key.ml_dsa_65_public_key
+        FROM device_keys key
+        JOIN devices device
+          ON device.identity_id = key.identity_id
+         AND device.id = key.device_id
+        WHERE key.identity_id = $1 AND key.device_id = $2
+          AND key.key_version = $3 AND key.suite_version = 32769
+          AND key.revoked_at IS NULL
+          AND device.trust_state = 'trusted' AND device.retired_at IS NULL
+        "#,
+    )
+    .bind(Uuid::from(signatures.signer_identity_id))
+    .bind(signatures.signer_device_id)
+    .bind(key_version)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    let statement_bytes = governance_canonical_bytes(statement)?;
+    verify_ed25519_ml_dsa65_signatures(
+        &keys.0,
+        &signatures.classical_signature,
+        &keys.1,
+        &signatures.post_quantum_signature,
+        &statement_bytes,
+        context,
+    )
+    .map_err(|_| AppError::BadRequest("device attestation signature verification failed"))?;
+    Ok(Sha256::digest(statement_bytes).into())
+}
+
+async fn require_pinned_compiler(
+    transaction: &mut Transaction<'_, Postgres>,
+    task_kind: &'static str,
+    compiler: &CompilerIdentity,
+) -> Result<[u8; 32], AppError> {
+    let digest = decode_commitment(&compiler.compiler_build_digest_hex)?;
+    let (expected_digest, manifest) = match (
+        task_kind,
+        compiler.compiler_id.as_str(),
+        compiler.compiler_version,
+    ) {
+        ("local_goal", "sprout.local-goal.compiler", 1) => (
+            LOCAL_GOAL_COMPILER_PROTOCOL_MANIFEST_SHA256,
+            LOCAL_GOAL_COMPILER_PROTOCOL_MANIFEST,
+        ),
+        ("responsibility", "sprout.responsibility.compiler", 1) => (
+            RESPONSIBILITY_COMPILER_PROTOCOL_MANIFEST_SHA256,
+            RESPONSIBILITY_COMPILER_PROTOCOL_MANIFEST,
+        ),
+        _ => return Err(AppError::BadRequest("compiler build is not pinned")),
+    };
+    if digest != expected_digest || Sha256::digest(manifest).as_slice() != expected_digest {
+        return Err(AppError::BadRequest("compiler build is not pinned"));
+    }
+    let registered = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM agent_compiler_builds
+            WHERE task_kind = $1 AND compiler_name = $2
+              AND compiler_version = $3 AND build_digest = $4
+              AND enabled
+        )
+        "#,
+    )
+    .bind(task_kind)
+    .bind(&compiler.compiler_id)
+    .bind(to_i32(compiler.compiler_version)?)
+    .bind(digest.as_slice())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !registered {
+        return Err(AppError::BadRequest("compiler build is not pinned"));
+    }
+    Ok(digest)
+}
+
+struct CompilationRecord<'a> {
+    id: Uuid,
+    task_kind: &'static str,
+    compiler: &'a CompilerIdentity,
+    build_digest: [u8; 32],
+    signer: &'a CompilationSignatures,
+    subject_id: Uuid,
+    subject_revision: u64,
+    draft_id: Uuid,
+    agent_principal_identity_id: Option<Uuid>,
+    controller_identity_id: Option<Uuid>,
+    administrator_identity_id: Option<Uuid>,
+    user_identity_id: Option<Uuid>,
+    input_commitment: [u8; 32],
+    ciphertext_commitment: [u8; 32],
+    output_json: String,
+    output_hash: [u8; 32],
+    envelope_json: String,
+    envelope_hash: [u8; 32],
+    certificate_hash: [u8; 32],
+    idempotency_key: Uuid,
+    classifier_version: Option<u32>,
+    classifier_output_hash: Option<[u8; 32]>,
+    authorization_kind: &'static str,
+    authorization_id: Option<Uuid>,
+    authorization_revision: Option<u64>,
+}
+
+async fn persist_compilation_certificate(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    record: CompilationRecord<'_>,
+) -> Result<(), AppError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 39))")
+        .bind(format!(
+            "{}:{}:{}:{}",
+            project_id, record.task_kind, record.subject_id, record.subject_revision
+        ))
+        .execute(&mut **transaction)
+        .await?;
+    let existing = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+        r#"
+        SELECT id, certificate_hash
+        FROM agent_compilation_certificates
+        WHERE project_id = $1 AND task_kind = $2
+          AND subject_id = $3 AND subject_revision = $4
+        "#,
+    )
+    .bind(project_id)
+    .bind(record.task_kind)
+    .bind(record.subject_id)
+    .bind(to_i64(record.subject_revision)?)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some((id, certificate_hash)) = existing {
+        if id == record.id && certificate_hash == record.certificate_hash {
+            return Ok(());
+        }
+        return Err(AppError::Conflict);
+    }
+    sqlx::query(
+        r#"
+        SELECT sprout_private.insert_verified_compilation_certificate(
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            $13, $14, $15, $16, $17, $18, $19::jsonb, $20,
+            $21::jsonb, $22, $23, $24, $25, $26, $27, $28, $29,
+            $30, $31
+        )
+        "#,
+    )
+    .bind(record.id)
+    .bind(project_id)
+    .bind(record.task_kind)
+    .bind(&record.compiler.compiler_id)
+    .bind(to_i32(record.compiler.compiler_version)?)
+    .bind(record.build_digest.as_slice())
+    .bind(Uuid::from(record.signer.signer_identity_id))
+    .bind(record.signer.signer_device_id)
+    .bind(to_i32(record.signer.signer_device_key_version)?)
+    .bind(record.subject_id)
+    .bind(to_i64(record.subject_revision)?)
+    .bind(record.draft_id)
+    .bind(record.agent_principal_identity_id)
+    .bind(record.controller_identity_id)
+    .bind(record.administrator_identity_id)
+    .bind(record.user_identity_id)
+    .bind(record.input_commitment.as_slice())
+    .bind(record.ciphertext_commitment.as_slice())
+    .bind(record.output_json)
+    .bind(record.output_hash.as_slice())
+    .bind(record.envelope_json)
+    .bind(record.envelope_hash.as_slice())
+    .bind(record.certificate_hash.as_slice())
+    .bind(record.idempotency_key)
+    .bind(&record.signer.classical_signature)
+    .bind(&record.signer.post_quantum_signature)
+    .bind(record.classifier_version.map(to_i32).transpose()?)
+    .bind(
+        record
+            .classifier_output_hash
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    )
+    .bind(record.authorization_kind)
+    .bind(record.authorization_id)
+    .bind(record.authorization_revision.map(to_i64).transpose()?)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 fn deserialize_ciphertext(bytes: &[u8]) -> Result<EncryptedPayload, AppError> {
     serde_json::from_slice(bytes).map_err(|_| AppError::Internal)
 }
@@ -4662,6 +5978,43 @@ mod tests {
                 Some(Uuid::from(resource_id)),
                 Some(document_id)
             )
+        );
+    }
+
+    #[test]
+    fn pinned_compiler_digests_are_hashes_of_versioned_protocol_manifests() {
+        assert_eq!(
+            Sha256::digest(LOCAL_GOAL_COMPILER_PROTOCOL_MANIFEST).as_slice(),
+            LOCAL_GOAL_COMPILER_PROTOCOL_MANIFEST_SHA256
+        );
+        assert_eq!(
+            Sha256::digest(RESPONSIBILITY_COMPILER_PROTOCOL_MANIFEST).as_slice(),
+            RESPONSIBILITY_COMPILER_PROTOCOL_MANIFEST_SHA256
+        );
+    }
+
+    #[test]
+    fn final_prompt_approval_identity_is_domain_separated_and_exact() {
+        let mut statement = FinalPromptApprovalStatement {
+            approval_id: Uuid::from_u128(1),
+            project_id: Uuid::from_u128(2),
+            draft_id: Uuid::from_u128(3),
+            agent_principal_identity_id: UserId::from(Uuid::from_u128(4)),
+            controller_identity_id: UserId::from(Uuid::from_u128(5)),
+            local_goal_id: Uuid::from_u128(6),
+            local_revision: 1,
+            prompt_commitment_hex: "11".repeat(32),
+            ciphertext_commitment_hex: "22".repeat(32),
+            compilation_certificate_id: Uuid::from_u128(7),
+            structured_output_hash_hex: "33".repeat(32),
+            approval_identity_hash_hex: "00".repeat(32),
+            idempotency_key: Uuid::from_u128(8),
+        };
+        let original = final_prompt_approval_identity_hash(&statement).unwrap();
+        statement.local_revision = 2;
+        assert_ne!(
+            original,
+            final_prompt_approval_identity_hash(&statement).unwrap()
         );
     }
 }
