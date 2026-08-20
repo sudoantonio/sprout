@@ -15349,3 +15349,1546 @@ permission safety, responsibility authorization o activation operativa R5.37.
 end R5
 
 end Sprout.AgentSpec
+
+namespace Sprout.AgentSpec
+
+namespace R5
+
+/-!
+R5.40/R5.41 — candidata ricostruita per closure formale di release.
+
+Estensione puramente additiva della baseline con hash
+0b7754cf65b92411269be5b1af70d9895d0ad39e0e697482ec4dee9c57cf254b.
+Non compilata in questa sessione: deve essere verificata esclusivamente nel
+toolchain canonico ~/lean-fixed prima di sostituire la specifica canonica.
+-/
+
+/-! ### R5.40 — Trace concreta, content binding e sostituzione cross-trace -/
+
+/-- Evento canonico di un singolo attempt di WorkItem. -/
+structure R540WorkAttemptEvent
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  run : X.RunId
+  goal : X.GoalId
+  work : X.WorkItemId
+  claim : X.ClaimId
+  attempt : Nat
+  actor : V.PrincipalId
+  tick : Nat
+
+
+/-- Esito terminale di un WorkItem nello stesso attempt certificato. -/
+structure R540WorkOutcomeEvent
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  run : X.RunId
+  goal : X.GoalId
+  work : X.WorkItemId
+  claim : X.ClaimId
+  attempt : Nat
+  status : WorkStatus
+  observedAt : Nat
+
+/-- Risoluzione concreta di un blocker tipato. -/
+structure R540BlockerResolutionEvent
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  run : X.RunId
+  goal : X.GoalId
+  blocker : X.BlockerId
+  resolution : BlockerResolution V X
+  observedAt : Nat
+
+/-- Link causale persistito nella medesima trace. -/
+structure R540CausalLinkEvent
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  run : X.RunId
+  goal : X.GoalId
+  link : CollaborativeCausalLink V X
+  recordedAt : Nat
+
+/-- Richiesta/terminale tool legati allo stesso work attempt. -/
+structure R540ToolEvent
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  run : X.RunId
+  goal : X.GoalId
+  work : X.WorkItemId
+  claim : X.ClaimId
+  attempt : Nat
+  owner : V.PrincipalId
+  callId : V.ToolCallId
+  tool : V.Tool
+  input : V.ToolInput
+  status : ToolCallStatus
+  output : Option V.ToolOutput
+  requestedAt : Nat
+  observedAt : Nat
+
+/-- Evidence accettata, content-addressed dal record tipato completo. -/
+structure R540EvidenceEvent
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  run : X.RunId
+  goal : X.GoalId
+  work : X.WorkItemId
+  claim : X.ClaimId
+  attempt : Nat
+  evidence : Evidence V X
+  acceptedAt : Nat
+
+/-- Disclosure prodotta da un effetto concreto. -/
+structure R540DisclosureEvent
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  run : X.RunId
+  goal : X.GoalId
+  work : X.WorkItemId
+  attempt : Nat
+  actor : V.PrincipalId
+  sink : DisclosureSink V
+  sources : List (InformationSource V X)
+  payload : V.EncryptedPayload
+  observedAt : Nat
+
+/-- Invocation LLM effettiva: input e output cifrati restano parte del record. -/
+structure R540ModelInvocationEvent
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  run : X.RunId
+  goal : X.GoalId
+  work : X.WorkItemId
+  attempt : Nat
+  principal : V.PrincipalId
+  context : ModelInvocationContext V X
+  projection : ModelExposureProjection V X
+  inputPayload : V.EncryptedPayload
+  outputPayload : V.EncryptedPayload
+  invokedAt : Nat
+
+/-- Interrogazione privata completa: question, answer e delta sono nello stesso record. -/
+structure R540InterrogationEvent
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  session : AgentInterrogationSession V
+  question : AgentInterrogationQuestion V
+  answer : AgentInterrogationAnswer V X
+  delta : AgentInterrogationCausalDelta V X
+  context : ModelInvocationContext V X
+  projection : ModelExposureProjection V X
+  observedAt : Nat
+
+/-- Trace unica della release/run. Tutti i registri sottostanti portano lo stesso traceId. -/
+structure R540ConcreteExecutionTrace
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  id : Nat
+  run : X.RunId
+  goal : X.GoalId
+  startTick : Nat
+  endTick : Nat
+  ordered : startTick ≤ endTick
+  workAttempts : List (R540WorkAttemptEvent V X)
+  workOutcomes : List (R540WorkOutcomeEvent V X)
+  blockerResolutions : List (R540BlockerResolutionEvent V X)
+  causalLinks : List (R540CausalLinkEvent V X)
+  toolEvents : List (R540ToolEvent V X)
+  evidenceEvents : List (R540EvidenceEvent V X)
+  disclosureEvents : List (R540DisclosureEvent V X)
+  modelInvocations : List (R540ModelInvocationEvent V X)
+  interrogations : List (R540InterrogationEvent V X)
+
+/-- Un evento appartiene temporalmente e nominalmente all'esatta trace. -/
+def R540EventWithinTrace
+    (traceId : Nat)
+    (run : X.RunId)
+    (goal : X.GoalId)
+    (tick : Nat)
+    (trace : R540ConcreteExecutionTrace V X) : Prop :=
+  traceId = trace.id ∧
+  run = trace.run ∧
+  goal = trace.goal ∧
+  trace.startTick ≤ tick ∧
+  tick ≤ trace.endTick
+
+/-- Il work attempt coincide con stato, lease, claimant e attempt runtime. -/
+def R540WorkAttemptEventExact
+    (certified : CertifiedCollaborativeRun V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540WorkAttemptEvent V X) : Prop :=
+  event ∈ trace.workAttempts ∧
+  R540EventWithinTrace event.traceId event.run event.goal event.tick trace ∧
+  LogicalClaimValidAt certified event.tick event.claim ∧
+  ∃ lease work,
+    certified.claimLeaseAt event.tick event.claim = some lease ∧
+    lease.claim = event.claim ∧
+    lease.work = event.work ∧
+    lease.attempt = event.attempt ∧
+    lease.claimant = event.actor ∧
+    (certified.run.semanticState event.tick).workItems event.work = some work ∧
+    work.run = event.run ∧
+    work.goal = event.goal ∧
+    work.owner = event.actor ∧
+    work.attempt = event.attempt
+
+
+/-- Esito terminale legato all'esatto WorkItem/claim/attempt. -/
+def R540WorkOutcomeEventExact
+    (certified : CertifiedCollaborativeRun V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540WorkOutcomeEvent V X) : Prop :=
+  event ∈ trace.workOutcomes ∧
+  R540EventWithinTrace
+    event.traceId event.run event.goal event.observedAt trace ∧
+  (event.status = WorkStatus.succeeded ∨
+   event.status = WorkStatus.failed ∨
+   event.status = WorkStatus.cancelled) ∧
+  (∃ workEvent,
+    R540WorkAttemptEventExact certified trace workEvent ∧
+    workEvent.work = event.work ∧
+    workEvent.claim = event.claim ∧
+    workEvent.attempt = event.attempt ∧
+    workEvent.run = event.run ∧
+    workEvent.goal = event.goal ∧
+    workEvent.tick ≤ event.observedAt) ∧
+  ∃ work,
+    (certified.run.semanticState event.observedAt).workItems event.work = some work ∧
+    work.run = event.run ∧
+    work.goal = event.goal ∧
+    work.attempt = event.attempt ∧
+    work.status = event.status
+
+/-- Il blocker terminale e la sua resolution appartengono alla stessa trace. -/
+def R540BlockerResolutionEventExact
+    (certified : CertifiedCollaborativeRun V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540BlockerResolutionEvent V X) : Prop :=
+  event ∈ trace.blockerResolutions ∧
+  R540EventWithinTrace
+    event.traceId event.run event.goal event.observedAt trace ∧
+  event.resolution.blocker = event.blocker ∧
+  event.resolution.observedAt = event.observedAt ∧
+  event.resolution ∈
+    (certified.run.semanticState event.observedAt).blockerResolutions ∧
+  ∃ blocker,
+    (certified.run.semanticState event.observedAt).blockers event.blocker =
+      some blocker ∧
+    blocker.run = event.run ∧
+    blocker.goal = event.goal ∧
+    BlockerTerminal blocker
+
+/-- Il link causale è osservato nella stessa run/goal e non è retrodatato. -/
+def R540CausalLinkEventExact
+    (certified : CertifiedCollaborativeRun V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540CausalLinkEvent V X) : Prop :=
+  event ∈ trace.causalLinks ∧
+  R540EventWithinTrace
+    event.traceId event.run event.goal event.recordedAt trace ∧
+  event.link.run = event.run ∧
+  event.link.goal = event.goal ∧
+  event.link.observedAt ≤ event.recordedAt ∧
+  event.link ∈ (certified.run.semanticState event.recordedAt).causalLinks ∧
+  certified.causalRank event.link.successor <
+    certified.causalRank event.link.predecessor
+
+/-- L'evento tool è legato a un attempt certificato e al record tool esatto. -/
+def R540ToolEventExact
+    (certified : CertifiedCollaborativeRun V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540ToolEvent V X) : Prop :=
+  event ∈ trace.toolEvents ∧
+  R540EventWithinTrace event.traceId event.run event.goal event.observedAt trace ∧
+  event.requestedAt ≤ event.observedAt ∧
+  (∃ workEvent,
+    R540WorkAttemptEventExact certified trace workEvent ∧
+    workEvent.run = event.run ∧
+    workEvent.goal = event.goal ∧
+    workEvent.work = event.work ∧
+    workEvent.claim = event.claim ∧
+    workEvent.attempt = event.attempt ∧
+    workEvent.actor = event.owner ∧
+    workEvent.tick = event.requestedAt) ∧
+  ∃ call,
+    (certified.run.semanticState event.observedAt).base.toolCalls event.callId = some call ∧
+    call.id = event.callId ∧
+    call.owner = event.owner ∧
+    call.tool = event.tool ∧
+    call.input = event.input ∧
+    call.attempt = event.attempt ∧
+    call.status = event.status ∧
+    call.output = event.output
+
+/-- L'evidence appartiene alla trace, è temporalmente causale e valida per il contratto. -/
+def R540EvidenceEventExact
+    (judge : SemanticEvidenceJudge V X)
+    (certified : CertifiedCollaborativeRun V X)
+    (contract : GoalContract V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540EvidenceEvent V X) : Prop :=
+  event ∈ trace.evidenceEvents ∧
+  R540EventWithinTrace
+    event.traceId event.run event.goal event.acceptedAt trace ∧
+  event.evidence.run = event.run ∧
+  event.evidence.observedAt ≤ event.acceptedAt ∧
+  event.evidence ∈ (certified.run.semanticState event.acceptedAt).evidences ∧
+  ContractEvidenceValid judge certified event.run contract event.evidence ∧
+  (∃ work,
+    (certified.run.semanticState event.acceptedAt).workItems event.work = some work ∧
+    work.run = event.run ∧
+    work.goal = event.goal ∧
+    work.attempt = event.attempt ∧
+    work.serves = event.evidence.obligation) ∧
+  ∃ workEvent,
+    R540WorkAttemptEventExact certified trace workEvent ∧
+    workEvent.work = event.work ∧
+    workEvent.claim = event.claim ∧
+    workEvent.attempt = event.attempt ∧
+    workEvent.run = event.run ∧
+    workEvent.goal = event.goal
+
+/-- Projection concreta dei payload osservati nei sink di disclosure. -/
+structure R540DisclosurePayloadProjection
+    (V : Vocabulary) where
+  payloadAt : Nat → DisclosureSink V → Option V.EncryptedPayload
+
+/-- Ledger esterno osservato dal refinement concreto, distinto dalla projection dichiarata. -/
+structure R540ActualDisclosureRuntime
+    (V : Vocabulary) where
+  payloadAt : Nat → DisclosureSink V → Option V.EncryptedPayload
+
+def R540DisclosureProjectionExact
+    (actual : R540ActualDisclosureRuntime V)
+    (projection : R540DisclosurePayloadProjection V) : Prop :=
+  actual.payloadAt = projection.payloadAt
+
+/-- L'effetto disclosure, le source e il payload coincidono con la projection concreta. -/
+def R540DisclosureEventExact
+    (secured : SecuredCollaborativeRun V X)
+    (payloads : R540DisclosurePayloadProjection V)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540DisclosureEvent V X) : Prop :=
+  event ∈ trace.disclosureEvents ∧
+  R540EventWithinTrace
+    event.traceId event.run event.goal event.observedAt trace ∧
+  payloads.payloadAt event.observedAt event.sink = some event.payload ∧
+  ∃ effect,
+    secured.securityEffectAt event.observedAt = some effect ∧
+    effect.run = event.run ∧
+    effect.actor = event.actor ∧
+    effect.work = event.work ∧
+    effect.contextSources = event.sources ∧
+    effect.disclosure = some event.sink
+
+/-- Projection adapter content-exact dell'effettiva invocation LLM. -/
+structure R540ModelRuntimeProjection
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  inputAt : Nat → Option V.EncryptedPayload
+  outputAt : Nat → Option V.EncryptedPayload
+  principalAt : Nat → Option V.PrincipalId
+  contextAt : Nat → Option (ModelInvocationContext V X)
+
+/-- Runtime provider osservato dall'adapter concreto, non una projection autocertificata. -/
+structure R540ActualModelRuntime
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  inputAt : Nat → Option V.EncryptedPayload
+  outputAt : Nat → Option V.EncryptedPayload
+  principalAt : Nat → Option V.PrincipalId
+  contextAt : Nat → Option (ModelInvocationContext V X)
+
+def R540ModelRuntimeProjectionExact
+    (actual : R540ActualModelRuntime V X)
+    (projection : R540ModelRuntimeProjection V X) : Prop :=
+  actual.inputAt = projection.inputAt ∧
+  actual.outputAt = projection.outputAt ∧
+  actual.principalAt = projection.principalAt ∧
+  actual.contextAt = projection.contextAt
+
+/-- Il certificato state-grounded è legato agli esatti byte cifrati della invocation. -/
+def R540ModelInvocationEventExact
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (runtime : R540ModelRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540ModelInvocationEvent V X) : Prop :=
+  event ∈ trace.modelInvocations ∧
+  R540EventWithinTrace
+    event.traceId event.run event.goal event.invokedAt trace ∧
+  runtime.inputAt event.invokedAt = some event.inputPayload ∧
+  runtime.outputAt event.invokedAt = some event.outputPayload ∧
+  runtime.principalAt event.invokedAt = some event.principal ∧
+  runtime.contextAt event.invokedAt = some event.context ∧
+  StateGroundedModelInvocationCertificate
+    authorization secured event.invokedAt event.principal
+    event.context event.projection ∧
+  ∃ workEvent,
+    R540WorkAttemptEventExact secured.certified trace workEvent ∧
+    workEvent.work = event.work ∧
+    workEvent.attempt = event.attempt ∧
+    workEvent.run = event.run ∧
+    workEvent.goal = event.goal
+
+/-- Projection product-side dell'interrogazione realmente persistita. -/
+structure R540InterrogationRuntimeProjection
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  sessionAt : Nat → Option (AgentInterrogationSession V)
+  questionAt : Nat → Option (AgentInterrogationQuestion V)
+  answerAt : Nat → Option (AgentInterrogationAnswer V X)
+  deltaAt : Nat → Option (AgentInterrogationCausalDelta V X)
+
+structure R540ActualInterrogationRuntime
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  sessionAt : Nat → Option (AgentInterrogationSession V)
+  questionAt : Nat → Option (AgentInterrogationQuestion V)
+  answerAt : Nat → Option (AgentInterrogationAnswer V X)
+  deltaAt : Nat → Option (AgentInterrogationCausalDelta V X)
+
+def R540InterrogationRuntimeProjectionExact
+    (actual : R540ActualInterrogationRuntime V X)
+    (projection : R540InterrogationRuntimeProjection V X) : Prop :=
+  actual.sessionAt = projection.sessionAt ∧
+  actual.questionAt = projection.questionAt ∧
+  actual.answerAt = projection.answerAt ∧
+  actual.deltaAt = projection.deltaAt
+
+/-- Interrogazione content-exact e read-only sullo stesso record/trace. -/
+def R540InterrogationEventExact
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (runtime : R540InterrogationRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540InterrogationEvent V X) : Prop :=
+  event ∈ trace.interrogations ∧
+  event.traceId = trace.id ∧
+  runtime.sessionAt event.observedAt = some event.session ∧
+  runtime.questionAt event.observedAt = some event.question ∧
+  runtime.answerAt event.observedAt = some event.answer ∧
+  runtime.deltaAt event.observedAt = some event.delta ∧
+  trace.startTick ≤ event.observedAt ∧
+  event.observedAt ≤ trace.endTick ∧
+  event.question.sessionId = event.session.id ∧
+  event.answer.sessionId = event.session.id ∧
+  event.question.askedAt ≤ event.answer.answeredAt ∧
+  StateGroundedStrongInterrogationCertificate
+    authorization secured event.observedAt event.session event.answer
+    event.delta event.context event.projection
+
+/-- Chiusura esatta di tutti gli eventi presenti nella trace. -/
+structure R540ConcreteTraceCertificate
+    (judge : SemanticEvidenceJudge V X)
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (contract : GoalContract V X)
+    (runtime : R540ModelRuntimeProjection V X)
+    (payloads : R540DisclosurePayloadProjection V)
+    (interrogationRuntime : R540InterrogationRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X) : Prop where
+  traceGoalAtStart :
+    (secured.certified.run.semanticState trace.startTick).runGoal trace.run =
+      some trace.goal
+  nonemptyCore : trace.workAttempts ≠ []
+  everyWorkExact :
+    ∀ event, event ∈ trace.workAttempts →
+      R540WorkAttemptEventExact secured.certified trace event
+  everyOutcomeExact :
+    ∀ event, event ∈ trace.workOutcomes →
+      R540WorkOutcomeEventExact secured.certified trace event
+  everyBlockerResolutionExact :
+    ∀ event, event ∈ trace.blockerResolutions →
+      R540BlockerResolutionEventExact secured.certified trace event
+  everyCausalLinkExact :
+    ∀ event, event ∈ trace.causalLinks →
+      R540CausalLinkEventExact secured.certified trace event
+  causalHistoryAppendOnly :
+    ∀ link,
+      link ∈ (secured.certified.run.semanticState trace.startTick).causalLinks →
+      link ∈ (secured.certified.run.semanticState trace.endTick).causalLinks
+  everyToolExact :
+    ∀ event, event ∈ trace.toolEvents →
+      R540ToolEventExact secured.certified trace event
+  everyEvidenceExact :
+    ∀ event, event ∈ trace.evidenceEvents →
+      R540EvidenceEventExact judge secured.certified contract trace event
+  everyDisclosureExact :
+    ∀ event, event ∈ trace.disclosureEvents →
+      R540DisclosureEventExact secured payloads trace event
+  everyInvocationExact :
+    ∀ event, event ∈ trace.modelInvocations →
+      R540ModelInvocationEventExact authorization secured runtime trace event
+  everyInterrogationExact :
+    ∀ event, event ∈ trace.interrogations →
+      R540InterrogationEventExact
+        authorization secured interrogationRuntime trace event
+
+/-- Un record esatto non può essere riutilizzato sotto un traceId differente. -/
+theorem r540_work_event_trace_id_unique
+    (certified : CertifiedCollaborativeRun V X)
+    (left right : R540ConcreteExecutionTrace V X)
+    (event : R540WorkAttemptEvent V X)
+    (leftExact : R540WorkAttemptEventExact certified left event)
+    (rightExact : R540WorkAttemptEventExact certified right event) :
+    left.id = right.id := by
+  have hLeft : event.traceId = left.id := leftExact.2.1.1
+  have hRight : event.traceId = right.id := rightExact.2.1.1
+  exact hLeft.symm.trans hRight
+
+/-- Nessuna sostituzione cross-trace è possibile quando gli ID sono distinti. -/
+theorem r540_distinct_traces_cannot_share_exact_work_event
+    (certified : CertifiedCollaborativeRun V X)
+    (left right : R540ConcreteExecutionTrace V X)
+    (event : R540WorkAttemptEvent V X)
+    (different : left.id ≠ right.id)
+    (leftExact : R540WorkAttemptEventExact certified left event) :
+    ¬ R540WorkAttemptEventExact certified right event := by
+  intro rightExact
+  exact different (r540_work_event_trace_id_unique certified left right event leftExact rightExact)
+
+/-- Ogni invocation concreta certificata esclude memoria persistente occulta. -/
+theorem r540_exact_model_invocation_has_no_hidden_memory
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (runtime : R540ModelRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540ModelInvocationEvent V X)
+    (exact : R540ModelInvocationEventExact
+      authorization secured runtime trace event) :
+    ¬ event.projection.hiddenPersistentModelMemoryAvailable := by
+  rcases exact with
+    ⟨_, _, _, _, _, _, invocationSafe, _⟩
+  exact invocationSafe.exposureExact.2
+
+/-- Anche una invocation content-exact non può essere ricertificata sotto una trace distinta. -/
+theorem r540_model_event_trace_id_unique
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (runtime : R540ModelRuntimeProjection V X)
+    (left right : R540ConcreteExecutionTrace V X)
+    (event : R540ModelInvocationEvent V X)
+    (leftExact : R540ModelInvocationEventExact
+      authorization secured runtime left event)
+    (rightExact : R540ModelInvocationEventExact
+      authorization secured runtime right event) :
+    left.id = right.id := by
+  have hLeft : event.traceId = left.id := leftExact.2.1.1
+  have hRight : event.traceId = right.id := rightExact.2.1.1
+  exact hLeft.symm.trans hRight
+
+/-- Qualunque evento con binding nominale esatto determina un solo traceId. -/
+theorem r540_event_binding_trace_id_unique
+    (left right : R540ConcreteExecutionTrace V X)
+    (traceId : Nat)
+    (run : X.RunId)
+    (goal : X.GoalId)
+    (tick : Nat)
+    (leftBound : R540EventWithinTrace traceId run goal tick left)
+    (rightBound : R540EventWithinTrace traceId run goal tick right) :
+    left.id = right.id := by
+  exact leftBound.1.symm.trans rightBound.1
+
+/-- Controesempio cross-trace: due trace distinte non possono certificare lo stesso binding. -/
+theorem r540_distinct_traces_reject_same_event_binding
+    (left right : R540ConcreteExecutionTrace V X)
+    (traceId : Nat)
+    (run : X.RunId)
+    (goal : X.GoalId)
+    (tick : Nat)
+    (different : left.id ≠ right.id)
+    (leftBound : R540EventWithinTrace traceId run goal tick left) :
+    ¬ R540EventWithinTrace traceId run goal tick right := by
+  intro rightBound
+  exact different
+    (r540_event_binding_trace_id_unique
+      left right traceId run goal tick leftBound rightBound)
+
+/-! ### R5.41 — Semantic hardening, non-vacuità e root certificate finale -/
+
+/-- Modalità esplicita di una superficie opzionale del prodotto. -/
+inductive R541SurfaceMode where
+  | enabled
+  | disabledFailClosed
+  deriving DecidableEq, Repr
+
+/-- Una superficie vuota è accettabile soltanto se dichiarata fail-closed. -/
+structure R541SurfaceGate (α : Type u) where
+  mode : R541SurfaceMode
+  records : List α
+  enabledNonempty : mode = R541SurfaceMode.enabled → records ≠ []
+  disabledEmpty : mode = R541SurfaceMode.disabledFailClosed → records = []
+
+/-- Nessun claim enabled può essere soddisfatto da una lista vuota. -/
+theorem r541_enabled_surface_is_nonempty
+    {α : Type u}
+    (gate : R541SurfaceGate α)
+    (enabled : gate.mode = R541SurfaceMode.enabled) :
+    gate.records ≠ [] := by
+  exact gate.enabledNonempty enabled
+
+/-! #### R5.41A — Exactness prompt→requirement→WorkSpec→action -/
+
+/--
+Chiusura bidirezionale: ogni azione compilata deriva da un requirement e ogni
+binding punta a oggetti reali. Questo rafforza, senza sostituirlo, il predicato
+`PromptRequirementsAndWorkExact` precedente.
+-/
+structure R541PromptRequirementsAndWorkExactCertificate
+    (compiler : StructuredLocalContractCompiler V X)
+    (prompt : V.SystemPrompt)
+    (contract : GoalContract V X) : Prop where
+  baseExact : PromptRequirementsAndWorkExact compiler prompt contract
+  uniqueRequirementIds :
+    ∀ left right,
+      left ∈ compiler.extractRequirements prompt →
+      right ∈ compiler.extractRequirements prompt →
+      left.id = right.id →
+      left = right
+  uniqueBindings :
+    ∀ left right,
+      left ∈ compiler.bindings prompt →
+      right ∈ compiler.bindings prompt →
+      left.requirementId = right.requirementId →
+      left.obligation = right.obligation →
+      left.workSpecId = right.workSpecId →
+      left = right
+  everyBindingResolved :
+    ∀ link,
+      link ∈ compiler.bindings prompt →
+      ∃ requirement obligationSpec workSpec,
+        requirement ∈ compiler.extractRequirements prompt ∧
+        requirement.id = link.requirementId ∧
+        obligationSpec ∈ contract.obligations ∧
+        obligationSpec.id = link.obligation ∧
+        workSpec ∈ contract.workSpecs ∧
+        workSpec.id = link.workSpecId ∧
+        workSpec.obligation = link.obligation
+  actionsBidirectionallyExact :
+    ∀ workSpec actionClass,
+      workSpec ∈ contract.workSpecs →
+      (actionClass ∈ workSpec.allowedActions ↔
+        ∃ requirement link,
+          requirement ∈ compiler.extractRequirements prompt ∧
+          link ∈ compiler.bindings prompt ∧
+          link.requirementId = requirement.id ∧
+          link.workSpecId = workSpec.id ∧
+          actionClass ∈ requirement.requiredActions)
+
+/-- Un'azione compilata non può essere introdotta senza requirement sorgente. -/
+theorem r541_compiled_action_has_exact_requirement
+    (compiler : StructuredLocalContractCompiler V X)
+    (prompt : V.SystemPrompt)
+    (contract : GoalContract V X)
+    (certificate : R541PromptRequirementsAndWorkExactCertificate
+      compiler prompt contract)
+    (workSpec : ContractWorkSpec V X)
+    (actionClass : AgentActionClass)
+    (workKnown : workSpec ∈ contract.workSpecs)
+    (allowed : actionClass ∈ workSpec.allowedActions) :
+    ∃ requirement link,
+      requirement ∈ compiler.extractRequirements prompt ∧
+      link ∈ compiler.bindings prompt ∧
+      link.requirementId = requirement.id ∧
+      link.workSpecId = workSpec.id ∧
+      actionClass ∈ requirement.requiredActions := by
+  exact (certificate.actionsBidirectionallyExact workSpec actionClass workKnown).1 allowed
+
+/-- Ogni azione concreta non-noop possiede una classe nel linguaggio chiuso. -/
+theorem r541_non_noop_action_has_class
+    (action : AgentAction V)
+    (nonNoOp : action ≠ AgentAction.noOp) :
+    ∃ actionClass, ActionHasClass action actionClass := by
+  cases action with
+  | createTask _ => exact ⟨AgentActionClass.createTask, trivial⟩
+  | replaceOwnTask _ _ => exact ⟨AgentActionClass.replaceOwnTask, trivial⟩
+  | deleteOwnTask _ => exact ⟨AgentActionClass.deleteOwnTask, trivial⟩
+  | assignOwnTask _ _ => exact ⟨AgentActionClass.assignOwnTask, trivial⟩
+  | unassignOwnTask _ _ => exact ⟨AgentActionClass.unassignOwnTask, trivial⟩
+  | markAssignedDone _ => exact ⟨AgentActionClass.markAssignedDone, trivial⟩
+  | appendAssignedNote _ _ =>
+      exact ⟨AgentActionClass.appendAssignedNote, trivial⟩
+  | addAssignedAttachment _ _ =>
+      exact ⟨AgentActionClass.addAssignedAttachment, trivial⟩
+  | postComment _ => exact ⟨AgentActionClass.postComment, trivial⟩
+  | invokeTool _ _ _ => exact ⟨AgentActionClass.invokeTool, trivial⟩
+  | retryTool _ => exact ⟨AgentActionClass.retryTool, trivial⟩
+  | noOp => exact False.elim (nonNoOp rfl)
+
+/-- La classificazione delle azioni concrete è funzionale. -/
+theorem r541_action_class_is_functional
+    (action : AgentAction V)
+    (left right : AgentActionClass)
+    (leftClass : ActionHasClass action left)
+    (rightClass : ActionHasClass action right) :
+    left = right := by
+  cases action <;> cases left <;> cases right <;>
+    simp [ActionHasClass] at leftClass rightClass ⊢
+
+/-! #### R5.41B — Compatibilità WorkSpec↔security policy -/
+
+/-- Policy product-side coerente con tutte le azioni ammesse dalla WorkSpec. -/
+def R541WorkSpecSecurityPolicyCompatible
+    (workSpec : ContractWorkSpec V X)
+    (policy : ContractWorkSecurityPolicy V) : Prop :=
+  policy.workSpecId = workSpec.id ∧
+  (∀ action,
+    ContractWorkSpecAllowsAgentAction workSpec action →
+    ∀ effect,
+      effect ∈ AgentActionCoreSecurityFootprint action →
+      effect.operation ∈ policy.allowedOperations) ∧
+  (∀ tool input retryPolicy,
+    ContractWorkSpecAllowsAgentAction
+      workSpec (AgentAction.invokeTool tool input retryPolicy) →
+    tool ∈ policy.allowedTools)
+
+/-- Ogni WorkSpec possiede esattamente una policy compatibile. -/
+structure R541ContractSecurityPolicyCertificate
+    (contract : GoalContract V X)
+    (policies : List (ContractWorkSecurityPolicy V)) : Prop where
+  everyWorkSpecHasExactPolicy :
+    ∀ workSpec,
+      workSpec ∈ contract.workSpecs →
+      ∃ policy,
+        policy ∈ policies ∧
+        R541WorkSpecSecurityPolicyCompatible workSpec policy ∧
+        ∀ other,
+          other ∈ policies →
+          other.workSpecId = workSpec.id →
+          other = policy
+  noOrphanPolicy :
+    ∀ policy,
+      policy ∈ policies →
+      ∃ workSpec,
+        workSpec ∈ contract.workSpecs ∧
+        workSpec.id = policy.workSpecId
+
+/-- Il footprint core di un'azione consentita è contenuto nella policy esatta. -/
+theorem r541_allowed_action_core_footprint_is_policy_bounded
+    (workSpec : ContractWorkSpec V X)
+    (policy : ContractWorkSecurityPolicy V)
+    (compatible : R541WorkSpecSecurityPolicyCompatible workSpec policy)
+    (action : AgentAction V)
+    (allowed : ContractWorkSpecAllowsAgentAction workSpec action)
+    (effect : ResourceSecurityEffect V)
+    (effectIn : effect ∈ AgentActionCoreSecurityFootprint action) :
+    effect.operation ∈ policy.allowedOperations := by
+  exact compatible.2.1 action allowed effect effectIn
+
+/-! #### R5.41C — Creazione/revisione e frame conditions di authority -/
+
+/-- Creazione e activation non concedono permission o tool permission. -/
+def R541AuthorityProjectionUnchanged
+    (before after : State V) : Prop :=
+  before.permissions = after.permissions ∧
+  before.toolPermission = after.toolPermission
+
+structure R541LocalRevisionRecord
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  envelope : LocalGoalCompilationEnvelope V
+  draft : LocalPromptGoalRevisionDraft V X
+  approval : ControllerFinalPromptApproval V
+
+structure R541AgentCreationRecord
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  envelope : LocalGoalCompilationEnvelope V
+  proposal : AgentCreationProposal V X
+  approval : ControllerFinalPromptApproval V
+  before : State V
+  after : State V
+
+structure R541ResponsibilityRecord (V : Vocabulary) where
+  traceId : Nat
+  envelope : ResponsibilityCompilationEnvelope V
+  responsibility : ResponsibilityContract V
+
+structure R541GlobalSynthesisRecord
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  envelope : StructuredGlobalSynthesisEnvelope V
+  candidate : GlobalContractCandidate V X
+  groundings : List (StructuredGlobalWorkGrounding V)
+
+structure R541ProxyPlanRecord (V : Vocabulary) where
+  traceId : Nat
+  proxy : UserProxyAgent V
+  thread : UserProxyChatThread V
+  request : UserProxyRequest V
+  envelope : UserProxyPlanningEnvelope V
+  plan : UserProxyActionPlan V
+  confirmation : Option (UserProxyOutOfResponsibilityConfirmation V)
+
+structure R541CrossOwnerRecord (V : Vocabulary) where
+  traceId : Nat
+  request : CrossOwnerTaskAssignmentRequest V
+
+structure R541CommentRecord
+    (V : Vocabulary)
+    (X : ExtensionVocabulary V) where
+  traceId : Nat
+  run : X.RunId
+  goal : X.GoalId
+  tick : Nat
+  comment : Comment V
+
+structure R541TaskIntentRecord (V : Vocabulary) where
+  traceId : Nat
+  envelope : TaskIntentDerivationEnvelope V
+  intent : PersistedTaskIntent V
+
+structure R541TaskProvenanceRecord (V : Vocabulary) where
+  traceId : Nat
+  provenance : TaskObligationProvenance V
+
+/-- Frame completo della creazione iniziale concreta. -/
+structure R541AgentCreationFrameCertificate
+    (authorization : ProductAuthorizationProjection V)
+    (structuredCompiler : StructuredLocalContractCompiler V X)
+    (classifier : LocalGoalClassifier V X)
+    (responsibilities : ResponsibilityDirectory V)
+    (exceptions : List (ApprovedLocalGoalException V X))
+    (globalAssignments : List (GlobalMandateAssignment V X))
+    (administratorCreationApprovals :
+      List (ApprovedAdministratorAgentCreation V X))
+    (record : R541AgentCreationRecord V X) : Prop where
+  operational :
+    OperationalAgentCreationActivationCertificate
+      authorization structuredCompiler classifier record.envelope record.before
+      responsibilities exceptions globalAssignments
+      administratorCreationApprovals record.proposal record.approval
+  traceBound : record.traceId ≠ 0
+  principalAbsentBefore :
+    record.before.principals record.proposal.proposedAgent = none
+  principalActiveAfter :
+    record.after.principals record.proposal.proposedAgent =
+      some PrincipalKind.agent
+  exactPromptAfter :
+    record.after.systemPrompts record.proposal.proposedAgent =
+      some record.proposal.prompt
+  noAuthorityGrant : R541AuthorityProjectionUnchanged record.before record.after
+
+/-- La creazione certificata non amplia permission né tool permission. -/
+theorem r541_agent_creation_does_not_grant_authority
+    (authorization : ProductAuthorizationProjection V)
+    (structuredCompiler : StructuredLocalContractCompiler V X)
+    (classifier : LocalGoalClassifier V X)
+    (responsibilities : ResponsibilityDirectory V)
+    (exceptions : List (ApprovedLocalGoalException V X))
+    (globalAssignments : List (GlobalMandateAssignment V X))
+    (administratorCreationApprovals :
+      List (ApprovedAdministratorAgentCreation V X))
+    (record : R541AgentCreationRecord V X)
+    (certificate : R541AgentCreationFrameCertificate
+      authorization structuredCompiler classifier responsibilities exceptions
+      globalAssignments administratorCreationApprovals record) :
+    R541AuthorityProjectionUnchanged record.before record.after := by
+  exact certificate.noAuthorityGrant
+
+/-! #### R5.41D — Chiusure operative per tutti i record dichiarati -/
+
+structure R541GovernanceOperationalClosureCertificate
+    (authorization : ProductAuthorizationProjection V)
+    (structuredCompiler : StructuredLocalContractCompiler V X)
+    (classifier : LocalGoalClassifier V X)
+    (responsibilityCompiler : ResponsibilityCompiler V)
+    (s : State V)
+    (responsibilities : ResponsibilityDirectory V)
+    (exceptions : List (ApprovedLocalGoalException V X))
+    (globalAssignments : List (GlobalMandateAssignment V X))
+    (administratorCreationApprovals :
+      List (ApprovedAdministratorAgentCreation V X))
+    (locals : LocalGoalDirectory V X)
+    (localRevisions : List (R541LocalRevisionRecord V X))
+    (creations : List (R541AgentCreationRecord V X))
+    (responsibilityRecords : List (R541ResponsibilityRecord V))
+    (globalRecords : List (R541GlobalSynthesisRecord V X)) : Prop where
+  everyLocalRevisionCertified :
+    ∀ record,
+      record ∈ localRevisions →
+      OperationalLocalRevisionActivationCertificate
+        structuredCompiler classifier record.envelope s responsibilities
+        exceptions globalAssignments record.draft record.approval
+  everyCreationCertified :
+    ∀ record,
+      record ∈ creations →
+      R541AgentCreationFrameCertificate
+        authorization structuredCompiler classifier responsibilities exceptions
+        globalAssignments administratorCreationApprovals record
+  everyResponsibilityCertified :
+    ∀ record,
+      record ∈ responsibilityRecords →
+      OperationalResponsibilityActivationCertificate
+        authorization responsibilityCompiler s record.envelope
+        record.responsibility
+  everyGlobalSynthesisCertified :
+    ∀ record,
+      record ∈ globalRecords →
+      StructuredGlobalSynthesisCertificate
+        s responsibilities exceptions locals record.envelope
+        record.candidate record.groundings
+
+/-- TaskIntent e provenance sono validi, completi e legati alla trace. -/
+structure R541TaskOperationalSurfaceCertificate
+    (s : SemanticState V X)
+    (locals : LocalGoalDirectory V X)
+    (operational : SemanticOperationalState V X)
+    (intentGate : R541SurfaceGate (R541TaskIntentRecord V))
+    (provenanceGate : R541SurfaceGate (R541TaskProvenanceRecord V)) : Prop where
+  everyIntentValid :
+    ∀ record,
+      record ∈ intentGate.records →
+      PersistedTaskIntentWithinEnvelope s.base record.envelope record.intent
+  everyProvenanceValid :
+    ∀ record,
+      record ∈ provenanceGate.records →
+      TaskObligationProvenanceValid s locals record.provenance
+  everyOperationalIntentRepresented :
+    ∀ intent,
+      intent ∈ operational.taskIntents ↔
+      ∃ record,
+        record ∈ intentGate.records ∧
+        record.intent = intent
+  everyOperationalProvenanceRepresented :
+    ∀ provenance,
+      provenance ∈ operational.taskObligationProvenance ↔
+      ∃ record,
+        record ∈ provenanceGate.records ∧
+        record.provenance = provenance
+
+/-- Commenti presenti nella trace sono ammissibili e la history è append-only. -/
+structure R541CommentSurfaceCertificate
+    (secured : SecuredCollaborativeRun V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (gate : R541SurfaceGate (R541CommentRecord V X)) : Prop where
+  everyCommentExact :
+    ∀ record,
+      record ∈ gate.records →
+      R540EventWithinTrace
+        record.traceId record.run record.goal record.tick trace ∧
+      record.comment ∈
+        (secured.certified.run.semanticState record.tick).base.comments ∧
+      CommentAdmissible
+        (secured.certified.run.semanticState record.tick).base record.comment
+  commentsAppendOnly :
+    ∀ comment,
+      comment ∈
+        (secured.certified.run.semanticState trace.startTick).base.comments →
+      comment ∈
+        (secured.certified.run.semanticState trace.endTick).base.comments
+
+structure R541ProxySurfaceCertificate
+    (authorization : ProductAuthorizationProjection V)
+    (toolSecurity : ToolSecuritySemantics V)
+    (responsibilityClassifier : UserProxyResponsibilityFootprintClassifier V)
+    (responsibilities : ResponsibilityDirectory V)
+    (s : State V)
+    (gate : R541SurfaceGate (R541ProxyPlanRecord V)) : Prop where
+  everyPlanCertified :
+    ∀ record,
+      record ∈ gate.records →
+      UserProxyPlanExecutionCertificate
+        authorization toolSecurity responsibilityClassifier responsibilities s
+        record.proxy record.thread record.request record.envelope record.plan
+        record.confirmation
+
+structure R541GlobalSurfaceCertificate
+    (s : State V)
+    (responsibilities : ResponsibilityDirectory V)
+    (exceptions : List (ApprovedLocalGoalException V X))
+    (locals : LocalGoalDirectory V X)
+    (gate : R541SurfaceGate (R541GlobalSynthesisRecord V X)) : Prop where
+  everyGlobalRecordCertified :
+    ∀ record,
+      record ∈ gate.records →
+      StructuredGlobalSynthesisCertificate
+        s responsibilities exceptions locals record.envelope
+        record.candidate record.groundings
+
+structure R541InterrogationSurfaceCertificate
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (runtime : R540InterrogationRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (gate : R541SurfaceGate (R540InterrogationEvent V X)) : Prop where
+  gateMatchesTrace : gate.records = trace.interrogations
+  everyInterrogationCertified :
+    ∀ record,
+      record ∈ gate.records →
+      R540InterrogationEventExact authorization secured runtime trace record
+
+structure R541ModelSurfaceCertificate
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (runtime : R540ModelRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (gate : R541SurfaceGate (R540ModelInvocationEvent V X)) : Prop where
+  gateMatchesTrace : gate.records = trace.modelInvocations
+  everyInvocationCertified :
+    ∀ record,
+      record ∈ gate.records →
+      R540ModelInvocationEventExact authorization secured runtime trace record
+
+/-! #### R5.41E — Gate espliciti, cross-owner e inventario della trace -/
+
+/-- I registri opzionali coincidono esattamente con i registri della trace. -/
+structure R541TraceFeatureGateCertificate
+    (trace : R540ConcreteExecutionTrace V X)
+    (outcomeGate : R541SurfaceGate (R540WorkOutcomeEvent V X))
+    (blockerGate : R541SurfaceGate (R540BlockerResolutionEvent V X))
+    (causalGate : R541SurfaceGate (R540CausalLinkEvent V X))
+    (toolGate : R541SurfaceGate (R540ToolEvent V X))
+    (evidenceGate : R541SurfaceGate (R540EvidenceEvent V X))
+    (disclosureGate : R541SurfaceGate (R540DisclosureEvent V X)) : Prop where
+  outcomesExact : outcomeGate.records = trace.workOutcomes
+  blockersExact : blockerGate.records = trace.blockerResolutions
+  causalExact : causalGate.records = trace.causalLinks
+  toolsExact : toolGate.records = trace.toolEvents
+  evidencesExact : evidenceGate.records = trace.evidenceEvents
+  disclosuresExact : disclosureGate.records = trace.disclosureEvents
+
+/-- Tutte le richieste cross-owner dichiarate sono instradate da uno dei soli tre rami. -/
+structure R541CrossOwnerSurfaceCertificate
+    (authorization : ProductAuthorizationProjection V)
+    (obligationMeaning : TaskObligationClassificationSemantics V X)
+    (obligationClassifier : TaskObligationClassifier V X)
+    (taskMeaning : TaskResponsibilityClassificationSemantics V)
+    (taskClassifier : TaskResponsibilityClassifier V)
+    (responsibilities : ResponsibilityDirectory V)
+    (s : SemanticState V X)
+    (agents : GovernedAgentDirectory V)
+    (locals : LocalGoalDirectory V X)
+    (gate : R541SurfaceGate (R541CrossOwnerRecord V)) : Prop where
+  everyRequestRouted :
+    ∀ record,
+      record ∈ gate.records →
+      Nonempty
+        (CrossOwnerTaskAssignmentRoutingCertificate
+          authorization obligationMeaning obligationClassifier
+          taskMeaning taskClassifier responsibilities s agents locals record.request)
+
+/-! #### R5.41F — Assumptions esterne separate dalle guarantees interne -/
+
+/--
+Assunzioni non dimostrate dal kernel: progress esterno e fedeltà dei boundary
+endpoint/provider. Non concedono permission e non sostituiscono i certificate.
+-/
+structure R541ExternalReleaseAssumptions
+    (secured : SecuredCollaborativeRun V X)
+    (goal : X.GoalId)
+    (start : Nat)
+    (promptMeaning : PromptContractSemantics V X)
+    (requirementMeaning : PromptRequirementSemantics V)
+    (structuredCompiler : StructuredLocalContractCompiler V X)
+    (prompt : V.SystemPrompt)
+    (judge : SemanticEvidenceJudge V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (actualModel : R540ActualModelRuntime V X)
+    (runtime : R540ModelRuntimeProjection V X)
+    (actualDisclosure : R540ActualDisclosureRuntime V)
+    (payloads : R540DisclosurePayloadProjection V)
+    (actualInterrogation : R540ActualInterrogationRuntime V X)
+    (interrogationRuntime : R540InterrogationRuntimeProjection V X) : Prop where
+  completionBoundary :
+    MinimalContractSuccessExternalAssumptions secured.certified.run goal start
+  promptContractFaithful :
+    PromptContractAdequacy
+      promptMeaning structuredCompiler.contractCompiler prompt
+  requirementsFaithful :
+    requirementMeaning.faithful
+      prompt (structuredCompiler.extractRequirements prompt)
+  modelProjectionExact : R540ModelRuntimeProjectionExact actualModel runtime
+  disclosureProjectionExact :
+    R540DisclosureProjectionExact actualDisclosure payloads
+  interrogationProjectionExact :
+    R540InterrogationRuntimeProjectionExact
+      actualInterrogation interrogationRuntime
+  externalEvidenceAuthentic :
+    ∀ event,
+      event ∈ trace.evidenceEvents →
+      (event.evidence.kind = EvidenceKind.externalOutcome ∨
+       event.evidence.kind = EvidenceKind.derivedFact) →
+      judge.adequate
+        (structuredCompiler.contractCompiler.compile prompt)
+        secured.certified.run event.evidence
+
+/--
+Root certificate: ogni certificate locale usa lo stesso contract, run, trace e
+inventario. Le superfici opzionali sono enabled/nonempty oppure fail-closed/empty.
+-/
+structure R541FormalReleaseCertificate
+    (measure : ProgressMeasure V X)
+    (policy : AgingSchedulerPolicy)
+    (judge : SemanticEvidenceJudge V X)
+    (authorization : ProductAuthorizationProjection V)
+    (structuredCompiler : StructuredLocalContractCompiler V X)
+    (classifier : LocalGoalClassifier V X)
+    (responsibilityCompiler : ResponsibilityCompiler V)
+    (responsibilityMeaning : ResponsibilityTextSemantics V)
+    (promptMeaning : PromptContractSemantics V X)
+    (classificationMeaning : LocalGoalClassificationSemantics V X)
+    (globalMeaning : GlobalSynthesisSemantics V X)
+    (secured : SecuredCollaborativeRun V X)
+    (governed : ResponsibilityGovernedRun V X)
+    (runId : X.RunId)
+    (prompt : V.SystemPrompt)
+    (start : Nat)
+    (responsibilities : ResponsibilityDirectory V)
+    (exceptions : List (ApprovedLocalGoalException V X))
+    (globalAssignments : List (GlobalMandateAssignment V X))
+    (administratorCreationApprovals :
+      List (ApprovedAdministratorAgentCreation V X))
+    (locals : LocalGoalDirectory V X)
+    (agents : GovernedAgentDirectory V)
+    (runtime : R540ModelRuntimeProjection V X)
+    (payloads : R540DisclosurePayloadProjection V)
+    (interrogationRuntime : R540InterrogationRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (policies : List (ContractWorkSecurityPolicy V))
+    (localRevisions : List (R541LocalRevisionRecord V X))
+    (creations : List (R541AgentCreationRecord V X))
+    (responsibilityRecords : List (R541ResponsibilityRecord V))
+    (globalRecords : List (R541GlobalSynthesisRecord V X))
+    (commentGate : R541SurfaceGate (R541CommentRecord V X))
+    (proxyGate : R541SurfaceGate (R541ProxyPlanRecord V))
+    (globalGate : R541SurfaceGate (R541GlobalSynthesisRecord V X))
+    (crossOwnerGate : R541SurfaceGate (R541CrossOwnerRecord V))
+    (outcomeGate : R541SurfaceGate (R540WorkOutcomeEvent V X))
+    (blockerGate : R541SurfaceGate (R540BlockerResolutionEvent V X))
+    (causalGate : R541SurfaceGate (R540CausalLinkEvent V X))
+    (toolGate : R541SurfaceGate (R540ToolEvent V X))
+    (evidenceGate : R541SurfaceGate (R540EvidenceEvent V X))
+    (disclosureGate : R541SurfaceGate (R540DisclosureEvent V X))
+    (interrogationGate : R541SurfaceGate (R540InterrogationEvent V X))
+    (modelGate : R541SurfaceGate (R540ModelInvocationEvent V X))
+    (taskIntentGate : R541SurfaceGate (R541TaskIntentRecord V))
+    (taskProvenanceGate : R541SurfaceGate (R541TaskProvenanceRecord V))
+    (toolSecurity : ToolSecuritySemantics V)
+    (proxyClassifier : UserProxyResponsibilityFootprintClassifier V)
+    (obligationMeaning : TaskObligationClassificationSemantics V X)
+    (obligationClassifier : TaskObligationClassifier V X)
+    (taskMeaning : TaskResponsibilityClassificationSemantics V)
+    (taskClassifier : TaskResponsibilityClassifier V)
+    (operationalBefore operationalAfter : SemanticOperationalState V X)
+    (proxyDirectory : UserProxyDirectory V)
+    (languageTasks : List StructuredLanguageTaskEnvelope)
+    (languageRuntime : StructuredLanguageModelRuntimeBoundary) : Prop where
+  runGoalExact :
+    trace.run = runId ∧
+    trace.goal = (structuredCompiler.contractCompiler.compile prompt).goal.id
+  traceStartExact : trace.startTick = start
+  governedRunExact : governed.toObservedSemanticRun = secured.certified.run
+  secureKernel :
+    SecureAssumptionMinimalFullSuccessKernelCertificate
+      measure policy judge authorization secured runId
+      (structuredCompiler.contractCompiler.compile prompt) start
+  governanceKernel :
+    ResponsibilityGovernanceKernelCertificate
+      authorization responsibilityCompiler responsibilityMeaning promptMeaning
+      structuredCompiler.contractCompiler classificationMeaning classifier
+      globalMeaning governed
+  concreteTrace :
+    R540ConcreteTraceCertificate
+      judge authorization secured
+      (structuredCompiler.contractCompiler.compile prompt)
+      runtime payloads interrogationRuntime trace
+  traceFeatureGates :
+    R541TraceFeatureGateCertificate trace outcomeGate blockerGate causalGate
+      toolGate evidenceGate disclosureGate
+  compilerActionExact :
+    R541PromptRequirementsAndWorkExactCertificate
+      structuredCompiler prompt
+      (structuredCompiler.contractCompiler.compile prompt)
+  securityPoliciesExact :
+    R541ContractSecurityPolicyCertificate
+      (structuredCompiler.contractCompiler.compile prompt) policies
+  governanceOperational :
+    R541GovernanceOperationalClosureCertificate
+      authorization structuredCompiler classifier responsibilityCompiler
+      (secured.certified.run.semanticState start).base responsibilities
+      exceptions globalAssignments administratorCreationApprovals locals
+      localRevisions creations responsibilityRecords globalRecords
+  localRevisionTraceBound :
+    ∀ record, record ∈ localRevisions → record.traceId = trace.id
+  creationTraceBound :
+    ∀ record, record ∈ creations → record.traceId = trace.id
+  responsibilityTraceBound :
+    ∀ record, record ∈ responsibilityRecords → record.traceId = trace.id
+  globalTraceBound :
+    ∀ record, record ∈ globalRecords → record.traceId = trace.id
+  proxyTraceBound :
+    ∀ record, record ∈ proxyGate.records → record.traceId = trace.id
+  crossOwnerTraceBound :
+    ∀ record, record ∈ crossOwnerGate.records → record.traceId = trace.id
+  comments : R541CommentSurfaceCertificate secured trace commentGate
+  proxy :
+    R541ProxySurfaceCertificate
+      authorization toolSecurity proxyClassifier responsibilities
+      (secured.certified.run.semanticState start).base proxyGate
+  globalInventoryExact : globalGate.records = globalRecords
+  global :
+    R541GlobalSurfaceCertificate
+      (secured.certified.run.semanticState start).base responsibilities
+      exceptions locals globalGate
+  crossOwner :
+    R541CrossOwnerSurfaceCertificate
+      authorization obligationMeaning obligationClassifier taskMeaning
+      taskClassifier responsibilities
+      (secured.certified.run.semanticState start) agents locals crossOwnerGate
+  interrogation :
+    R541InterrogationSurfaceCertificate
+      authorization secured interrogationRuntime trace interrogationGate
+  model :
+    R541ModelSurfaceCertificate authorization secured runtime trace modelGate
+  taskOperational :
+    R541TaskOperationalSurfaceCertificate
+      (secured.certified.run.semanticState start) locals operationalAfter
+      taskIntentGate taskProvenanceGate
+  taskIntentTraceBound :
+    ∀ record, record ∈ taskIntentGate.records → record.traceId = trace.id
+  taskProvenanceTraceBound :
+    ∀ record, record ∈ taskProvenanceGate.records → record.traceId = trace.id
+  operationalHistory :
+    SemanticOperationalStateExtends operationalBefore operationalAfter
+  operationalClosure :
+    SemanticOperationalClosureCertificate
+      authorization (secured.certified.run.semanticState start).base
+      proxyDirectory languageTasks languageRuntime
+
+/-- Garanzie complete estratte dal root certificate. -/
+structure R541ReleaseGuarantees
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (runId : X.RunId)
+    (contract : GoalContract V X)
+    (start : Nat)
+    (trace : R540ConcreteExecutionTrace V X)
+    (policies : List (ContractWorkSecurityPolicy V))
+    (structuredCompiler : StructuredLocalContractCompiler V X)
+    (prompt : V.SystemPrompt)
+    (operationalBefore operationalAfter : SemanticOperationalState V X) : Prop where
+  eventualCompletion :
+    EventuallyCollaborativeContractCompleted
+      secured.certified.run runId contract start
+  authorityInformationSafety :
+    AuthorityInformationSafetyHolds authorization secured contract runId start
+  concreteTraceNonempty : trace.workAttempts ≠ []
+  promptWorkActionsExact :
+    R541PromptRequirementsAndWorkExactCertificate
+      structuredCompiler prompt contract
+  securityPoliciesExact :
+    R541ContractSecurityPolicyCertificate contract policies
+  operationalHistoryAppendOnly :
+    SemanticOperationalStateExtends operationalBefore operationalAfter
+  noHiddenPersistentModelMemory :
+    ∀ event,
+      event ∈ trace.modelInvocations →
+      ¬ event.projection.hiddenPersistentModelMemoryAvailable
+
+/-- Il root certificate è non vacuo: contiene almeno un work attempt concreto. -/
+theorem r541_formal_release_is_nonvacuous
+    (measure : ProgressMeasure V X)
+    (policy : AgingSchedulerPolicy)
+    (judge : SemanticEvidenceJudge V X)
+    (authorization : ProductAuthorizationProjection V)
+    (structuredCompiler : StructuredLocalContractCompiler V X)
+    (classifier : LocalGoalClassifier V X)
+    (responsibilityCompiler : ResponsibilityCompiler V)
+    (responsibilityMeaning : ResponsibilityTextSemantics V)
+    (promptMeaning : PromptContractSemantics V X)
+    (classificationMeaning : LocalGoalClassificationSemantics V X)
+    (globalMeaning : GlobalSynthesisSemantics V X)
+    (secured : SecuredCollaborativeRun V X)
+    (governed : ResponsibilityGovernedRun V X)
+    (runId : X.RunId)
+    (prompt : V.SystemPrompt)
+    (start : Nat)
+    (responsibilities : ResponsibilityDirectory V)
+    (exceptions : List (ApprovedLocalGoalException V X))
+    (globalAssignments : List (GlobalMandateAssignment V X))
+    (administratorCreationApprovals :
+      List (ApprovedAdministratorAgentCreation V X))
+    (locals : LocalGoalDirectory V X)
+    (agents : GovernedAgentDirectory V)
+    (runtime : R540ModelRuntimeProjection V X)
+    (payloads : R540DisclosurePayloadProjection V)
+    (interrogationRuntime : R540InterrogationRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (policies : List (ContractWorkSecurityPolicy V))
+    (localRevisions : List (R541LocalRevisionRecord V X))
+    (creations : List (R541AgentCreationRecord V X))
+    (responsibilityRecords : List (R541ResponsibilityRecord V))
+    (globalRecords : List (R541GlobalSynthesisRecord V X))
+    (commentGate : R541SurfaceGate (R541CommentRecord V X))
+    (proxyGate : R541SurfaceGate (R541ProxyPlanRecord V))
+    (globalGate : R541SurfaceGate (R541GlobalSynthesisRecord V X))
+    (crossOwnerGate : R541SurfaceGate (R541CrossOwnerRecord V))
+    (outcomeGate : R541SurfaceGate (R540WorkOutcomeEvent V X))
+    (blockerGate : R541SurfaceGate (R540BlockerResolutionEvent V X))
+    (causalGate : R541SurfaceGate (R540CausalLinkEvent V X))
+    (toolGate : R541SurfaceGate (R540ToolEvent V X))
+    (evidenceGate : R541SurfaceGate (R540EvidenceEvent V X))
+    (disclosureGate : R541SurfaceGate (R540DisclosureEvent V X))
+    (interrogationGate : R541SurfaceGate (R540InterrogationEvent V X))
+    (modelGate : R541SurfaceGate (R540ModelInvocationEvent V X))
+    (taskIntentGate : R541SurfaceGate (R541TaskIntentRecord V))
+    (taskProvenanceGate : R541SurfaceGate (R541TaskProvenanceRecord V))
+    (toolSecurity : ToolSecuritySemantics V)
+    (proxyClassifier : UserProxyResponsibilityFootprintClassifier V)
+    (obligationMeaning : TaskObligationClassificationSemantics V X)
+    (obligationClassifier : TaskObligationClassifier V X)
+    (taskMeaning : TaskResponsibilityClassificationSemantics V)
+    (taskClassifier : TaskResponsibilityClassifier V)
+    (operationalBefore operationalAfter : SemanticOperationalState V X)
+    (proxyDirectory : UserProxyDirectory V)
+    (languageTasks : List StructuredLanguageTaskEnvelope)
+    (languageRuntime : StructuredLanguageModelRuntimeBoundary)
+    (certificate : R541FormalReleaseCertificate
+      measure policy judge authorization structuredCompiler classifier
+      responsibilityCompiler responsibilityMeaning promptMeaning
+      classificationMeaning globalMeaning secured governed runId prompt start
+      responsibilities exceptions globalAssignments administratorCreationApprovals
+      locals agents runtime payloads interrogationRuntime trace policies localRevisions creations
+      responsibilityRecords globalRecords commentGate proxyGate globalGate
+      crossOwnerGate outcomeGate blockerGate causalGate toolGate evidenceGate
+      disclosureGate interrogationGate modelGate taskIntentGate
+      taskProvenanceGate toolSecurity proxyClassifier
+      obligationMeaning obligationClassifier taskMeaning taskClassifier
+      operationalBefore operationalAfter proxyDirectory languageTasks
+      languageRuntime) :
+    trace.workAttempts ≠ [] := by
+  exact certificate.concreteTrace.nonemptyCore
+
+/-- Una invocation certificata dal root non dispone di memoria persistente occulta. -/
+theorem r541_root_model_invocation_has_no_hidden_memory
+    (judge : SemanticEvidenceJudge V X)
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (contract : GoalContract V X)
+    (runtime : R540ModelRuntimeProjection V X)
+    (payloads : R540DisclosurePayloadProjection V)
+    (interrogationRuntime : R540InterrogationRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (traceCertificate : R540ConcreteTraceCertificate
+      judge authorization secured contract runtime payloads
+      interrogationRuntime trace)
+    (event : R540ModelInvocationEvent V X)
+    (eventIn : event ∈ trace.modelInvocations) :
+    ¬ event.projection.hiddenPersistentModelMemoryAvailable := by
+  exact r540_exact_model_invocation_has_no_hidden_memory
+    authorization secured runtime trace event
+    (traceCertificate.everyInvocationExact event eventIn)
+
+/--
+Teorema generale: dal root certificate e dalle sole assumptions esterne dichiarate
+seguono completion, safety, exactness, append-only e no-model-memory.
+-/
+theorem sprout_r5_41_formal_release
+    (measure : ProgressMeasure V X)
+    (policy : AgingSchedulerPolicy)
+    (judge : SemanticEvidenceJudge V X)
+    (authorization : ProductAuthorizationProjection V)
+    (structuredCompiler : StructuredLocalContractCompiler V X)
+    (classifier : LocalGoalClassifier V X)
+    (responsibilityCompiler : ResponsibilityCompiler V)
+    (responsibilityMeaning : ResponsibilityTextSemantics V)
+    (promptMeaning : PromptContractSemantics V X)
+    (requirementMeaning : PromptRequirementSemantics V)
+    (classificationMeaning : LocalGoalClassificationSemantics V X)
+    (globalMeaning : GlobalSynthesisSemantics V X)
+    (secured : SecuredCollaborativeRun V X)
+    (governed : ResponsibilityGovernedRun V X)
+    (runId : X.RunId)
+    (prompt : V.SystemPrompt)
+    (start : Nat)
+    (responsibilities : ResponsibilityDirectory V)
+    (exceptions : List (ApprovedLocalGoalException V X))
+    (globalAssignments : List (GlobalMandateAssignment V X))
+    (administratorCreationApprovals :
+      List (ApprovedAdministratorAgentCreation V X))
+    (locals : LocalGoalDirectory V X)
+    (agents : GovernedAgentDirectory V)
+    (runtime : R540ModelRuntimeProjection V X)
+    (payloads : R540DisclosurePayloadProjection V)
+    (interrogationRuntime : R540InterrogationRuntimeProjection V X)
+    (actualModel : R540ActualModelRuntime V X)
+    (actualDisclosure : R540ActualDisclosureRuntime V)
+    (actualInterrogation : R540ActualInterrogationRuntime V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (policies : List (ContractWorkSecurityPolicy V))
+    (localRevisions : List (R541LocalRevisionRecord V X))
+    (creations : List (R541AgentCreationRecord V X))
+    (responsibilityRecords : List (R541ResponsibilityRecord V))
+    (globalRecords : List (R541GlobalSynthesisRecord V X))
+    (commentGate : R541SurfaceGate (R541CommentRecord V X))
+    (proxyGate : R541SurfaceGate (R541ProxyPlanRecord V))
+    (globalGate : R541SurfaceGate (R541GlobalSynthesisRecord V X))
+    (crossOwnerGate : R541SurfaceGate (R541CrossOwnerRecord V))
+    (outcomeGate : R541SurfaceGate (R540WorkOutcomeEvent V X))
+    (blockerGate : R541SurfaceGate (R540BlockerResolutionEvent V X))
+    (causalGate : R541SurfaceGate (R540CausalLinkEvent V X))
+    (toolGate : R541SurfaceGate (R540ToolEvent V X))
+    (evidenceGate : R541SurfaceGate (R540EvidenceEvent V X))
+    (disclosureGate : R541SurfaceGate (R540DisclosureEvent V X))
+    (interrogationGate : R541SurfaceGate (R540InterrogationEvent V X))
+    (modelGate : R541SurfaceGate (R540ModelInvocationEvent V X))
+    (taskIntentGate : R541SurfaceGate (R541TaskIntentRecord V))
+    (taskProvenanceGate : R541SurfaceGate (R541TaskProvenanceRecord V))
+    (toolSecurity : ToolSecuritySemantics V)
+    (proxyClassifier : UserProxyResponsibilityFootprintClassifier V)
+    (obligationMeaning : TaskObligationClassificationSemantics V X)
+    (obligationClassifier : TaskObligationClassifier V X)
+    (taskMeaning : TaskResponsibilityClassificationSemantics V)
+    (taskClassifier : TaskResponsibilityClassifier V)
+    (operationalBefore operationalAfter : SemanticOperationalState V X)
+    (proxyDirectory : UserProxyDirectory V)
+    (languageTasks : List StructuredLanguageTaskEnvelope)
+    (languageRuntime : StructuredLanguageModelRuntimeBoundary)
+    (certificate : R541FormalReleaseCertificate
+      measure policy judge authorization structuredCompiler classifier
+      responsibilityCompiler responsibilityMeaning promptMeaning
+      classificationMeaning globalMeaning secured governed runId prompt start
+      responsibilities exceptions globalAssignments administratorCreationApprovals
+      locals agents runtime payloads interrogationRuntime trace policies localRevisions creations
+      responsibilityRecords globalRecords commentGate proxyGate globalGate
+      crossOwnerGate outcomeGate blockerGate causalGate toolGate evidenceGate
+      disclosureGate interrogationGate modelGate taskIntentGate
+      taskProvenanceGate toolSecurity proxyClassifier
+      obligationMeaning obligationClassifier taskMeaning taskClassifier
+      operationalBefore operationalAfter proxyDirectory languageTasks
+      languageRuntime)
+    (assumptions : R541ExternalReleaseAssumptions
+      secured (structuredCompiler.contractCompiler.compile prompt).goal.id start
+      promptMeaning requirementMeaning structuredCompiler prompt judge trace
+      actualModel runtime actualDisclosure payloads
+      actualInterrogation interrogationRuntime) :
+    R541ReleaseGuarantees
+      authorization secured runId
+      (structuredCompiler.contractCompiler.compile prompt) start trace policies
+      structuredCompiler prompt operationalBefore operationalAfter := by
+  have secure :=
+    sprout_secure_assumption_minimal_successful_completion
+      measure policy judge authorization structuredCompiler.contractCompiler prompt
+      secured runId start certificate.secureKernel assumptions.completionBoundary
+  refine
+    { eventualCompletion := secure.1
+      authorityInformationSafety := secure.2
+      concreteTraceNonempty := certificate.concreteTrace.nonemptyCore
+      promptWorkActionsExact := certificate.compilerActionExact
+      securityPoliciesExact := certificate.securityPoliciesExact
+      operationalHistoryAppendOnly := certificate.operationalHistory
+      noHiddenPersistentModelMemory := ?_ }
+  intro event eventIn
+  exact r540_exact_model_invocation_has_no_hidden_memory
+    authorization secured runtime trace event
+    (certificate.concreteTrace.everyInvocationExact event eventIn)
+
+/-! ### R5.41G — Controesempi espliciti di vacuità e sostituzione -/
+
+/-- Una superficie enabled non può essere certificata con inventario vuoto. -/
+theorem r541_counterexample_enabled_empty_surface_impossible
+    {α : Type u}
+    (gate : R541SurfaceGate α)
+    (enabled : gate.mode = R541SurfaceMode.enabled)
+    (empty : gate.records = []) : False := by
+  exact gate.enabledNonempty enabled empty
+
+/-- Una superficie disabilitata fail-closed non può contenere un record operativo. -/
+theorem r541_counterexample_disabled_surface_record_impossible
+    {α : Type u}
+    (gate : R541SurfaceGate α)
+    (disabled : gate.mode = R541SurfaceMode.disabledFailClosed)
+    (record : α)
+    (present : record ∈ gate.records) : False := by
+  have empty : gate.records = [] := gate.disabledEmpty disabled
+  rw [empty] at present
+  simp at present
+
+/-- Il compiler non può aggiungere una action class priva di requirement sorgente. -/
+theorem r541_counterexample_unrequested_compiled_action_impossible
+    (compiler : StructuredLocalContractCompiler V X)
+    (prompt : V.SystemPrompt)
+    (contract : GoalContract V X)
+    (certificate : R541PromptRequirementsAndWorkExactCertificate
+      compiler prompt contract)
+    (workSpec : ContractWorkSpec V X)
+    (actionClass : AgentActionClass)
+    (workKnown : workSpec ∈ contract.workSpecs)
+    (noRequirement :
+      ¬ ∃ requirement link,
+        requirement ∈ compiler.extractRequirements prompt ∧
+        link ∈ compiler.bindings prompt ∧
+        link.requirementId = requirement.id ∧
+        link.workSpecId = workSpec.id ∧
+        actionClass ∈ requirement.requiredActions) :
+    actionClass ∉ workSpec.allowedActions := by
+  intro allowed
+  exact noRequirement
+    (r541_compiled_action_has_exact_requirement
+      compiler prompt contract certificate workSpec actionClass workKnown allowed)
+
+/-- Un certificato di creazione non può nascondere un nuovo grant. -/
+theorem r541_counterexample_creation_permission_escalation_impossible
+    (authorization : ProductAuthorizationProjection V)
+    (structuredCompiler : StructuredLocalContractCompiler V X)
+    (classifier : LocalGoalClassifier V X)
+    (responsibilities : ResponsibilityDirectory V)
+    (exceptions : List (ApprovedLocalGoalException V X))
+    (globalAssignments : List (GlobalMandateAssignment V X))
+    (administratorCreationApprovals :
+      List (ApprovedAdministratorAgentCreation V X))
+    (record : R541AgentCreationRecord V X)
+    (certificate : R541AgentCreationFrameCertificate
+      authorization structuredCompiler classifier responsibilities exceptions
+      globalAssignments administratorCreationApprovals record)
+    (permissionChanged :
+      record.before.permissions ≠ record.after.permissions) : False := by
+  exact permissionChanged certificate.noAuthorityGrant.1
+
+/-- La stessa invocation content-exact non può appartenere a due trace distinte. -/
+theorem r541_counterexample_cross_trace_model_substitution_impossible
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (runtime : R540ModelRuntimeProjection V X)
+    (left right : R540ConcreteExecutionTrace V X)
+    (event : R540ModelInvocationEvent V X)
+    (different : left.id ≠ right.id)
+    (leftExact : R540ModelInvocationEventExact
+      authorization secured runtime left event) :
+    ¬ R540ModelInvocationEventExact authorization secured runtime right event := by
+  intro rightExact
+  exact different
+    (r540_model_event_trace_id_unique
+      authorization secured runtime left right event leftExact rightExact)
+
+/-- Un modello certificato non può dichiarare memoria persistente occulta. -/
+theorem r541_counterexample_hidden_model_memory_impossible
+    (authorization : ProductAuthorizationProjection V)
+    (secured : SecuredCollaborativeRun V X)
+    (runtime : R540ModelRuntimeProjection V X)
+    (trace : R540ConcreteExecutionTrace V X)
+    (event : R540ModelInvocationEvent V X)
+    (exact : R540ModelInvocationEventExact
+      authorization secured runtime trace event)
+    (hidden : event.projection.hiddenPersistentModelMemoryAvailable) : False := by
+  exact (r540_exact_model_invocation_has_no_hidden_memory
+    authorization secured runtime trace event exact) hidden
+
+end R5
+
+end Sprout.AgentSpec
