@@ -3808,7 +3808,7 @@ impl ProxyExecution<'_> {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InformationSource {
     ResourceBody {
         resource_id: ResourceId,
@@ -3842,6 +3842,7 @@ pub enum InformationSource {
 /// Context reconstructed for one invocation from authoritative product data.
 /// There is deliberately no recalled/persistent model-memory field.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelInvocationContext {
     pub invocation_id: InvocationId,
     pub principal: UserId,
@@ -3850,9 +3851,130 @@ pub struct ModelInvocationContext {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelExposureProjection {
     pub exposed_sources: Vec<InformationSource>,
     pub hidden_persistent_model_memory_available: bool,
+}
+
+/// Exact collaborative-work coordinates for a model invocation projected into
+/// the R5.40 causal trace. Invocations without this binding may support a
+/// product surface, but cannot be certified as work-graph model events.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelInvocationWorkBinding {
+    pub trace_id: Uuid,
+    pub run: RunId,
+    pub goal: GoalId,
+    pub work: WorkItemId,
+    pub claim: ClaimId,
+    pub attempt: u32,
+}
+
+/// Provider-neutral terminal observation produced by an endpoint TCB. The
+/// endpoint attestation is verified by the server; this domain value checks
+/// that the independently persisted dispatch and formal projection agree.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRuntimeActualObservation {
+    pub invocation_id: InvocationId,
+    pub attempt: u32,
+    pub principal: UserId,
+    pub exposed_sources: Vec<InformationSource>,
+    pub request_commitment: [u8; 32],
+    pub output_commitment: Option<[u8; 32]>,
+    pub explicit_failure: bool,
+    pub hidden_persistent_model_memory_available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct R540ModelRuntimeProjection {
+    pub invocation_id: InvocationId,
+    pub attempt: u32,
+    pub principal: UserId,
+    pub context_sources: Vec<InformationSource>,
+    pub request_commitment: [u8; 32],
+    pub output_commitment: Option<[u8; 32]>,
+    pub explicit_failure: bool,
+}
+
+pub fn validate_model_runtime_projection(
+    actual: &ModelRuntimeActualObservation,
+    projection: &R540ModelRuntimeProjection,
+) -> Result<(), AgentValidationError> {
+    ensure_unique(&actual.exposed_sources, "actual model source")?;
+    ensure_unique(&projection.context_sources, "projected model source")?;
+    if actual.hidden_persistent_model_memory_available {
+        return Err(AgentValidationError::HiddenModelMemoryForbidden);
+    }
+    if actual.invocation_id != projection.invocation_id
+        || actual.attempt != projection.attempt
+        || actual.principal != projection.principal
+        || actual.request_commitment != projection.request_commitment
+        || actual.output_commitment != projection.output_commitment
+        || actual.explicit_failure != projection.explicit_failure
+        || as_set(&actual.exposed_sources) != as_set(&projection.context_sources)
+    {
+        return Err(AgentValidationError::ModelRuntimeProjectionNotExact);
+    }
+    if actual.explicit_failure == actual.output_commitment.is_some() {
+        return Err(AgentValidationError::InvalidModelTerminalObservation);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StructuredLanguageArtifact {
+    GroundedOutput {
+        output: StructuredLanguageOutput,
+    },
+    UserProxyPlan {
+        envelope: Box<UserProxyPlanningEnvelope>,
+        plan: UserProxyActionPlan,
+    },
+    InterrogationAnswer {
+        session_id: InterrogationId,
+        encrypted_answer: EncryptedPayload,
+        context_sources: Vec<InformationSource>,
+    },
+    GovernanceSummary {
+        summary: BriefGovernanceSummary,
+    },
+}
+
+impl StructuredLanguageArtifact {
+    pub fn validate_for(
+        &self,
+        task: &StructuredLanguageTaskEnvelope,
+    ) -> Result<(), AgentValidationError> {
+        match self {
+            Self::GroundedOutput { output } => task.validate_grounded_output(output),
+            Self::UserProxyPlan { envelope, plan } => {
+                if task.kind != StructuredLanguageTaskKind::InterpretProxyRequest
+                    || envelope.language_task != *task
+                {
+                    return Err(AgentValidationError::WrongLanguageTaskKind);
+                }
+                plan.validate_within_envelope(envelope)
+            }
+            Self::InterrogationAnswer {
+                context_sources, ..
+            } => {
+                if task.kind != StructuredLanguageTaskKind::AnswerFromAuthorizedContext {
+                    return Err(AgentValidationError::WrongLanguageTaskKind);
+                }
+                ensure_unique(context_sources, "interrogation answer source")
+            }
+            Self::GovernanceSummary { summary } => {
+                if task.kind != StructuredLanguageTaskKind::SummarizeGovernanceDecision {
+                    return Err(AgentValidationError::WrongLanguageTaskKind);
+                }
+                summary.validate()
+            }
+        }
+    }
 }
 
 pub fn validate_state_grounded_invocation(
@@ -3879,6 +4001,7 @@ pub fn validate_state_grounded_invocation(
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentInterrogationCausalDelta {
     pub resource_effects: Vec<ResourceEffect>,
     pub tool_invocations: Vec<PlannedToolInvocation>,
@@ -4372,6 +4495,10 @@ pub enum AgentValidationError {
     HiddenModelMemoryForbidden,
     #[error("the exposed model context is not exactly the declared source set")]
     InvocationExposureNotExact,
+    #[error("actual model observation does not exactly match its persisted projection")]
+    ModelRuntimeProjectionNotExact,
+    #[error("model terminal observation must contain exactly one of output or failure")]
+    InvalidModelTerminalObservation,
     #[error("interrogation produced a causal side effect")]
     InterrogationHasSideEffects,
     #[error("persisted disclosure would expand the source audience")]
@@ -4984,12 +5111,49 @@ mod tests {
             AgentInterrogationCausalDelta::default().validate_read_only(),
             Ok(())
         );
-        let mut delta = AgentInterrogationCausalDelta::default();
-        delta.assigned_tasks.push(ResourceId::new());
-        assert_eq!(
-            delta.validate_read_only(),
-            Err(AgentValidationError::InterrogationHasSideEffects)
-        );
+        let mutations = [
+            AgentInterrogationCausalDelta {
+                resource_effects: vec![ResourceEffect {
+                    resource_id: ResourceId::new(),
+                    operation: ResourceOperation::PostComment,
+                }],
+                ..Default::default()
+            },
+            AgentInterrogationCausalDelta {
+                tool_invocations: vec![PlannedToolInvocation {
+                    tool: "bounded-tool".to_owned(),
+                    input_digest: "00".repeat(32),
+                    required_effects: vec![],
+                }],
+                ..Default::default()
+            },
+            AgentInterrogationCausalDelta {
+                prompt_revisions: vec![UserId::new()],
+                ..Default::default()
+            },
+            AgentInterrogationCausalDelta {
+                local_goal_revisions: vec![UserId::new()],
+                ..Default::default()
+            },
+            AgentInterrogationCausalDelta {
+                created_work: vec![Uuid::from_u128(1)],
+                ..Default::default()
+            },
+            AgentInterrogationCausalDelta {
+                activated_obligations: vec![Uuid::from_u128(2)],
+                ..Default::default()
+            },
+            AgentInterrogationCausalDelta {
+                assigned_tasks: vec![ResourceId::new()],
+                ..Default::default()
+            },
+        ];
+        for delta in mutations {
+            assert_eq!(
+                delta.validate_read_only(),
+                Err(AgentValidationError::InterrogationHasSideEffects)
+            );
+        }
     }
 
     #[test]

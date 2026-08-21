@@ -24,19 +24,21 @@ use sprout_domain::{
     InformationSource, InterrogationId, InvocationId, LOCAL_GOAL_CLASSIFIER_VERSION,
     LocalGoalCompilationEnvelope, LocalGoalCompilerOutput, LocalGoalContract, LocalGoalOrigin,
     LocalPromptReviewDisposition, ModelExposureProjection, ModelInvocationContext,
-    NewAgentForGlobalNeedProposal, PersistedTaskIntent, PrincipalKind, ProjectId, ProxyExecution,
-    ProxyRequestId, ProxyThreadId, ResourceEffect, ResourceId, ResourceOperation,
+    ModelInvocationWorkBinding, ModelRuntimeActualObservation, NewAgentForGlobalNeedProposal,
+    PersistedTaskIntent, PrincipalKind, ProjectId, ProxyExecution, ProxyRequestId, ProxyThreadId,
+    R540ModelRuntimeProjection, ResourceEffect, ResourceId, ResourceOperation,
     ResponsibilityCompilationEnvelope, ResponsibilityCompilerOutput, ResponsibilityContract,
     ResponsibilityExceptionReview, StructuredGlobalSynthesisEnvelope,
-    StructuredGlobalWorkGrounding, StructuredLanguageOutput, StructuredLanguageTaskEnvelope,
-    StructuredLanguageTaskKind, TaskObligationProvenance, UserEscalationConsent, UserId, UserProxy,
-    UserProxyActionPlan, UserProxyOutOfResponsibilityConfirmation, UserProxyPlanningEnvelope,
-    UserProxyRequest, UserProxyThread, classify_local_goal_contract, derive_global_coverage_need,
+    StructuredGlobalWorkGrounding, StructuredLanguageArtifact, StructuredLanguageOutput,
+    StructuredLanguageTaskEnvelope, StructuredLanguageTaskKind, TaskObligationProvenance,
+    UserEscalationConsent, UserId, UserProxy, UserProxyActionPlan,
+    UserProxyOutOfResponsibilityConfirmation, UserProxyPlanningEnvelope, UserProxyRequest,
+    UserProxyThread, classify_local_goal_contract, derive_global_coverage_need,
     responsibility_operationally_covers_local_goal, route_cross_owner_assignment,
     validate_approved_local_goal_exception, validate_global_synthesis, validate_information_flow,
-    validate_state_grounded_invocation,
+    validate_model_runtime_projection, validate_state_grounded_invocation,
 };
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
 
 use crate::{
@@ -52,6 +54,7 @@ const ADMINISTRATOR_AGENT_CREATION_SIGNATURE_CONTEXT: &[u8] =
     b"sprout-administrator-agent-creation-v1";
 const EXCEPTION_CONSENT_SIGNATURE_CONTEXT: &[u8] = b"sprout-local-goal-exception-consent-v1";
 const EXCEPTION_DECISION_SIGNATURE_CONTEXT: &[u8] = b"sprout-local-goal-exception-decision-v1";
+const MODEL_RUNTIME_OBSERVATION_SIGNATURE_CONTEXT: &[u8] = b"sprout-model-runtime-observation-v1";
 const LOCAL_GOAL_COMPILER_PROTOCOL_MANIFEST: &[u8] =
     include_bytes!("../../tcb/sprout-local-goal-compiler-v1.json");
 const RESPONSIBILITY_COMPILER_PROTOCOL_MANIFEST: &[u8] =
@@ -3745,6 +3748,8 @@ pub struct InterrogationResponse {
     key_epoch: u32,
     encrypted_transcript: EncryptedPayload,
     created_at: DateTime<Utc>,
+    encrypted_answer: Option<EncryptedPayload>,
+    answered_at: Option<DateTime<Utc>>,
 }
 
 pub async fn record_interrogation(
@@ -3857,8 +3862,12 @@ pub async fn get_interrogation(
         SELECT interrogation.id, interrogation.target_agent_identity_id,
                interrogation.transcript_resource_node_id,
                interrogation.key_epoch, interrogation.encrypted_transcript,
-               interrogation.created_at
+               interrogation.created_at, answer.encrypted_answer,
+               answer.answered_at
         FROM agent_interrogations interrogation
+        LEFT JOIN agent_interrogation_answers answer
+          ON answer.project_id = interrogation.project_id
+         AND answer.interrogation_id = interrogation.id
         WHERE interrogation.project_id = $1
           AND interrogation.target_agent_id = $2
           AND interrogation.id = $3
@@ -3883,6 +3892,11 @@ pub async fn get_interrogation(
             .map_err(|_| AppError::Internal)?,
         encrypted_transcript: deserialize_ciphertext(row.try_get("encrypted_transcript")?)?,
         created_at: row.try_get("created_at")?,
+        encrypted_answer: row
+            .try_get::<Option<Vec<u8>>, _>("encrypted_answer")?
+            .map(|bytes| deserialize_ciphertext(&bytes))
+            .transpose()?,
+        answered_at: row.try_get("answered_at")?,
     }))
 }
 
@@ -4141,15 +4155,42 @@ pub async fn record_proxy_plan(
         )
         .map_err(agent_validation_error)?;
     if let Some(invocation_id) = request.invocation_id {
-        let valid_invocation = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM agent_invocations
-             WHERE project_id = $1 AND id = $2 AND status = 'succeeded')",
+        let invocation = sqlx::query(
+            r#"
+            SELECT invocation.context_principal_identity_id,
+                   invocation.proxy_request_id,
+                   invocation.language_task::text AS language_task,
+                   projection.structured_artifact::text AS structured_artifact
+            FROM agent_invocations invocation
+            JOIN agent_model_invocation_projections projection
+              ON projection.project_id = invocation.project_id
+             AND projection.invocation_id = invocation.id
+            WHERE invocation.project_id = $1 AND invocation.id = $2
+              AND invocation.status = 'succeeded'
+              AND invocation.invocation_surface = 'user_proxy'
+              AND projection.status = 'succeeded'
+            "#,
         )
         .bind(project_id)
         .bind(Uuid::from(invocation_id))
-        .fetch_one(&mut *transaction)
-        .await?;
-        if !valid_invocation {
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::Conflict)?;
+        let task: StructuredLanguageTaskEnvelope =
+            serde_json::from_str(invocation.try_get("language_task")?)
+                .map_err(|_| AppError::Internal)?;
+        let artifact: StructuredLanguageArtifact =
+            serde_json::from_str(invocation.try_get("structured_artifact")?)
+                .map_err(|_| AppError::Internal)?;
+        let StructuredLanguageArtifact::UserProxyPlan { envelope, plan } = artifact else {
+            return Err(AppError::Conflict);
+        };
+        if invocation.try_get::<Uuid, _>("context_principal_identity_id")? != actor.identity_id
+            || invocation.try_get::<Option<Uuid>, _>("proxy_request_id")? != Some(request_id)
+            || task.kind != StructuredLanguageTaskKind::InterpretProxyRequest
+            || *envelope != request.envelope
+            || plan != request.plan
+        {
             return Err(AppError::Conflict);
         }
     }
@@ -5073,7 +5114,37 @@ pub async fn materialize_cross_owner_task_assignment(
     }))
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationSurface {
+    #[default]
+    Generic,
+    UserProxy,
+    Interrogation,
+    GovernanceSummary,
+}
+
+impl InvocationSurface {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::UserProxy => "user_proxy",
+            Self::Interrogation => "interrogation",
+            Self::GovernanceSummary => "governance_summary",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InvocationSurfaceBinding {
+    surface: InvocationSurface,
+    proxy_request_id: Option<ProxyRequestId>,
+    interrogation_id: Option<InterrogationId>,
+    task_kind: StructuredLanguageTaskKind,
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueueInvocationRequest {
     id: InvocationId,
     local_goal_id: Option<Uuid>,
@@ -5082,6 +5153,11 @@ pub struct QueueInvocationRequest {
     authority_envelope: AuthorityEnvelope,
     sources: Vec<InformationSource>,
     encrypted_input: EncryptedPayload,
+    #[serde(default)]
+    surface: InvocationSurface,
+    proxy_request_id: Option<ProxyRequestId>,
+    interrogation_id: Option<InterrogationId>,
+    work_binding: Option<ModelInvocationWorkBinding>,
 }
 
 #[derive(Serialize)]
@@ -5112,6 +5188,19 @@ pub async fn queue_invocation(
         .authority_envelope
         .validate_unique()
         .map_err(agent_validation_error)?;
+    let context_principal = resolve_invocation_surface_context(
+        &state,
+        actor,
+        project_id,
+        agent_id,
+        InvocationSurfaceBinding {
+            surface: request.surface,
+            proxy_request_id: request.proxy_request_id,
+            interrogation_id: request.interrogation_id,
+            task_kind: request.language_task.kind,
+        },
+    )
+    .await?;
     if !request.authority_envelope.tool_authority.is_empty()
         || !request.language_task.allowed_tools.is_empty()
     {
@@ -5134,6 +5223,18 @@ pub async fn queue_invocation(
     let runner = active_runner(&state, actor, project_id, &agent).await?;
     for source in &request.sources {
         let resource_id = supported_source_resource(&state, actor, project_id, source).await?;
+        if !resource_access_for_identity(
+            &state,
+            actor,
+            project_id,
+            Uuid::from(context_principal),
+            resource_id,
+            ResourceOperation::Read,
+        )
+        .await?
+        {
+            return Err(AppError::Forbidden);
+        }
         ensure_runner_can_read(
             &state,
             actor,
@@ -5161,7 +5262,7 @@ pub async fn queue_invocation(
     }
     let context = ModelInvocationContext {
         invocation_id: request.id,
-        principal: agent.principal_id,
+        principal: context_principal,
         sources: request.sources.clone(),
         reconstructed_at: Utc::now(),
     };
@@ -5183,12 +5284,18 @@ pub async fn queue_invocation(
         "authority_envelope": request.authority_envelope,
         "sources": request.sources,
         "encrypted_input": request.encrypted_input,
+        "surface": request.surface,
+        "proxy_request_id": request.proxy_request_id,
+        "interrogation_id": request.interrogation_id,
+        "work_binding": request.work_binding,
     });
     let request_json = canonical_json(&request_projection)?;
     let request_hash: [u8; 32] = Sha256::digest(request_json.as_bytes()).into();
     let language_task_json = canonical_json(&request.language_task)?;
     let authority_json = canonical_json(&request.authority_envelope)?;
     let encrypted_input = serialize_ciphertext(&request.encrypted_input)?;
+    let context_json = canonical_json(&context)?;
+    let context_hash: [u8; 32] = Sha256::digest(context_json.as_bytes()).into();
     let mut transaction = begin(&state, actor, project_id).await?;
     if let (Some(local_goal_id), Some(revision)) =
         (request.local_goal_id, request.local_goal_revision)
@@ -5212,16 +5319,26 @@ pub async fn queue_invocation(
             return Err(AppError::Conflict);
         }
     }
+    if let Some(binding) = &request.work_binding {
+        validate_invocation_work_binding(&mut transaction, project_id, agent.principal_id, binding)
+            .await?;
+    }
     sqlx::query(
         r#"
         INSERT INTO agent_invocations (
             id, project_id, agent_id, agent_identity_id,
             local_goal_id, local_goal_revision, language_task,
             authority_envelope, encrypted_input, request_hash,
-            max_attempts, created_by_identity_id
+            max_attempts, created_by_identity_id,
+            context_principal_identity_id, invocation_surface,
+            proxy_request_id, interrogation_id,
+            trace_id, run_id, goal_id, work_item_id, work_claim_id, work_attempt,
+            context_hash
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7::jsonb,
-            $8::jsonb, $9, $10, $11, $12
+            $8::jsonb, $9, $10, $11, $12,
+            $13, $14, $15, $16,
+            $17, $18, $19, $20, $21, $22, $23
         )
         "#,
     )
@@ -5237,6 +5354,48 @@ pub async fn queue_invocation(
     .bind(request_hash.as_slice())
     .bind(i32::from(request.language_task.max_attempts))
     .bind(actor.identity_id)
+    .bind(Uuid::from(context_principal))
+    .bind(request.surface.as_str())
+    .bind(request.proxy_request_id.map(Uuid::from))
+    .bind(request.interrogation_id.map(Uuid::from))
+    .bind(
+        request
+            .work_binding
+            .as_ref()
+            .map(|binding| binding.trace_id),
+    )
+    .bind(
+        request
+            .work_binding
+            .as_ref()
+            .map(|binding| Uuid::from(binding.run)),
+    )
+    .bind(
+        request
+            .work_binding
+            .as_ref()
+            .map(|binding| Uuid::from(binding.goal)),
+    )
+    .bind(
+        request
+            .work_binding
+            .as_ref()
+            .map(|binding| Uuid::from(binding.work)),
+    )
+    .bind(
+        request
+            .work_binding
+            .as_ref()
+            .map(|binding| Uuid::from(binding.claim)),
+    )
+    .bind(
+        request
+            .work_binding
+            .as_ref()
+            .map(|binding| to_i32(binding.attempt))
+            .transpose()?,
+    )
+    .bind(context_hash.as_slice())
     .execute(&mut *transaction)
     .await?;
     for (ordinal, source) in request.sources.iter().enumerate() {
@@ -5284,6 +5443,7 @@ pub async fn queue_invocation(
 #[derive(Serialize)]
 pub struct ClaimedInvocationResponse {
     id: InvocationId,
+    dispatch_id: Uuid,
     lease_id: Uuid,
     lease_expires_at: DateTime<Utc>,
     attempt: i32,
@@ -5291,6 +5451,10 @@ pub struct ClaimedInvocationResponse {
     authority_envelope: AuthorityEnvelope,
     sources: Vec<InformationSource>,
     encrypted_input: EncryptedPayload,
+    context_principal_identity_id: UserId,
+    request_commitment_hex: String,
+    context_commitment_hex: String,
+    transport_commitment_hex: String,
 }
 
 pub async fn claim_invocation(
@@ -5307,7 +5471,8 @@ pub async fn claim_invocation(
         r#"
         SELECT id, language_task::text AS language_task,
                authority_envelope::text AS authority_envelope,
-               encrypted_input, attempt
+               encrypted_input, attempt, context_principal_identity_id,
+               request_hash
         FROM agent_invocations
         WHERE project_id = $1 AND agent_id = $2
           AND attempt < max_attempts
@@ -5341,9 +5506,34 @@ pub async fn claim_invocation(
         .await?;
     }
     let lease_id = Uuid::new_v4();
+    let dispatch_id = Uuid::new_v4();
+    let dispatched_at = Utc::now();
     let lease_expires_at =
-        Utc::now() + chrono::Duration::from_std(RUNNER_LEASE).map_err(|_| AppError::Internal)?;
+        dispatched_at + chrono::Duration::from_std(RUNNER_LEASE).map_err(|_| AppError::Internal)?;
     let attempt: i32 = candidate.try_get::<i32, _>("attempt")? + 1;
+    let context_principal_identity_id: Uuid = candidate.try_get("context_principal_identity_id")?;
+    let source_json = governance_canonical_json(&sources)?;
+    let context_commitment: [u8; 32] = Sha256::digest(source_json.as_bytes()).into();
+    let request_commitment: Vec<u8> = candidate.try_get("request_hash")?;
+    let transport_projection = json!({
+        "dispatch_id": dispatch_id,
+        "invocation_id": invocation_id,
+        "attempt": attempt,
+        "lease_id": lease_id,
+        "context_principal_identity_id": context_principal_identity_id,
+        "language_task": serde_json::from_str::<Value>(candidate.try_get("language_task")?)
+            .map_err(|_| AppError::Internal)?,
+        "authority_envelope": serde_json::from_str::<Value>(
+            candidate.try_get("authority_envelope")?,
+        )
+        .map_err(|_| AppError::Internal)?,
+        "sources": sources,
+        "encrypted_input": deserialize_ciphertext(candidate.try_get("encrypted_input")?)?,
+        "request_commitment_hex": hex::encode(&request_commitment),
+        "context_commitment_hex": hex::encode(context_commitment),
+    });
+    let transport_commitment: [u8; 32] =
+        Sha256::digest(governance_canonical_bytes(&transport_projection)?).into();
     sqlx::query(
         r#"
         UPDATE agent_invocations
@@ -5359,6 +5549,38 @@ pub async fn claim_invocation(
     .bind(attempt)
     .bind(runner.id)
     .bind(lease_id)
+    .bind(lease_expires_at)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO agent_model_attempt_dispatches (
+            id, project_id, invocation_id, attempt, lease_id, runner_id,
+            runner_identity_id, runner_device_id, runner_key_version,
+            context_principal_identity_id, request_commitment,
+            context_commitment, exposure_commitment, transport_commitment,
+            source_descriptors, dispatched_at, lease_expires_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $12, $13, $14::jsonb, $15, $16
+        )
+        "#,
+    )
+    .bind(dispatch_id)
+    .bind(project_id)
+    .bind(invocation_id)
+    .bind(attempt)
+    .bind(lease_id)
+    .bind(runner.id)
+    .bind(actor.identity_id)
+    .bind(actor.device_id)
+    .bind(runner.key_version)
+    .bind(context_principal_identity_id)
+    .bind(&request_commitment)
+    .bind(context_commitment.as_slice())
+    .bind(transport_commitment.as_slice())
+    .bind(source_json)
+    .bind(dispatched_at)
     .bind(lease_expires_at)
     .execute(&mut *transaction)
     .await?;
@@ -5385,6 +5607,7 @@ pub async fn claim_invocation(
     transaction.commit().await?;
     Ok(Json(Some(ClaimedInvocationResponse {
         id: InvocationId::from(invocation_id),
+        dispatch_id,
         lease_id,
         lease_expires_at,
         attempt,
@@ -5392,6 +5615,10 @@ pub async fn claim_invocation(
         authority_envelope,
         sources,
         encrypted_input,
+        context_principal_identity_id: context_principal_identity_id.into(),
+        request_commitment_hex: hex::encode(request_commitment),
+        context_commitment_hex: hex::encode(context_commitment),
+        transport_commitment_hex: hex::encode(transport_commitment),
     })))
 }
 
@@ -5431,12 +5658,43 @@ struct PersistedEffectDescriptor {
     materialization: PersistedEffectMaterialization,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEndpointObservationStatement {
+    observation_id: Uuid,
+    dispatch_id: Uuid,
+    invocation_id: InvocationId,
+    attempt: u32,
+    lease_id: Uuid,
+    principal_identity_id: UserId,
+    exposed_sources: Vec<InformationSource>,
+    request_commitment_hex: String,
+    context_commitment_hex: String,
+    transport_commitment_hex: String,
+    output_commitment_hex: Option<String>,
+    artifact_commitment_hex: Option<String>,
+    provider_status: String,
+    hidden_persistent_model_memory_available: bool,
+    idempotency_key: Uuid,
+    observed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedModelEndpointObservation {
+    statement: ModelEndpointObservationStatement,
+    signatures: CompilationSignatures,
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitInvocationRequest {
     lease_id: Uuid,
     structured_output: StructuredLanguageOutput,
     encrypted_output: EncryptedPayload,
     effects: Vec<EffectProposalRequest>,
+    artifact: Option<StructuredLanguageArtifact>,
+    observation: Option<SignedModelEndpointObservation>,
 }
 
 #[derive(Serialize)]
@@ -5448,10 +5706,12 @@ pub struct SubmitInvocationResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailInvocationRequest {
     lease_id: Uuid,
     failure_code: RunnerFailureCode,
     retryable: bool,
+    observation: Option<SignedModelEndpointObservation>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -5497,7 +5757,11 @@ pub async fn submit_invocation(
     let row = sqlx::query(
         r#"
         SELECT language_task::text AS language_task,
-               authority_envelope::text AS authority_envelope
+               authority_envelope::text AS authority_envelope,
+               attempt, context_principal_identity_id, invocation_surface,
+               proxy_request_id, interrogation_id,
+               trace_id, run_id, goal_id, work_item_id, work_claim_id, work_attempt,
+               request_hash, context_hash
         FROM agent_invocations
         WHERE project_id = $1 AND id = $2 AND agent_id = $3
           AND runner_id = $4 AND lease_id = $5
@@ -5511,13 +5775,79 @@ pub async fn submit_invocation(
     .bind(runner.id)
     .bind(request.lease_id)
     .fetch_optional(&mut *transaction)
-    .await?
-    .ok_or(AppError::Conflict)?;
+    .await?;
+    let Some(row) = row else {
+        if let Some(observation) = &request.observation {
+            let observation_hash: [u8; 32] =
+                Sha256::digest(governance_canonical_bytes(&observation.statement)?).into();
+            let replay = sqlx::query(
+                r#"
+                SELECT invocation.output_hash
+                FROM agent_invocations invocation
+                JOIN agent_model_attempt_observations observed
+                  ON observed.project_id = invocation.project_id
+                 AND observed.invocation_id = invocation.id
+                WHERE invocation.project_id = $1 AND invocation.id = $2
+                  AND invocation.agent_id = $3 AND invocation.status = 'succeeded'
+                  AND observed.id = $4 AND observed.idempotency_key = $5
+                  AND observed.observation_hash = $6 AND observed.status = 'succeeded'
+                "#,
+            )
+            .bind(project_id)
+            .bind(invocation_id)
+            .bind(agent_id)
+            .bind(observation.statement.observation_id)
+            .bind(observation.statement.idempotency_key)
+            .bind(observation_hash.as_slice())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some(replay) = replay {
+                let effect_ids = sqlx::query_scalar::<_, Uuid>(
+                    "SELECT id FROM agent_effect_proposals
+                     WHERE project_id = $1 AND invocation_id = $2 ORDER BY ordinal",
+                )
+                .bind(project_id)
+                .bind(invocation_id)
+                .fetch_all(&mut *transaction)
+                .await?;
+                let output_hash: Vec<u8> = replay.try_get("output_hash")?;
+                transaction.commit().await?;
+                return Ok(Json(SubmitInvocationResponse {
+                    id: InvocationId::from(invocation_id),
+                    status: "succeeded",
+                    accepted_effect_ids: effect_ids,
+                    output_hash_hex: hex::encode(output_hash),
+                }));
+            }
+        }
+        return Err(AppError::Conflict);
+    };
     let language_task: StructuredLanguageTaskEnvelope =
         serde_json::from_str(row.try_get("language_task")?).map_err(|_| AppError::Internal)?;
     language_task
         .validate_grounded_output(&request.structured_output)
         .map_err(agent_validation_error)?;
+    let artifact =
+        request
+            .artifact
+            .clone()
+            .unwrap_or_else(|| StructuredLanguageArtifact::GroundedOutput {
+                output: request.structured_output.clone(),
+            });
+    artifact
+        .validate_for(&language_task)
+        .map_err(agent_validation_error)?;
+    let invocation_surface: String = row.try_get("invocation_surface")?;
+    if invocation_surface != "generic" && request.observation.is_none() {
+        return Err(AppError::BadRequest(
+            "language surface requires a signed endpoint observation",
+        ));
+    }
+    if invocation_surface == "interrogation" && !request.effects.is_empty() {
+        return Err(AppError::BadRequest(
+            "interrogation language invocation is answer-only",
+        ));
+    }
     let authority: AuthorityEnvelope =
         serde_json::from_str(row.try_get("authority_envelope")?).map_err(|_| AppError::Internal)?;
     ensure_unique_effect_ids(&request.effects)?;
@@ -5528,9 +5858,21 @@ pub async fn submit_invocation(
         .filter_map(|item| item.resource_id)
         .collect();
     let sources = load_sources(&mut transaction, project_id, invocation_id).await?;
+    let context_principal_identity_id: Uuid = row.try_get("context_principal_identity_id")?;
     let mut source_audiences = Vec::with_capacity(sources.len());
     for source in &sources {
         let resource_id = source_resource(source).ok_or(AppError::Forbidden)?;
+        if !resource_access_in_transaction(
+            &mut transaction,
+            project_id,
+            context_principal_identity_id,
+            resource_id,
+            ResourceOperation::Read,
+        )
+        .await?
+        {
+            return Err(AppError::Forbidden);
+        }
         ensure_runner_can_read_in_transaction(
             &mut transaction,
             project_id,
@@ -5589,6 +5931,125 @@ pub async fn submit_invocation(
     });
     let output_json = canonical_json(&output_projection)?;
     let output_hash: [u8; 32] = Sha256::digest(output_json.as_bytes()).into();
+    let artifact_json = governance_canonical_json(&artifact)?;
+    let artifact_hash: [u8; 32] = Sha256::digest(artifact_json.as_bytes()).into();
+
+    let verified_observation = if let Some(observation) = &request.observation {
+        let dispatch = sqlx::query(
+            r#"
+            SELECT id, attempt, lease_id, runner_identity_id, runner_device_id,
+                   runner_key_version, context_principal_identity_id,
+                   request_commitment, context_commitment, exposure_commitment,
+                   transport_commitment, source_descriptors::text AS source_descriptors,
+                   dispatched_at, lease_expires_at
+            FROM agent_model_attempt_dispatches
+            WHERE project_id = $1 AND id = $2 AND invocation_id = $3
+              AND lease_id = $4 AND attempt = $5
+            "#,
+        )
+        .bind(project_id)
+        .bind(observation.statement.dispatch_id)
+        .bind(invocation_id)
+        .bind(request.lease_id)
+        .bind(row.try_get::<i32, _>("attempt")?)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::Conflict)?;
+        let sources_json: String = dispatch.try_get("source_descriptors")?;
+        let dispatched_sources: Vec<InformationSource> =
+            serde_json::from_str(&sources_json).map_err(|_| AppError::Internal)?;
+        let request_commitment: Vec<u8> = dispatch.try_get("request_commitment")?;
+        let context_commitment: Vec<u8> = dispatch.try_get("context_commitment")?;
+        let transport_commitment: Vec<u8> = dispatch.try_get("transport_commitment")?;
+        let observed_request = decode_commitment(&observation.statement.request_commitment_hex)?;
+        let observed_context = decode_commitment(&observation.statement.context_commitment_hex)?;
+        let observed_transport =
+            decode_commitment(&observation.statement.transport_commitment_hex)?;
+        let observed_output = decode_commitment(
+            observation
+                .statement
+                .output_commitment_hex
+                .as_deref()
+                .ok_or(AppError::Conflict)?,
+        )?;
+        let observed_artifact = decode_commitment(
+            observation
+                .statement
+                .artifact_commitment_hex
+                .as_deref()
+                .ok_or(AppError::Conflict)?,
+        )?;
+        let dispatched_at: DateTime<Utc> = dispatch.try_get("dispatched_at")?;
+        let expires_at: DateTime<Utc> = dispatch.try_get("lease_expires_at")?;
+        let attempt =
+            u32::try_from(row.try_get::<i32, _>("attempt")?).map_err(|_| AppError::Internal)?;
+        let context_principal: Uuid = row.try_get("context_principal_identity_id")?;
+        if observation.statement.invocation_id != InvocationId::from(invocation_id)
+            || observation.statement.attempt != attempt
+            || observation.statement.lease_id != request.lease_id
+            || observation.statement.principal_identity_id != UserId::from(context_principal)
+            || observation.statement.exposed_sources != dispatched_sources
+            || observed_request.as_slice() != request_commitment.as_slice()
+            || observed_context.as_slice() != context_commitment.as_slice()
+            || observed_transport.as_slice() != transport_commitment.as_slice()
+            || observed_output != output_hash
+            || observed_artifact != artifact_hash
+            || observation
+                .statement
+                .hidden_persistent_model_memory_available
+            || observation.statement.provider_status.trim().is_empty()
+            || observation.statement.provider_status.len() > 128
+            || observation.statement.observed_at < dispatched_at
+            || observation.statement.observed_at >= expires_at
+            || observation.signatures.signer_identity_id != actor.identity_id.into()
+            || observation.signatures.signer_device_id != actor.device_id
+            || to_i32(observation.signatures.signer_device_key_version)? != runner.key_version
+        {
+            return Err(AppError::Conflict);
+        }
+        verify_device_statement_for_signer(
+            &mut transaction,
+            actor.identity_id.into(),
+            &observation.statement,
+            &observation.signatures,
+            MODEL_RUNTIME_OBSERVATION_SIGNATURE_CONTEXT,
+        )
+        .await?;
+        let actual = ModelRuntimeActualObservation {
+            invocation_id: InvocationId::from(invocation_id),
+            attempt,
+            principal: context_principal.into(),
+            exposed_sources: dispatched_sources.clone(),
+            request_commitment: observed_request,
+            output_commitment: Some(observed_output),
+            explicit_failure: false,
+            hidden_persistent_model_memory_available: false,
+        };
+        let projection = R540ModelRuntimeProjection {
+            invocation_id: InvocationId::from(invocation_id),
+            attempt,
+            principal: context_principal.into(),
+            context_sources: sources.clone(),
+            request_commitment: request_commitment
+                .as_slice()
+                .try_into()
+                .map_err(|_| AppError::Internal)?,
+            output_commitment: Some(output_hash),
+            explicit_failure: false,
+        };
+        validate_model_runtime_projection(&actual, &projection).map_err(agent_validation_error)?;
+        Some((
+            observation,
+            dispatched_sources,
+            request_commitment,
+            context_commitment,
+            transport_commitment,
+            context_principal,
+            dispatched_at,
+        ))
+    } else {
+        None
+    };
     for (ordinal, proposal) in request.effects.iter().enumerate() {
         let (descriptor, materialization) = persisted_materialization(proposal)?;
         let proposal_json = canonical_json(&descriptor)?;
@@ -5619,6 +6080,160 @@ pub async fn submit_invocation(
         .bind(proposal_hash.as_slice())
         .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            "INSERT INTO agent_language_causal_mutations (
+                 id, project_id, invocation_id, category, record_id
+             ) VALUES ($1, $2, $3, 'resource_effect', $4)",
+        )
+        .bind(derived_governance_id(
+            b"language-resource-effect",
+            &[project_id, invocation_id, proposal.id],
+        ))
+        .bind(project_id)
+        .bind(invocation_id)
+        .bind(proposal.id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    if let Some((
+        observation,
+        dispatched_sources,
+        request_commitment,
+        context_commitment,
+        transport_commitment,
+        context_principal,
+        dispatched_at,
+    )) = verified_observation
+    {
+        if let Some(run_id) = row.try_get::<Option<Uuid>, _>("run_id")? {
+            let binding = ModelInvocationWorkBinding {
+                trace_id: row
+                    .try_get::<Option<Uuid>, _>("trace_id")?
+                    .ok_or(AppError::Internal)?,
+                run: run_id.into(),
+                goal: row
+                    .try_get::<Option<Uuid>, _>("goal_id")?
+                    .ok_or(AppError::Internal)?
+                    .into(),
+                work: row
+                    .try_get::<Option<Uuid>, _>("work_item_id")?
+                    .ok_or(AppError::Internal)?
+                    .into(),
+                claim: row
+                    .try_get::<Option<Uuid>, _>("work_claim_id")?
+                    .ok_or(AppError::Internal)?
+                    .into(),
+                attempt: u32::try_from(
+                    row.try_get::<Option<i32>, _>("work_attempt")?
+                        .ok_or(AppError::Internal)?,
+                )
+                .map_err(|_| AppError::Internal)?,
+            };
+            validate_invocation_work_binding(
+                &mut transaction,
+                project_id,
+                actor.identity_id.into(),
+                &binding,
+            )
+            .await?;
+        }
+        let observation_hash = governance_canonical_bytes(&observation.statement)?;
+        let observation_hash: [u8; 32] = Sha256::digest(observation_hash).into();
+        sqlx::query(
+            r#"
+            INSERT INTO agent_model_attempt_observations (
+                id, project_id, dispatch_id, invocation_id, attempt, lease_id,
+                principal_identity_id, status, provider_status,
+                request_commitment, context_commitment, exposure_commitment,
+                output_commitment, artifact_commitment, structured_artifact,
+                transport_commitment, exposed_source_descriptors,
+                hidden_persistent_model_memory_available,
+                signer_identity_id, signer_device_id, signer_key_version,
+                classical_signature, post_quantum_signature,
+                observation_hash, idempotency_key, observed_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, 'succeeded', $8,
+                $9, $10, $10, $11, $12, $13::jsonb, $14, $15::jsonb,
+                false, $16, $17, $18, $19, $20, $21, $22, $23
+            )
+            "#,
+        )
+        .bind(observation.statement.observation_id)
+        .bind(project_id)
+        .bind(observation.statement.dispatch_id)
+        .bind(invocation_id)
+        .bind(to_i32(observation.statement.attempt)?)
+        .bind(request.lease_id)
+        .bind(context_principal)
+        .bind(&observation.statement.provider_status)
+        .bind(&request_commitment)
+        .bind(&context_commitment)
+        .bind(output_hash.as_slice())
+        .bind(artifact_hash.as_slice())
+        .bind(&artifact_json)
+        .bind(&transport_commitment)
+        .bind(governance_canonical_json(&dispatched_sources)?)
+        .bind(Uuid::from(observation.signatures.signer_identity_id))
+        .bind(observation.signatures.signer_device_id)
+        .bind(to_i32(observation.signatures.signer_device_key_version)?)
+        .bind(&observation.signatures.classical_signature)
+        .bind(&observation.signatures.post_quantum_signature)
+        .bind(observation_hash.as_slice())
+        .bind(observation.statement.idempotency_key)
+        .bind(observation.statement.observed_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO agent_model_invocation_projections (
+                id, project_id, invocation_id, observation_id, provider_attempt,
+                trace_id, run_id, goal_id, work_item_id, work_claim_id, work_attempt,
+                principal_identity_id, status, invocation_surface, language_task,
+                context_source_descriptors, request_commitment, context_commitment,
+                output_commitment, artifact_commitment, structured_artifact, invoked_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                $12, 'succeeded', $13, $14::jsonb, $15::jsonb, $16, $17, $18, $19,
+                $20::jsonb, $21
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(project_id)
+        .bind(invocation_id)
+        .bind(observation.statement.observation_id)
+        .bind(to_i32(observation.statement.attempt)?)
+        .bind(row.try_get::<Option<Uuid>, _>("trace_id")?)
+        .bind(row.try_get::<Option<Uuid>, _>("run_id")?)
+        .bind(row.try_get::<Option<Uuid>, _>("goal_id")?)
+        .bind(row.try_get::<Option<Uuid>, _>("work_item_id")?)
+        .bind(row.try_get::<Option<Uuid>, _>("work_claim_id")?)
+        .bind(row.try_get::<Option<i32>, _>("work_attempt")?)
+        .bind(context_principal)
+        .bind(&invocation_surface)
+        .bind(canonical_json(&language_task)?)
+        .bind(governance_canonical_json(&dispatched_sources)?)
+        .bind(&request_commitment)
+        .bind(&context_commitment)
+        .bind(output_hash.as_slice())
+        .bind(artifact_hash.as_slice())
+        .bind(&artifact_json)
+        .bind(dispatched_at)
+        .execute(&mut *transaction)
+        .await?;
+        if invocation_surface == "interrogation" {
+            persist_interrogation_answer(
+                &mut transaction,
+                project_id,
+                invocation_id,
+                row.try_get::<Option<Uuid>, _>("interrogation_id")?
+                    .ok_or(AppError::Internal)?,
+                &artifact,
+                &dispatched_sources,
+                observation.statement.observed_at,
+            )
+            .await?;
+        }
     }
     sqlx::query(
         r#"
@@ -5667,9 +6282,11 @@ pub async fn fail_invocation(
     }
     let runner = authenticated_runner(&state, actor, project_id, agent_id).await?;
     let mut transaction = begin(&state, actor, project_id).await?;
-    let attempts = sqlx::query_as::<_, (i32, i32)>(
+    let attempts = sqlx::query(
         r#"
-        SELECT attempt, max_attempts
+        SELECT attempt, max_attempts, invocation_surface,
+               context_principal_identity_id, language_task::text AS language_task,
+               trace_id, run_id, goal_id, work_item_id, work_claim_id, work_attempt
         FROM agent_invocations
         WHERE project_id = $1 AND id = $2 AND agent_id = $3
           AND runner_id = $4 AND lease_id = $5
@@ -5685,7 +6302,31 @@ pub async fn fail_invocation(
     .fetch_optional(&mut *transaction)
     .await?
     .ok_or(AppError::Conflict)?;
-    let exhausted = !request.retryable || attempts.0 >= attempts.1;
+    let attempt: i32 = attempts.try_get("attempt")?;
+    let max_attempts: i32 = attempts.try_get("max_attempts")?;
+    let invocation_surface: String = attempts.try_get("invocation_surface")?;
+    if invocation_surface != "generic" && request.observation.is_none() {
+        return Err(AppError::BadRequest(
+            "language surface failure requires a signed endpoint observation",
+        ));
+    }
+    if let Some(observation) = &request.observation {
+        persist_signed_failure_observation(
+            &mut transaction,
+            actor,
+            project_id,
+            agent_id,
+            invocation_id,
+            runner.id,
+            runner.key_version,
+            request.lease_id,
+            request.failure_code,
+            observation,
+            &attempts,
+        )
+        .await?;
+    }
+    let exhausted = !request.retryable || attempt >= max_attempts;
     if exhausted {
         sqlx::query(
             r#"
@@ -5725,8 +6366,8 @@ pub async fn fail_invocation(
         json!({
             "failure_code": request.failure_code.as_str(),
             "retryable": request.retryable,
-            "attempt": attempts.0,
-            "max_attempts": attempts.1,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
             "terminal": exhausted,
         }),
     )
@@ -6580,6 +7221,496 @@ async fn supported_source_resource(
     } else {
         Err(AppError::NotFound)
     }
+}
+
+async fn resolve_invocation_surface_context(
+    state: &AppState,
+    actor: AuthSession,
+    project_id: Uuid,
+    agent_id: Uuid,
+    binding: InvocationSurfaceBinding,
+) -> Result<UserId, AppError> {
+    let mut transaction = begin(state, actor, project_id).await?;
+    let principal = match binding.surface {
+        InvocationSurface::Generic => {
+            if binding.proxy_request_id.is_some() || binding.interrogation_id.is_some() {
+                return Err(AppError::BadRequest(
+                    "generic invocation has surface reference",
+                ));
+            }
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT principal_identity_id FROM governed_agents
+                 WHERE project_id = $1 AND id = $2 AND state = 'active'",
+            )
+            .bind(project_id)
+            .bind(agent_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(AppError::NotFound)?
+        }
+        InvocationSurface::UserProxy => {
+            if binding.task_kind != StructuredLanguageTaskKind::InterpretProxyRequest
+                || binding.interrogation_id.is_some()
+            {
+                return Err(AppError::BadRequest("invalid proxy language task binding"));
+            }
+            let request_id = binding.proxy_request_id.ok_or(AppError::BadRequest(
+                "proxy invocation requires exact request",
+            ))?;
+            sqlx::query_scalar::<_, Uuid>(
+                r#"
+                SELECT request.user_identity_id
+                FROM user_proxy_requests request
+                JOIN user_proxy_threads thread
+                  ON thread.project_id = request.project_id
+                 AND thread.id = request.thread_id
+                WHERE request.project_id = $1 AND request.id = $2
+                  AND request.user_identity_id = $3 AND thread.closed_at IS NULL
+                "#,
+            )
+            .bind(project_id)
+            .bind(Uuid::from(request_id))
+            .bind(actor.identity_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(AppError::NotFound)?
+        }
+        InvocationSurface::Interrogation => {
+            if binding.task_kind != StructuredLanguageTaskKind::AnswerFromAuthorizedContext
+                || binding.proxy_request_id.is_some()
+            {
+                return Err(AppError::BadRequest(
+                    "invalid interrogation language task binding",
+                ));
+            }
+            let session_id = binding.interrogation_id.ok_or(AppError::BadRequest(
+                "interrogation invocation requires exact session",
+            ))?;
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT creator_identity_id FROM agent_interrogations
+                 WHERE project_id = $1 AND id = $2 AND target_agent_id = $3
+                   AND creator_identity_id = $4
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agent_interrogation_answers answer
+                       WHERE answer.project_id = agent_interrogations.project_id
+                         AND answer.interrogation_id = agent_interrogations.id
+                   )",
+            )
+            .bind(project_id)
+            .bind(Uuid::from(session_id))
+            .bind(agent_id)
+            .bind(actor.identity_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(AppError::NotFound)?
+        }
+        InvocationSurface::GovernanceSummary => {
+            if binding.task_kind != StructuredLanguageTaskKind::SummarizeGovernanceDecision
+                || binding.proxy_request_id.is_some()
+                || binding.interrogation_id.is_some()
+            {
+                return Err(AppError::BadRequest("invalid governance summary binding"));
+            }
+            actor.identity_id
+        }
+    };
+    transaction.commit().await?;
+    Ok(principal.into())
+}
+
+async fn validate_invocation_work_binding(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    agent_principal: UserId,
+    binding: &ModelInvocationWorkBinding,
+) -> Result<(), AppError> {
+    let valid = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM agent_collaborative_runs run
+            JOIN agent_run_work_slots slot
+              ON slot.project_id = run.project_id AND slot.run_id = run.id
+            JOIN agent_run_claim_leases claim
+              ON claim.project_id = slot.project_id
+             AND claim.run_id = slot.run_id
+             AND claim.work_item_id = slot.work_item_id
+            WHERE run.project_id = $1 AND run.id = $2 AND run.goal_id = $3
+              AND slot.work_item_id = $4 AND claim.id = $5
+              AND claim.attempt = $6 AND claim.claimant_identity_id = $7
+              AND claim.status = 'active'
+              AND claim.acquired_at <= clock_timestamp()
+              AND clock_timestamp() < claim.expires_at
+              AND run.goal_status = 'active' AND run.run_status = 'running'
+        )
+        "#,
+    )
+    .bind(project_id)
+    .bind(Uuid::from(binding.run))
+    .bind(Uuid::from(binding.goal))
+    .bind(Uuid::from(binding.work))
+    .bind(Uuid::from(binding.claim))
+    .bind(to_i32(binding.attempt)?)
+    .bind(Uuid::from(agent_principal))
+    .fetch_one(&mut **transaction)
+    .await?;
+    if valid {
+        Ok(())
+    } else {
+        Err(AppError::Conflict)
+    }
+}
+
+async fn interrogation_read_only_fingerprint(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+) -> Result<[u8; 32], AppError> {
+    let snapshot = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT jsonb_build_object(
+            'resource_effects', (SELECT count(*) FROM agent_effect_proposals
+                                 WHERE project_id = $1),
+            'prompt_revisions', (SELECT count(*) FROM agent_prompt_revisions
+                                 WHERE project_id = $1),
+            'local_goal_revisions', (SELECT count(*) FROM agent_local_goal_contracts
+                                     WHERE project_id = $1),
+            'work_items', (SELECT count(*) FROM agent_run_work_slots
+                           WHERE project_id = $1),
+            'assigned_tasks', (SELECT count(*) FROM task_assignments
+                               WHERE project_id = $1),
+            'run_states', COALESCE((
+                SELECT jsonb_agg(jsonb_build_array(id, state_version, encode(state_hash, 'hex'))
+                                 ORDER BY id)
+                FROM agent_collaborative_runs WHERE project_id = $1
+            ), '[]'::jsonb)
+        )::text
+        "#,
+    )
+    .bind(project_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(Sha256::digest(snapshot.as_bytes()).into())
+}
+
+async fn persist_interrogation_answer(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    invocation_id: Uuid,
+    interrogation_id: Uuid,
+    artifact: &StructuredLanguageArtifact,
+    actual_sources: &[InformationSource],
+    answered_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let StructuredLanguageArtifact::InterrogationAnswer {
+        session_id,
+        encrypted_answer,
+        context_sources,
+    } = artifact
+    else {
+        return Err(AppError::BadRequest(
+            "interrogation requires an answer artifact",
+        ));
+    };
+    if Uuid::from(*session_id) != interrogation_id || context_sources != actual_sources {
+        return Err(AppError::Conflict);
+    }
+    let question = sqlx::query(
+        "SELECT creator_identity_id, target_agent_identity_id,
+                transcript_resource_node_id, key_epoch, encrypted_transcript,
+                causal_delta::text AS causal_delta, created_at
+         FROM agent_interrogations
+         WHERE project_id = $1 AND id = $2
+           AND NOT EXISTS (
+               SELECT 1 FROM agent_interrogation_answers answer
+               WHERE answer.project_id = agent_interrogations.project_id
+                 AND answer.interrogation_id = agent_interrogations.id
+           )
+         FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(interrogation_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    if !interrogation_invocation_is_read_only(transaction, project_id, invocation_id).await? {
+        return Err(AppError::Conflict);
+    }
+    let after = interrogation_read_only_fingerprint(transaction, project_id).await?;
+    let question_fingerprint = canonical_hash(&json!({
+        "interrogation_id": interrogation_id,
+        "creator_identity_id": question.try_get::<Uuid, _>("creator_identity_id")?,
+        "target_agent_identity_id": question.try_get::<Uuid, _>("target_agent_identity_id")?,
+        "transcript_resource_node_id": question.try_get::<Uuid, _>("transcript_resource_node_id")?,
+        "key_epoch": question.try_get::<i32, _>("key_epoch")?,
+        "encrypted_transcript_commitment": hex::encode(Sha256::digest(
+            question.try_get::<Vec<u8>, _>("encrypted_transcript")?,
+        )),
+        "causal_delta": serde_json::from_str::<Value>(question.try_get("causal_delta")?)
+            .map_err(|_| AppError::Internal)?,
+        "created_at": question.try_get::<DateTime<Utc>, _>("created_at")?,
+    }))?;
+    let rows = sqlx::query(
+        r#"
+        INSERT INTO agent_interrogation_answers (
+            id, project_id, interrogation_id, invocation_id,
+            encrypted_answer, context_source_descriptors,
+            question_state_fingerprint, answer_state_fingerprint, answered_at
+        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+        "#,
+    )
+    .bind(derived_governance_id(
+        b"interrogation-answer",
+        &[interrogation_id, invocation_id],
+    ))
+    .bind(project_id)
+    .bind(interrogation_id)
+    .bind(invocation_id)
+    .bind(serialize_ciphertext(encrypted_answer)?)
+    .bind(governance_canonical_json(context_sources)?)
+    .bind(question_fingerprint.as_slice())
+    .bind(after.as_slice())
+    .bind(answered_at)
+    .execute(&mut **transaction)
+    .await?;
+    if rows.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(AppError::Conflict)
+    }
+}
+
+async fn interrogation_invocation_is_read_only(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    invocation_id: Uuid,
+) -> Result<bool, AppError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT sprout_private.interrogation_invocation_is_read_only($1, $2)",
+    )
+    .bind(project_id)
+    .bind(invocation_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(AppError::from)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_signed_failure_observation(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: AuthSession,
+    project_id: Uuid,
+    _agent_id: Uuid,
+    invocation_id: Uuid,
+    runner_id: Uuid,
+    runner_key_version: i32,
+    lease_id: Uuid,
+    failure_code: RunnerFailureCode,
+    observation: &SignedModelEndpointObservation,
+    invocation: &PgRow,
+) -> Result<(), AppError> {
+    let attempt_i32: i32 = invocation.try_get("attempt")?;
+    let attempt = u32::try_from(attempt_i32).map_err(|_| AppError::Internal)?;
+    let dispatch = sqlx::query(
+        r#"
+        SELECT id, runner_id, runner_identity_id, runner_device_id,
+               runner_key_version, context_principal_identity_id,
+               request_commitment, context_commitment, transport_commitment,
+               source_descriptors::text AS source_descriptors,
+               dispatched_at, lease_expires_at
+        FROM agent_model_attempt_dispatches
+        WHERE project_id = $1 AND id = $2 AND invocation_id = $3
+          AND attempt = $4 AND lease_id = $5
+        "#,
+    )
+    .bind(project_id)
+    .bind(observation.statement.dispatch_id)
+    .bind(invocation_id)
+    .bind(attempt_i32)
+    .bind(lease_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let sources: Vec<InformationSource> =
+        serde_json::from_str(dispatch.try_get("source_descriptors")?)
+            .map_err(|_| AppError::Internal)?;
+    let request_commitment: Vec<u8> = dispatch.try_get("request_commitment")?;
+    let context_commitment: Vec<u8> = dispatch.try_get("context_commitment")?;
+    let transport_commitment: Vec<u8> = dispatch.try_get("transport_commitment")?;
+    let principal: Uuid = dispatch.try_get("context_principal_identity_id")?;
+    let dispatched_at: DateTime<Utc> = dispatch.try_get("dispatched_at")?;
+    let expires_at: DateTime<Utc> = dispatch.try_get("lease_expires_at")?;
+    if observation.statement.invocation_id != InvocationId::from(invocation_id)
+        || observation.statement.attempt != attempt
+        || observation.statement.lease_id != lease_id
+        || observation.statement.principal_identity_id != UserId::from(principal)
+        || observation.statement.exposed_sources != sources
+        || observation.statement.output_commitment_hex.is_some()
+        || observation.statement.artifact_commitment_hex.is_some()
+        || observation.statement.request_commitment_hex != hex::encode(&request_commitment)
+        || observation.statement.context_commitment_hex != hex::encode(&context_commitment)
+        || observation.statement.transport_commitment_hex != hex::encode(&transport_commitment)
+        || observation
+            .statement
+            .hidden_persistent_model_memory_available
+        || observation.statement.provider_status != failure_code.as_str()
+        || observation.statement.observed_at < dispatched_at
+        || observation.statement.observed_at >= expires_at
+        || dispatch.try_get::<Uuid, _>("runner_id")? != runner_id
+        || dispatch.try_get::<Uuid, _>("runner_identity_id")? != actor.identity_id
+        || dispatch.try_get::<Uuid, _>("runner_device_id")? != actor.device_id
+        || dispatch.try_get::<i32, _>("runner_key_version")? != runner_key_version
+        || observation.signatures.signer_identity_id != actor.identity_id.into()
+        || observation.signatures.signer_device_id != actor.device_id
+        || to_i32(observation.signatures.signer_device_key_version)? != runner_key_version
+    {
+        return Err(AppError::Conflict);
+    }
+    verify_device_statement_for_signer(
+        transaction,
+        actor.identity_id.into(),
+        &observation.statement,
+        &observation.signatures,
+        MODEL_RUNTIME_OBSERVATION_SIGNATURE_CONTEXT,
+    )
+    .await?;
+    validate_model_runtime_projection(
+        &ModelRuntimeActualObservation {
+            invocation_id: InvocationId::from(invocation_id),
+            attempt,
+            principal: principal.into(),
+            exposed_sources: sources.clone(),
+            request_commitment: request_commitment
+                .as_slice()
+                .try_into()
+                .map_err(|_| AppError::Internal)?,
+            output_commitment: None,
+            explicit_failure: true,
+            hidden_persistent_model_memory_available: false,
+        },
+        &R540ModelRuntimeProjection {
+            invocation_id: InvocationId::from(invocation_id),
+            attempt,
+            principal: principal.into(),
+            context_sources: sources.clone(),
+            request_commitment: request_commitment
+                .as_slice()
+                .try_into()
+                .map_err(|_| AppError::Internal)?,
+            output_commitment: None,
+            explicit_failure: true,
+        },
+    )
+    .map_err(agent_validation_error)?;
+    if let Some(run_id) = invocation.try_get::<Option<Uuid>, _>("run_id")? {
+        let binding = ModelInvocationWorkBinding {
+            trace_id: invocation
+                .try_get::<Option<Uuid>, _>("trace_id")?
+                .ok_or(AppError::Internal)?,
+            run: run_id.into(),
+            goal: invocation
+                .try_get::<Option<Uuid>, _>("goal_id")?
+                .ok_or(AppError::Internal)?
+                .into(),
+            work: invocation
+                .try_get::<Option<Uuid>, _>("work_item_id")?
+                .ok_or(AppError::Internal)?
+                .into(),
+            claim: invocation
+                .try_get::<Option<Uuid>, _>("work_claim_id")?
+                .ok_or(AppError::Internal)?
+                .into(),
+            attempt: u32::try_from(
+                invocation
+                    .try_get::<Option<i32>, _>("work_attempt")?
+                    .ok_or(AppError::Internal)?,
+            )
+            .map_err(|_| AppError::Internal)?,
+        };
+        validate_invocation_work_binding(
+            transaction,
+            project_id,
+            actor.identity_id.into(),
+            &binding,
+        )
+        .await?;
+    }
+    let observation_hash: [u8; 32] =
+        Sha256::digest(governance_canonical_bytes(&observation.statement)?).into();
+    sqlx::query(
+        r#"
+        INSERT INTO agent_model_attempt_observations (
+            id, project_id, dispatch_id, invocation_id, attempt, lease_id,
+            principal_identity_id, status, provider_status,
+            request_commitment, context_commitment, exposure_commitment,
+            transport_commitment, exposed_source_descriptors,
+            hidden_persistent_model_memory_available,
+            signer_identity_id, signer_device_id, signer_key_version,
+            classical_signature, post_quantum_signature,
+            observation_hash, idempotency_key, observed_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, 'explicit_failure', $8,
+            $9, $10, $10, $11, $12::jsonb, false,
+            $13, $14, $15, $16, $17, $18, $19, $20
+        )
+        "#,
+    )
+    .bind(observation.statement.observation_id)
+    .bind(project_id)
+    .bind(observation.statement.dispatch_id)
+    .bind(invocation_id)
+    .bind(attempt_i32)
+    .bind(lease_id)
+    .bind(principal)
+    .bind(&observation.statement.provider_status)
+    .bind(&request_commitment)
+    .bind(&context_commitment)
+    .bind(&transport_commitment)
+    .bind(governance_canonical_json(&sources)?)
+    .bind(actor.identity_id)
+    .bind(actor.device_id)
+    .bind(runner_key_version)
+    .bind(&observation.signatures.classical_signature)
+    .bind(&observation.signatures.post_quantum_signature)
+    .bind(observation_hash.as_slice())
+    .bind(observation.statement.idempotency_key)
+    .bind(observation.statement.observed_at)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO agent_model_invocation_projections (
+            id, project_id, invocation_id, observation_id, provider_attempt,
+            trace_id, run_id, goal_id, work_item_id, work_claim_id, work_attempt,
+            principal_identity_id, status, invocation_surface, language_task,
+            context_source_descriptors, request_commitment, context_commitment,
+            invoked_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+            $12, 'explicit_failure', $13, $14::jsonb, $15::jsonb, $16, $17, $18
+        )
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(project_id)
+    .bind(invocation_id)
+    .bind(observation.statement.observation_id)
+    .bind(attempt_i32)
+    .bind(invocation.try_get::<Option<Uuid>, _>("trace_id")?)
+    .bind(invocation.try_get::<Option<Uuid>, _>("run_id")?)
+    .bind(invocation.try_get::<Option<Uuid>, _>("goal_id")?)
+    .bind(invocation.try_get::<Option<Uuid>, _>("work_item_id")?)
+    .bind(invocation.try_get::<Option<Uuid>, _>("work_claim_id")?)
+    .bind(invocation.try_get::<Option<i32>, _>("work_attempt")?)
+    .bind(principal)
+    .bind(invocation.try_get::<String, _>("invocation_surface")?)
+    .bind(invocation.try_get::<String, _>("language_task")?)
+    .bind(governance_canonical_json(&sources)?)
+    .bind(&request_commitment)
+    .bind(&context_commitment)
+    .bind(dispatched_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 fn source_resource(source: &InformationSource) -> Option<Uuid> {

@@ -3182,6 +3182,36 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         .bootstrap_token
         .expect("exact creation bootstrap token");
 
+    let runner_key_ids = DeviceKeyIds {
+        x25519: Uuid::new_v4(),
+        ml_kem_768: Uuid::new_v4(),
+        ed25519: Uuid::new_v4(),
+        ml_dsa_65: Uuid::new_v4(),
+    };
+    let generated_runner =
+        generate_experimental_device_package(runner_device_id, runner_key_ids.clone())
+            .expect("generate runner endpoint-TCB signing package");
+    let runner_public = generated_runner.public_package();
+    let runner_public_key = |algorithm| {
+        runner_public
+            .encryption_keys
+            .iter()
+            .chain(&runner_public.signing_keys)
+            .find(|key| key.algorithm == algorithm)
+            .expect("runner endpoint-TCB public key")
+            .public_key
+            .clone()
+    };
+    let runner_x25519_public = runner_public_key(KeyAlgorithm::X25519);
+    let runner_ml_kem_public = runner_public_key(KeyAlgorithm::MlKem768Experimental);
+    let runner_ed25519_public = runner_public_key(KeyAlgorithm::Ed25519);
+    let runner_ml_dsa_public = runner_public_key(KeyAlgorithm::MlDsa65Experimental);
+    let runner_package_json = runner_public
+        .to_canonical_json()
+        .expect("serialize runner endpoint-TCB package");
+    let runner_ed25519_private_key = generated_runner.private_keys().ed25519().to_vec();
+    let runner_ml_dsa_65_private_key = generated_runner.private_keys().ml_dsa_65().to_vec();
+
     let mut prepare = fixture.pool.begin().await.expect("begin runner prepare");
     sqlx::query("SET LOCAL row_security = off")
         .execute(&mut *prepare)
@@ -3192,18 +3222,30 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         INSERT INTO device_keys (
             identity_id, device_id, key_version,
             encryption_public_key, signing_public_key,
-            previous_package_hash, package_hash,
-            x25519_public_key, ed25519_public_key
+            suite_version, generation, previous_package_hash, package_hash,
+            package_json, x25519_key_id, ml_kem_768_key_id,
+            ed25519_key_id, ml_dsa_65_key_id,
+            x25519_public_key, ml_kem_768_public_key,
+            ed25519_public_key, ml_dsa_65_public_key
         ) VALUES (
             $1, $2, 1,
-            decode(repeat('33', 32), 'hex'), decode(repeat('44', 32), 'hex'),
-            decode(repeat('00', 32), 'hex'), digest($2::text, 'sha256'),
-            decode(repeat('33', 32), 'hex'), decode(repeat('44', 32), 'hex')
+            $3, $4, 32769, 0, decode(repeat('00', 32), 'hex'),
+            digest($5, 'sha256'), $5, $6, $7, $8, $9,
+            $3, $10, $4, $11
         )
         "#,
     )
     .bind(agent_identity_id)
     .bind(runner_device_id)
+    .bind(&runner_x25519_public)
+    .bind(&runner_ed25519_public)
+    .bind(&runner_package_json)
+    .bind(runner_key_ids.x25519)
+    .bind(runner_key_ids.ml_kem_768)
+    .bind(runner_key_ids.ed25519)
+    .bind(runner_key_ids.ml_dsa_65)
+    .bind(&runner_ml_kem_public)
+    .bind(&runner_ml_dsa_public)
     .execute(&mut *prepare)
     .await
     .expect("insert runner device key");
@@ -3525,6 +3567,1009 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
             "foreign runner status={status} body={body}"
         );
     }
+
+    // A real endpoint-TCB invocation answers the previously created
+    // interrogation from an exact, ordered source list. The collaborative run
+    // and foreign-runner checks above are unrelated project changes after the
+    // question; they must not invalidate the causally read-only answer.
+    let collaborative_claim_id =
+        Uuid::parse_str(&collaborative_claim_id).expect("collaborative claim UUID");
+    let (collaborative_goal_id, collaborative_work_item_id, collaborative_attempt) =
+        sqlx::query_as::<_, (Uuid, Uuid, i32)>(
+            r#"
+            SELECT run.goal_id, claim.work_item_id, claim.attempt
+            FROM agent_run_claim_leases claim
+            JOIN agent_collaborative_runs run
+              ON run.project_id = claim.project_id AND run.id = claim.run_id
+            WHERE claim.project_id = $1 AND claim.id = $2
+            "#,
+        )
+        .bind(fixture.project_id)
+        .bind(collaborative_claim_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("load exact collaborative work binding");
+    let model_invocation_id = Uuid::new_v4();
+    let model_trace_id = Uuid::new_v4();
+    let model_language_task = json!({
+        "id": Uuid::new_v4(),
+        "kind": "answer_from_authorized_context",
+        "input_item_count": 2,
+        "max_input_items": 2,
+        "max_output_items": 1,
+        "max_nesting_depth": 2,
+        "max_attempts": 2,
+        "closed_output_schema": true,
+        "grounded_identifiers_only": true,
+        "requires_formal_proof": false,
+        "requires_permission_decision": false,
+        "requires_exact_semantic_equivalence": false,
+        "requires_exhaustive_world_knowledge": false,
+        "allowed_resource_ids": [fixture.profile_resource_id],
+        "allowed_principal_ids": [fixture.owner_id],
+        "allowed_tools": []
+    });
+    let exact_context_sources = json!([
+        {
+            "kind": "resource_body",
+            "resource_id": fixture.profile_resource_id
+        },
+        {
+            "kind": "info_document",
+            "resource_id": fixture.profile_resource_id,
+            "document_id": fixture.info_document_id
+        }
+    ]);
+    let failed_model_invocation_id = Uuid::new_v4();
+    let queue_failed_model = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": failed_model_invocation_id,
+                        "local_goal_id": local_goal_id,
+                        "local_goal_revision": 1,
+                        "language_task": model_language_task,
+                        "authority_envelope": {
+                            "resource_authority": [],
+                            "tool_authority": []
+                        },
+                        "sources": exact_context_sources,
+                        "encrypted_input": encrypted(40),
+                        "surface": "interrogation",
+                        "interrogation_id": interrogation_id,
+                        "work_binding": {
+                            "trace_id": Uuid::new_v4(),
+                            "run": collaborative_run_id,
+                            "goal": collaborative_goal_id,
+                            "work": collaborative_work_item_id,
+                            "claim": collaborative_claim_id,
+                            "attempt": collaborative_attempt
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("queue explicit-failure model invocation"),
+        )
+        .await
+        .expect("queue explicit-failure model response");
+    assert_eq!(
+        queue_failed_model.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(queue_failed_model).await
+    );
+    let claim_failed_model = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/runner/claim",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::empty())
+                .expect("claim explicit-failure model invocation"),
+        )
+        .await
+        .expect("claim explicit-failure model response");
+    assert_eq!(claim_failed_model.status(), StatusCode::OK);
+    let claim_failed_model = json_body(claim_failed_model).await;
+    let failed_observation_id = Uuid::new_v4();
+    let failed_statement = json!({
+        "observation_id": failed_observation_id,
+        "dispatch_id": claim_failed_model["dispatch_id"],
+        "invocation_id": failed_model_invocation_id,
+        "attempt": claim_failed_model["attempt"],
+        "lease_id": claim_failed_model["lease_id"],
+        "principal_identity_id": fixture.owner_id,
+        "exposed_sources": exact_context_sources,
+        "request_commitment_hex": claim_failed_model["request_commitment_hex"],
+        "context_commitment_hex": claim_failed_model["context_commitment_hex"],
+        "transport_commitment_hex": claim_failed_model["transport_commitment_hex"],
+        "output_commitment_hex": null,
+        "artifact_commitment_hex": null,
+        "provider_status": "invalid_structured_output",
+        "hidden_persistent_model_memory_available": false,
+        "idempotency_key": failed_observation_id,
+        "observed_at": Utc::now()
+    });
+    let fail_model = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{failed_model_invocation_id}/fail",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({
+                        "lease_id": claim_failed_model["lease_id"],
+                        "failure_code": "invalid_structured_output",
+                        "retryable": false,
+                        "observation": {
+                            "statement": failed_statement,
+                            "signatures": signed_statement_by(
+                                agent_identity_id,
+                                runner_device_id,
+                                &runner_ed25519_private_key,
+                                &runner_ml_dsa_65_private_key,
+                                &failed_statement,
+                                b"sprout-model-runtime-observation-v1"
+                            )
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("persist explicit-failure model observation"),
+        )
+        .await
+        .expect("persist explicit-failure model response");
+    assert_eq!(fail_model.status(), StatusCode::OK);
+    let mut failure_surface = fixture.pool.begin().await.expect("begin failure inventory");
+    sqlx::query("SELECT set_config('app.identity_id', $1, true)")
+        .bind(fixture.owner_id.to_string())
+        .execute(&mut *failure_surface)
+        .await
+        .expect("set failure inventory identity");
+    let failure_inventory = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT surface, mode, record_count
+         FROM agent_r541_language_surface_inventory ORDER BY surface",
+    )
+    .fetch_all(&mut *failure_surface)
+    .await
+    .expect("load explicit-failure surface inventory");
+    for surface_name in ["model", "interrogation", "proxy"] {
+        assert!(failure_inventory.contains(&(
+            surface_name.to_owned(),
+            "disabled_fail_closed".to_owned(),
+            0
+        )));
+    }
+    failure_surface
+        .rollback()
+        .await
+        .expect("rollback failure inventory");
+    let queue_model = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": model_invocation_id,
+                        "local_goal_id": local_goal_id,
+                        "local_goal_revision": 1,
+                        "language_task": model_language_task,
+                        "authority_envelope": {
+                            "resource_authority": [],
+                            "tool_authority": []
+                        },
+                        "sources": exact_context_sources,
+                        "encrypted_input": encrypted(41),
+                        "surface": "interrogation",
+                        "interrogation_id": interrogation_id,
+                        "work_binding": {
+                            "trace_id": model_trace_id,
+                            "run": collaborative_run_id,
+                            "goal": collaborative_goal_id,
+                            "work": collaborative_work_item_id,
+                            "claim": collaborative_claim_id,
+                            "attempt": collaborative_attempt
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("queue exact interrogation model invocation"),
+        )
+        .await
+        .expect("queue exact interrogation model response");
+    assert_eq!(
+        queue_model.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(queue_model).await
+    );
+    let claim_model = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/runner/claim",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::empty())
+                .expect("claim exact interrogation model invocation"),
+        )
+        .await
+        .expect("claim exact interrogation model response");
+    assert_eq!(claim_model.status(), StatusCode::OK);
+    let claim_model = json_body(claim_model).await;
+    let dispatch_id = claim_model["dispatch_id"].as_str().expect("dispatch id");
+    let model_lease_id = claim_model["lease_id"].as_str().expect("model lease id");
+    let model_attempt = claim_model["attempt"].as_i64().expect("model attempt");
+    let model_output = encrypted(42);
+    let grounded_output = json!({
+        "items": [{
+            "resource_id": fixture.profile_resource_id,
+            "principal_id": fixture.owner_id,
+            "tool": null,
+            "action": null
+        }],
+        "max_observed_nesting_depth": 1
+    });
+    let interrogation_artifact = json!({
+        "kind": "interrogation_answer",
+        "session_id": interrogation_id,
+        "encrypted_answer": model_output,
+        "context_sources": exact_context_sources
+    });
+    let output_projection = json!({
+        "structured_output": grounded_output,
+        "encrypted_output": model_output,
+        "effects": []
+    });
+    let output_commitment = sha256_hex(
+        serde_json::to_string(&output_projection)
+            .unwrap()
+            .as_bytes(),
+    );
+    let artifact_commitment = canonical_hash_hex(&interrogation_artifact);
+    let make_model_submit = |sources: Value, observation_id: Uuid| {
+        let statement = json!({
+            "observation_id": observation_id,
+            "dispatch_id": dispatch_id,
+            "invocation_id": model_invocation_id,
+            "attempt": model_attempt,
+            "lease_id": model_lease_id,
+            "principal_identity_id": fixture.owner_id,
+            "exposed_sources": sources,
+            "request_commitment_hex": claim_model["request_commitment_hex"],
+            "context_commitment_hex": claim_model["context_commitment_hex"],
+            "transport_commitment_hex": claim_model["transport_commitment_hex"],
+            "output_commitment_hex": output_commitment,
+            "artifact_commitment_hex": artifact_commitment,
+            "provider_status": "schema_valid",
+            "hidden_persistent_model_memory_available": false,
+            "idempotency_key": observation_id,
+            "observed_at": Utc::now()
+        });
+        json!({
+            "lease_id": model_lease_id,
+            "structured_output": grounded_output,
+            "encrypted_output": model_output,
+            "effects": [],
+            "artifact": interrogation_artifact,
+            "observation": {
+                "statement": statement,
+                "signatures": signed_statement_by(
+                    agent_identity_id,
+                    runner_device_id,
+                    &runner_ed25519_private_key,
+                    &runner_ml_dsa_65_private_key,
+                    &statement,
+                    b"sprout-model-runtime-observation-v1"
+                )
+            }
+        })
+    };
+    let exact_sources = exact_context_sources
+        .as_array()
+        .expect("exact context list")
+        .clone();
+    for forbidden_mutation in [
+        "tool_invocations",
+        "prompt_revisions",
+        "local_goal_revisions",
+        "created_work",
+        "activated_obligations",
+        "assigned_tasks",
+    ] {
+        let mut mutation_attempt = make_model_submit(exact_context_sources.clone(), Uuid::new_v4());
+        mutation_attempt
+            .as_object_mut()
+            .expect("model submit object")
+            .insert(forbidden_mutation.to_owned(), json!([Uuid::new_v4()]));
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/projects/{}/agents/{agent_id}/invocations/{model_invocation_id}/submit",
+                        fixture.project_id
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {runner_token}"))
+                    .body(Body::from(mutation_attempt.to_string()))
+                    .expect("forbidden interrogation mutation request"),
+            )
+            .await
+            .expect("forbidden interrogation mutation response");
+        assert_eq!(
+            rejected.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "mutation category {forbidden_mutation} must be schema-closed"
+        );
+    }
+    let mut resource_effect_attempt =
+        make_model_submit(exact_context_sources.clone(), Uuid::new_v4());
+    resource_effect_attempt["effects"] = json!([{
+        "id": Uuid::new_v4(),
+        "effect": {
+            "resource_id": fixture.profile_resource_id,
+            "operation": "post_comment"
+        },
+        "materialization": {
+            "kind": "replace_info_document",
+            "document_id": fixture.info_document_id,
+            "expected_payload_version": 1,
+            "key_epoch": 1,
+            "idempotency_key": Uuid::new_v4(),
+            "payload": encrypted(47)
+        }
+    }]);
+    let resource_effect_rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{model_invocation_id}/submit",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(resource_effect_attempt.to_string()))
+                .expect("interrogation resource-effect attempt"),
+        )
+        .await
+        .expect("interrogation resource-effect response");
+    assert_eq!(resource_effect_rejected.status(), StatusCode::BAD_REQUEST);
+    let partial_interrogation_records = sqlx::query_scalar::<_, i64>(
+        "SELECT
+             (SELECT count(*) FROM agent_effect_proposals
+              WHERE project_id = $1 AND invocation_id = $2)
+           + (SELECT count(*) FROM agent_language_causal_mutations
+              WHERE project_id = $1 AND invocation_id = $2)
+           + (SELECT count(*) FROM agent_model_attempt_observations
+              WHERE project_id = $1 AND invocation_id = $2)
+           + (SELECT count(*) FROM agent_model_invocation_projections
+              WHERE project_id = $1 AND invocation_id = $2)
+           + (SELECT count(*) FROM agent_interrogation_answers
+              WHERE project_id = $1 AND invocation_id = $2)",
+    )
+    .bind(fixture.project_id)
+    .bind(model_invocation_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count rejected interrogation mutation residue");
+    assert_eq!(partial_interrogation_records, 0);
+    let mut grounded_effect_probe = fixture.pool.begin().await.expect("begin effect probe");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *grounded_effect_probe)
+        .await
+        .expect("enter trusted grounded-effect fixture boundary");
+    sqlx::query("SELECT set_config('app.identity_id', $1, true)")
+        .bind(fixture.owner_id.to_string())
+        .execute(&mut *grounded_effect_probe)
+        .await
+        .expect("set grounded-effect identity");
+    let grounded_effect_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_effect_proposals (
+             id, project_id, invocation_id, agent_id, ordinal,
+             effect, encrypted_materialization, proposal_hash
+         ) VALUES ($1, $2, $3, $4, 99, $5::jsonb, NULL, $6)",
+    )
+    .bind(grounded_effect_id)
+    .bind(fixture.project_id)
+    .bind(model_invocation_id)
+    .bind(agent_id)
+    .bind(
+        json!({
+            "resource_id": fixture.profile_resource_id,
+            "operation": "post_comment"
+        })
+        .to_string(),
+    )
+    .bind(Sha256::digest(grounded_effect_id.as_bytes()).as_slice())
+    .execute(&mut *grounded_effect_probe)
+    .await
+    .expect("insert real authoritative effect record");
+    sqlx::query(
+        "INSERT INTO agent_language_causal_mutations (
+             id, project_id, invocation_id, category, record_id
+         ) VALUES ($1, $2, $3, 'resource_effect', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(fixture.project_id)
+    .bind(model_invocation_id)
+    .bind(grounded_effect_id)
+    .execute(&mut *grounded_effect_probe)
+    .await
+    .expect("bind interrogation to real authoritative effect");
+    let effect_read_only = sqlx::query_scalar::<_, bool>(
+        "SELECT sprout_private.interrogation_invocation_is_read_only($1, $2)",
+    )
+    .bind(fixture.project_id)
+    .bind(model_invocation_id)
+    .fetch_one(&mut *grounded_effect_probe)
+    .await
+    .expect("evaluate grounded resource-effect delta");
+    assert!(!effect_read_only);
+    grounded_effect_probe
+        .rollback()
+        .await
+        .expect("rollback grounded resource-effect probe");
+
+    let mut nonexistent_effect_probe = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin missing effect probe");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *nonexistent_effect_probe)
+        .await
+        .expect("enter missing-effect fixture boundary");
+    let missing_effect = sqlx::query(
+        "INSERT INTO agent_language_causal_mutations (
+             id, project_id, invocation_id, category, record_id
+         ) VALUES ($1, $2, $3, 'resource_effect', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(fixture.project_id)
+    .bind(model_invocation_id)
+    .bind(Uuid::new_v4())
+    .execute(&mut *nonexistent_effect_probe)
+    .await;
+    assert!(
+        missing_effect.is_err(),
+        "causal edge requires a real effect record"
+    );
+    nonexistent_effect_probe
+        .rollback()
+        .await
+        .expect("rollback missing-effect probe");
+
+    for category in [
+        "tool_invocation",
+        "prompt_revision",
+        "local_goal_revision",
+        "created_work",
+        "activated_obligation",
+        "assigned_task",
+    ] {
+        let mut causal_probe = fixture.pool.begin().await.expect("begin causal probe");
+        sqlx::query("SET LOCAL row_security = off")
+            .execute(&mut *causal_probe)
+            .await
+            .expect("enter trusted causal-probe fixture boundary");
+        let unsupported = sqlx::query(
+            "INSERT INTO agent_language_causal_mutations (
+                 id, project_id, invocation_id, category, record_id
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.project_id)
+        .bind(model_invocation_id)
+        .bind(category)
+        .bind(Uuid::new_v4())
+        .execute(&mut *causal_probe)
+        .await;
+        assert!(
+            unsupported.is_err(),
+            "structurally unreachable category {category} must have no DB writer"
+        );
+        causal_probe
+            .rollback()
+            .await
+            .expect("rollback adversarial causal probe");
+    }
+    let adversarial_sources = [
+        Value::Array(exact_sources.iter().cloned().rev().collect()),
+        Value::Array(vec![exact_sources[0].clone()]),
+        Value::Array(vec![
+            exact_sources[0].clone(),
+            exact_sources[1].clone(),
+            json!({
+                "kind": "resource_body",
+                "resource_id": Uuid::new_v4()
+            }),
+        ]),
+        Value::Array(vec![exact_sources[0].clone(), exact_sources[0].clone()]),
+    ];
+    for exposed_sources in adversarial_sources {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/projects/{}/agents/{agent_id}/invocations/{model_invocation_id}/submit",
+                        fixture.project_id
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {runner_token}"))
+                    .body(Body::from(
+                        make_model_submit(exposed_sources, Uuid::new_v4()).to_string(),
+                    ))
+                    .expect("adversarial exact-source submit"),
+            )
+            .await
+            .expect("adversarial exact-source response");
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    }
+    let model_observation_id = Uuid::new_v4();
+    let exact_submit_payload =
+        make_model_submit(exact_context_sources.clone(), model_observation_id);
+    let exact_submit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{model_invocation_id}/submit",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(exact_submit_payload.to_string()))
+                .expect("submit exact interrogation model observation"),
+        )
+        .await
+        .expect("submit exact interrogation model response");
+    assert_eq!(
+        exact_submit.status(),
+        StatusCode::OK,
+        "response={} payload={}",
+        json_body(exact_submit).await,
+        exact_submit_payload
+    );
+    let exact_replay = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{model_invocation_id}/submit",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(exact_submit_payload.to_string()))
+                .expect("replay exact model observation"),
+        )
+        .await
+        .expect("replay exact model response");
+    assert_eq!(exact_replay.status(), StatusCode::OK);
+    let answered = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/projects/{}/agents/{agent_id}/interrogations/{interrogation_id}",
+                        fixture.project_id
+                    ))
+                    .header("authorization", format!("Bearer {}", fixture.owner_token))
+                    .body(Body::empty())
+                    .expect("read answered interrogation"),
+            )
+            .await
+            .expect("read answered interrogation response"),
+    )
+    .await;
+    assert_eq!(answered["encrypted_answer"], model_output);
+    let mut surface = fixture.pool.begin().await.expect("begin surface inventory");
+    sqlx::query("SELECT set_config('app.identity_id', $1, true)")
+        .bind(fixture.owner_id.to_string())
+        .execute(&mut *surface)
+        .await
+        .expect("set surface inventory identity");
+    let inventory = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT surface, mode, record_count
+         FROM agent_r541_language_surface_inventory ORDER BY surface",
+    )
+    .fetch_all(&mut *surface)
+    .await
+    .expect("load exact R5.41 surface inventory");
+    assert!(inventory.contains(&("model".to_owned(), "enabled".to_owned(), 1)));
+    assert!(inventory.contains(&("interrogation".to_owned(), "enabled".to_owned(), 1)));
+    assert!(inventory.contains(&("proxy".to_owned(), "disabled_fail_closed".to_owned(), 0)));
+    surface
+        .rollback()
+        .await
+        .expect("rollback surface inventory");
+
+    // A legacy/deterministic proxy plan remains supported, but only an exact
+    // succeeded model projection may enable the R5.41 model-mediated proxy
+    // surface. Use the owner's already-authorized agent runner so the endpoint
+    // TCB and the user actor remain distinct.
+    let model_proxy_id = Uuid::new_v4();
+    let model_proxy_thread_id = Uuid::new_v4();
+    let create_model_proxy_thread = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/user-proxy/threads",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "proxy_id": model_proxy_id,
+                        "thread_id": model_proxy_thread_id
+                    })
+                    .to_string(),
+                ))
+                .expect("create model-mediated proxy thread request"),
+        )
+        .await
+        .expect("create model-mediated proxy thread response");
+    assert_eq!(create_model_proxy_thread.status(), StatusCode::OK);
+    let model_proxy_request_id = Uuid::new_v4();
+    let create_model_proxy_request = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/user-proxy/threads/{model_proxy_thread_id}/requests",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": model_proxy_request_id,
+                        "encrypted_payload": encrypted(43)
+                    })
+                    .to_string(),
+                ))
+                .expect("create model-mediated proxy request"),
+        )
+        .await
+        .expect("create model-mediated proxy response");
+    assert_eq!(create_model_proxy_request.status(), StatusCode::OK);
+
+    let model_proxy_envelope = json!({
+        "language_task": {
+            "id": Uuid::new_v4(),
+            "kind": "interpret_proxy_request",
+            "input_item_count": 1,
+            "max_input_items": 1,
+            "max_output_items": 1,
+            "max_nesting_depth": 1,
+            "max_attempts": 2,
+            "closed_output_schema": true,
+            "grounded_identifiers_only": true,
+            "requires_formal_proof": false,
+            "requires_permission_decision": false,
+            "requires_exact_semantic_equivalence": false,
+            "requires_exhaustive_world_knowledge": false,
+            "allowed_resource_ids": [fixture.profile_resource_id],
+            "allowed_principal_ids": [fixture.owner_id],
+            "allowed_tools": []
+        },
+        "request_id": model_proxy_request_id,
+        "user": fixture.owner_id,
+        "candidate_resources": [fixture.profile_resource_id],
+        "candidate_operations": ["post_comment"],
+        "available_tools": [],
+        "max_plan_steps": 1
+    });
+    let model_proxy_plan = json!({
+        "request_id": model_proxy_request_id,
+        "thread_id": model_proxy_thread_id,
+        "user": fixture.owner_id,
+        "intent_id": Uuid::new_v4(),
+        "resource_effects": [{
+            "resource_id": fixture.profile_resource_id,
+            "operation": "post_comment"
+        }],
+        "tool_invocations": [],
+        "encrypted_explanation": encrypted(44)
+    });
+    let interrogation_as_proxy_witness = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/user-proxy/requests/{model_proxy_request_id}/plan",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": Uuid::new_v4(),
+                        "invocation_id": model_invocation_id,
+                        "envelope": model_proxy_envelope,
+                        "plan": model_proxy_plan,
+                        "confirmation": {
+                            "user": fixture.owner_id,
+                            "thread_id": model_proxy_thread_id,
+                            "request_id": model_proxy_request_id,
+                            "accepted_plan": model_proxy_plan,
+                            "summary_id": Uuid::new_v4(),
+                            "confirmed_at": Utc::now()
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("reuse interrogation as proxy witness request"),
+        )
+        .await
+        .expect("reuse interrogation as proxy witness response");
+    assert_eq!(
+        interrogation_as_proxy_witness.status(),
+        StatusCode::CONFLICT
+    );
+    let forged_proxy_residue = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM user_proxy_plans
+         WHERE project_id = $1 AND request_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(model_proxy_request_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count rejected cross-surface proxy residue");
+    assert_eq!(forged_proxy_residue, 0);
+    let proxy_model_invocation_id = Uuid::new_v4();
+    let queue_proxy_model = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": proxy_model_invocation_id,
+                        "local_goal_id": local_goal_id,
+                        "local_goal_revision": 1,
+                        "language_task": model_proxy_envelope["language_task"],
+                        "authority_envelope": {
+                            "resource_authority": [],
+                            "tool_authority": []
+                        },
+                        "sources": [{
+                            "kind": "resource_body",
+                            "resource_id": fixture.profile_resource_id
+                        }],
+                        "encrypted_input": encrypted(45),
+                        "surface": "user_proxy",
+                        "proxy_request_id": model_proxy_request_id,
+                        "interrogation_id": null,
+                        "work_binding": null
+                    })
+                    .to_string(),
+                ))
+                .expect("queue model-mediated proxy invocation"),
+        )
+        .await
+        .expect("queue model-mediated proxy response");
+    assert_eq!(
+        queue_proxy_model.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(queue_proxy_model).await
+    );
+    let claim_proxy_model = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/runner/claim",
+                    fixture.project_id
+                ))
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::empty())
+                .expect("claim model-mediated proxy invocation"),
+        )
+        .await
+        .expect("claim model-mediated proxy response");
+    assert_eq!(claim_proxy_model.status(), StatusCode::OK);
+    let claim_proxy_model = json_body(claim_proxy_model).await;
+    let proxy_model_lease_id = claim_proxy_model["lease_id"]
+        .as_str()
+        .expect("proxy model lease id");
+    let proxy_model_output = encrypted(46);
+    let proxy_grounded_output = json!({
+        "items": [{
+            "resource_id": fixture.profile_resource_id,
+            "principal_id": fixture.owner_id,
+            "tool": null,
+            "action": null
+        }],
+        "max_observed_nesting_depth": 1
+    });
+    let proxy_artifact = json!({
+        "kind": "user_proxy_plan",
+        "envelope": model_proxy_envelope,
+        "plan": model_proxy_plan
+    });
+    let proxy_output_projection = json!({
+        "structured_output": proxy_grounded_output,
+        "encrypted_output": proxy_model_output,
+        "effects": []
+    });
+    let proxy_output_commitment = sha256_hex(
+        serde_json::to_string(&proxy_output_projection)
+            .unwrap()
+            .as_bytes(),
+    );
+    let proxy_artifact_commitment = canonical_hash_hex(&proxy_artifact);
+    let proxy_observation_id = Uuid::new_v4();
+    let proxy_observation_statement = json!({
+        "observation_id": proxy_observation_id,
+        "dispatch_id": claim_proxy_model["dispatch_id"],
+        "invocation_id": proxy_model_invocation_id,
+        "attempt": claim_proxy_model["attempt"],
+        "lease_id": proxy_model_lease_id,
+        "principal_identity_id": fixture.owner_id,
+        "exposed_sources": [{
+            "kind": "resource_body",
+            "resource_id": fixture.profile_resource_id
+        }],
+        "request_commitment_hex": claim_proxy_model["request_commitment_hex"],
+        "context_commitment_hex": claim_proxy_model["context_commitment_hex"],
+        "transport_commitment_hex": claim_proxy_model["transport_commitment_hex"],
+        "output_commitment_hex": proxy_output_commitment,
+        "artifact_commitment_hex": proxy_artifact_commitment,
+        "provider_status": "schema_valid",
+        "hidden_persistent_model_memory_available": false,
+        "idempotency_key": proxy_observation_id,
+        "observed_at": Utc::now()
+    });
+    let submit_proxy_model = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{proxy_model_invocation_id}/submit",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({
+                        "lease_id": proxy_model_lease_id,
+                        "structured_output": proxy_grounded_output,
+                        "encrypted_output": proxy_model_output,
+                        "effects": [],
+                        "artifact": proxy_artifact,
+                        "observation": {
+                            "statement": proxy_observation_statement,
+                            "signatures": signed_statement_by(
+                                agent_identity_id,
+                                runner_device_id,
+                                &runner_ed25519_private_key,
+                                &runner_ml_dsa_65_private_key,
+                                &proxy_observation_statement,
+                                b"sprout-model-runtime-observation-v1"
+                            )
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("submit model-mediated proxy invocation"),
+        )
+        .await
+        .expect("submit model-mediated proxy response");
+    assert_eq!(
+        submit_proxy_model.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(submit_proxy_model).await
+    );
+    let record_model_proxy_plan = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/user-proxy/requests/{model_proxy_request_id}/plan",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": Uuid::new_v4(),
+                        "invocation_id": proxy_model_invocation_id,
+                        "envelope": model_proxy_envelope,
+                        "plan": model_proxy_plan,
+                        "confirmation": {
+                            "user": fixture.owner_id,
+                            "thread_id": model_proxy_thread_id,
+                            "request_id": model_proxy_request_id,
+                            "accepted_plan": model_proxy_plan,
+                            "summary_id": Uuid::new_v4(),
+                            "confirmed_at": Utc::now()
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("record exact model-mediated proxy plan"),
+        )
+        .await
+        .expect("record exact model-mediated proxy plan response");
+    assert_eq!(
+        record_model_proxy_plan.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(record_model_proxy_plan).await
+    );
+    let mut proxy_surface = fixture.pool.begin().await.expect("begin proxy inventory");
+    sqlx::query("SELECT set_config('app.identity_id', $1, true)")
+        .bind(fixture.owner_id.to_string())
+        .execute(&mut *proxy_surface)
+        .await
+        .expect("set proxy inventory identity");
+    let proxy_inventory = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT surface, mode, record_count
+         FROM agent_r541_language_surface_inventory ORDER BY surface",
+    )
+    .fetch_all(&mut *proxy_surface)
+    .await
+    .expect("load model-mediated proxy surface inventory");
+    assert!(proxy_inventory.contains(&("proxy".to_owned(), "enabled".to_owned(), 1)));
+    proxy_surface
+        .rollback()
+        .await
+        .expect("rollback proxy inventory");
+
     let mut plaintext_local_goal = local_goal_contract.clone();
     plaintext_local_goal
         .as_object_mut()
@@ -4702,6 +5747,34 @@ async fn governance_verified_history_rejects_app_role_dml_and_shadowing() {
     .await
     .expect("verify SECURITY DEFINER ownership and fixed search path");
     assert!(definer_boundary);
+    let language_definer_boundary = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT bool_and(
+            procedure.prosecdef
+            AND procedure.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+            AND procedure.proconfig @> ARRAY['search_path=pg_catalog']::text[]
+            AND procedure.proconfig @> ARRAY['row_security=off']::text[]
+            AND NOT has_function_privilege(
+                'sprout_0029_untrusted_app', procedure.oid, 'EXECUTE'
+            )
+        )
+        FROM pg_proc procedure
+        JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+        WHERE namespace.nspname = 'sprout_private'
+          AND procedure.proname IN (
+              'agent_language_retention_delete_allowed',
+              'purge_agent_language_for_interrogation',
+              'purge_agent_language_for_proxy_request',
+              'purge_agent_language_for_invocation',
+              'purge_agent_language_for_effect',
+              'interrogation_invocation_is_read_only'
+          )
+        "#,
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify 0031 definer ownership and fixed search path");
+    assert!(language_definer_boundary);
     let counts_before = sqlx::query_scalar::<_, Value>(
         "SELECT jsonb_build_array(
              (SELECT count(*) FROM agent_compilation_certificates WHERE project_id = $1),
@@ -4821,6 +5894,28 @@ async fn governance_verified_history_rejects_app_role_dml_and_shadowing() {
                     NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
                 );
                 RAISE EXCEPTION 'untrusted app executed private 0030 writer';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+            BEGIN
+                PERFORM count(*) FROM public.agent_r541_language_surface_inventory;
+                RAISE EXCEPTION 'untrusted app read certified language inventory';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+            BEGIN
+                INSERT INTO public.agent_language_causal_mutations (
+                    id, project_id, invocation_id, category, record_id
+                ) VALUES (
+                    gen_random_uuid(), current_setting('app.project_id')::uuid,
+                    gen_random_uuid(), 'tool_invocation', gen_random_uuid()
+                );
+                RAISE EXCEPTION 'untrusted app forged language causal history';
+            EXCEPTION WHEN insufficient_privilege THEN NULL;
+            END;
+            BEGIN
+                PERFORM sprout_private.interrogation_invocation_is_read_only(
+                    current_setting('app.project_id')::uuid, gen_random_uuid()
+                );
+                RAISE EXCEPTION 'untrusted app executed private read-only certifier';
             EXCEPTION WHEN insufficient_privilege THEN NULL;
             END;
         END
