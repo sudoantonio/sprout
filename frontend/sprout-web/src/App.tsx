@@ -58,6 +58,7 @@ import {
 } from './components/QuestionnaireScreen'
 import { TasksScreen } from './components/TasksScreen'
 import { WorkspaceUserMenu } from './components/WorkspaceUserMenu'
+import { AiGenerationScreen } from './components/AiGenerationScreen'
 import { useTheme } from './hooks/useTheme'
 import {
   PresetScreen,
@@ -204,6 +205,7 @@ const screenTitles: Record<AppScreen, string> = {
   retention: 'Retention',
   conflicts: 'Conflitti',
   security: 'Sicurezza',
+  ai: 'AI / Generazione testo',
 }
 
 const asLockedReason = (error: unknown): string =>
@@ -5686,6 +5688,9 @@ const App = ({ apiClient, initialSession }: AppProps) => {
                     })
                   }
                 />
+              )}
+              {state.screen === 'ai' && services && (
+                <AiGenerationScreen vault={services.auth.vault} />
               )}
               {state.screen === 'conflicts' && (
                 <ConflictScreen

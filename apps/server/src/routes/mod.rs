@@ -223,8 +223,16 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             post(agents::queue_invocation),
         )
         .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/invocations/client-provider",
+            post(agents::queue_client_provider_invocation),
+        )
+        .route(
             "/v1/projects/{project_id}/agents/{agent_id}/runner/claim",
             post(agents::claim_invocation),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/runner/client-provider/claim",
+            post(agents::claim_client_provider_invocation),
         )
         .route(
             "/v1/projects/{project_id}/agents/{agent_id}/invocations/{invocation_id}/submit",

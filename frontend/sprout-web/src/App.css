@@ -6,6 +6,91 @@
   text-transform: uppercase;
 }
 
+.ai-generation-settings {
+  width: 100%;
+  max-width: 52rem;
+  margin: 0 auto;
+  padding: 0.35rem 1.25rem 2rem;
+}
+
+.ai-mode-grid,
+.ai-settings-form {
+  display: grid;
+  gap: 0.8rem;
+  padding: 1rem 1.1rem;
+}
+
+.ai-mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  color: var(--text-primary);
+  font-size: 0.875rem;
+}
+
+.ai-settings-form label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.ai-settings-form input,
+.ai-settings-form select {
+  width: 100%;
+  min-height: 2.4rem;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-control);
+  background: var(--surface-main);
+  color: var(--text-primary);
+  padding: 0.5rem 0.65rem;
+  font: inherit;
+  font-weight: 450;
+}
+
+.ai-boundary-note {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-control);
+  background: var(--surface-sidebar);
+  color: var(--text-muted);
+  padding: 0.8rem;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.ai-boundary-note p {
+  margin: 0;
+}
+
+.ai-settings-status {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+.ai-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.ai-local-install-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.ai-local-install-actions p {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
 .primary-button,
 .secondary-button,
 .text-button {

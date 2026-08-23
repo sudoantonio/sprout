@@ -5173,6 +5173,34 @@ pub async fn queue_invocation(
     Path((project_id, agent_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<QueueInvocationRequest>,
 ) -> Result<Json<QueueInvocationResponse>, AppError> {
+    queue_invocation_for_runtime(state, actor, project_id, agent_id, request, "legacy_0031").await
+}
+
+pub async fn queue_client_provider_invocation(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<QueueInvocationRequest>,
+) -> Result<Json<QueueInvocationResponse>, AppError> {
+    queue_invocation_for_runtime(
+        state,
+        actor,
+        project_id,
+        agent_id,
+        request,
+        "client_provider_v1",
+    )
+    .await
+}
+
+async fn queue_invocation_for_runtime(
+    state: Arc<AppState>,
+    actor: AuthSession,
+    project_id: Uuid,
+    agent_id: Uuid,
+    request: QueueInvocationRequest,
+    required_runtime_kind: &'static str,
+) -> Result<Json<QueueInvocationResponse>, AppError> {
     if actor.is_agent || request.local_goal_id.is_some() != request.local_goal_revision.is_some() {
         return Err(AppError::BadRequest("invalid invocation goal reference"));
     }
@@ -5288,6 +5316,7 @@ pub async fn queue_invocation(
         "proxy_request_id": request.proxy_request_id,
         "interrogation_id": request.interrogation_id,
         "work_binding": request.work_binding,
+        "required_runtime_kind": required_runtime_kind,
     });
     let request_json = canonical_json(&request_projection)?;
     let request_hash: [u8; 32] = Sha256::digest(request_json.as_bytes()).into();
@@ -5333,12 +5362,12 @@ pub async fn queue_invocation(
             context_principal_identity_id, invocation_surface,
             proxy_request_id, interrogation_id,
             trace_id, run_id, goal_id, work_item_id, work_claim_id, work_attempt,
-            context_hash
+            context_hash, required_runtime_kind
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7::jsonb,
             $8::jsonb, $9, $10, $11, $12,
             $13, $14, $15, $16,
-            $17, $18, $19, $20, $21, $22, $23
+            $17, $18, $19, $20, $21, $22, $23, $24
         )
         "#,
     )
@@ -5396,6 +5425,7 @@ pub async fn queue_invocation(
             .transpose()?,
     )
     .bind(context_hash.as_slice())
+    .bind(required_runtime_kind)
     .execute(&mut *transaction)
     .await?;
     for (ordinal, source) in request.sources.iter().enumerate() {
@@ -5455,6 +5485,7 @@ pub struct ClaimedInvocationResponse {
     request_commitment_hex: String,
     context_commitment_hex: String,
     transport_commitment_hex: String,
+    runtime_kind: &'static str,
 }
 
 pub async fn claim_invocation(
@@ -5462,6 +5493,45 @@ pub async fn claim_invocation(
     actor: AuthSession,
     Path((project_id, agent_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Option<ClaimedInvocationResponse>>, AppError> {
+    claim_invocation_for_runtime(state, actor, project_id, agent_id, "legacy_0031", None).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientProviderClaimRequest {
+    execution_profile_commitment_hex: String,
+}
+
+pub async fn claim_client_provider_invocation(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ClientProviderClaimRequest>,
+) -> Result<Json<Option<ClaimedInvocationResponse>>, AppError> {
+    let execution_profile_commitment =
+        decode_commitment(&request.execution_profile_commitment_hex)?;
+    claim_invocation_for_runtime(
+        state,
+        actor,
+        project_id,
+        agent_id,
+        "client_provider_v1",
+        Some(execution_profile_commitment),
+    )
+    .await
+}
+
+async fn claim_invocation_for_runtime(
+    state: Arc<AppState>,
+    actor: AuthSession,
+    project_id: Uuid,
+    agent_id: Uuid,
+    runtime_kind: &'static str,
+    execution_profile_commitment: Option<[u8; 32]>,
+) -> Result<Json<Option<ClaimedInvocationResponse>>, AppError> {
+    if (runtime_kind == "client_provider_v1") != execution_profile_commitment.is_some() {
+        return Err(AppError::Conflict);
+    }
     if !actor.is_agent {
         return Err(AppError::Forbidden);
     }
@@ -5475,6 +5545,7 @@ pub async fn claim_invocation(
                request_hash
         FROM agent_invocations
         WHERE project_id = $1 AND agent_id = $2
+          AND required_runtime_kind = $3
           AND attempt < max_attempts
           AND (status = 'pending'
                OR (status = 'leased' AND lease_expires_at <= clock_timestamp()))
@@ -5485,6 +5556,7 @@ pub async fn claim_invocation(
     )
     .bind(project_id)
     .bind(agent_id)
+    .bind(runtime_kind)
     .fetch_optional(&mut *transaction)
     .await?;
     let Some(candidate) = candidate else {
@@ -5531,6 +5603,8 @@ pub async fn claim_invocation(
         "encrypted_input": deserialize_ciphertext(candidate.try_get("encrypted_input")?)?,
         "request_commitment_hex": hex::encode(&request_commitment),
         "context_commitment_hex": hex::encode(context_commitment),
+        "runtime_kind": runtime_kind,
+        "execution_profile_commitment_hex": execution_profile_commitment.map(hex::encode),
     });
     let transport_commitment: [u8; 32] =
         Sha256::digest(governance_canonical_bytes(&transport_projection)?).into();
@@ -5559,10 +5633,11 @@ pub async fn claim_invocation(
             runner_identity_id, runner_device_id, runner_key_version,
             context_principal_identity_id, request_commitment,
             context_commitment, exposure_commitment, transport_commitment,
-            source_descriptors, dispatched_at, lease_expires_at
+            source_descriptors, dispatched_at, lease_expires_at, runtime_kind,
+            execution_profile_commitment
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $12, $13, $14::jsonb, $15, $16
+            $11, $12, $12, $13, $14::jsonb, $15, $16, $17, $18
         )
         "#,
     )
@@ -5582,6 +5657,12 @@ pub async fn claim_invocation(
     .bind(source_json)
     .bind(dispatched_at)
     .bind(lease_expires_at)
+    .bind(runtime_kind)
+    .bind(
+        execution_profile_commitment
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    )
     .execute(&mut *transaction)
     .await?;
     append_audit(
@@ -5619,6 +5700,7 @@ pub async fn claim_invocation(
         request_commitment_hex: hex::encode(request_commitment),
         context_commitment_hex: hex::encode(context_commitment),
         transport_commitment_hex: hex::encode(transport_commitment),
+        runtime_kind,
     })))
 }
 
@@ -5671,12 +5753,24 @@ pub struct ModelEndpointObservationStatement {
     request_commitment_hex: String,
     context_commitment_hex: String,
     transport_commitment_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint_request_commitment_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    endpoint_request_exact: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_profile_commitment_hex: Option<String>,
     output_commitment_hex: Option<String>,
     artifact_commitment_hex: Option<String>,
     provider_status: String,
     hidden_persistent_model_memory_available: bool,
     idempotency_key: Uuid,
     observed_at: DateTime<Utc>,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5695,6 +5789,14 @@ pub struct SubmitInvocationRequest {
     effects: Vec<EffectProposalRequest>,
     artifact: Option<StructuredLanguageArtifact>,
     observation: Option<SignedModelEndpointObservation>,
+    #[serde(default)]
+    endpoint_request_commitment_hex: Option<String>,
+    #[serde(default)]
+    endpoint_request_exact: bool,
+    #[serde(default)]
+    runtime_kind: Option<String>,
+    #[serde(default)]
+    execution_profile_commitment_hex: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -5712,6 +5814,14 @@ pub struct FailInvocationRequest {
     failure_code: RunnerFailureCode,
     retryable: bool,
     observation: Option<SignedModelEndpointObservation>,
+    #[serde(default)]
+    endpoint_request_commitment_hex: Option<String>,
+    #[serde(default)]
+    endpoint_request_exact: bool,
+    #[serde(default)]
+    runtime_kind: Option<String>,
+    #[serde(default)]
+    execution_profile_commitment_hex: Option<String>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -5733,6 +5843,13 @@ impl RunnerFailureCode {
             Self::ContextDecryptionFailed => "context_decryption_failed",
             Self::LocalExecutionFailed => "local_execution_failed",
         }
+    }
+
+    const fn requires_endpoint_request_witness(self) -> bool {
+        matches!(
+            self,
+            Self::ProviderUnavailable | Self::ProviderTimeout | Self::InvalidStructuredOutput
+        )
     }
 }
 
@@ -5933,6 +6050,19 @@ pub async fn submit_invocation(
     let output_hash: [u8; 32] = Sha256::digest(output_json.as_bytes()).into();
     let artifact_json = governance_canonical_json(&artifact)?;
     let artifact_hash: [u8; 32] = Sha256::digest(artifact_json.as_bytes()).into();
+    let projected_endpoint_request_commitment = request
+        .endpoint_request_commitment_hex
+        .as_deref()
+        .map(decode_commitment)
+        .transpose()?;
+    let projected_execution_profile_commitment = request
+        .execution_profile_commitment_hex
+        .as_deref()
+        .map(decode_commitment)
+        .transpose()?;
+    if request.endpoint_request_exact != projected_endpoint_request_commitment.is_some() {
+        return Err(AppError::Conflict);
+    }
 
     let verified_observation = if let Some(observation) = &request.observation {
         let dispatch = sqlx::query(
@@ -5941,7 +6071,8 @@ pub async fn submit_invocation(
                    runner_key_version, context_principal_identity_id,
                    request_commitment, context_commitment, exposure_commitment,
                    transport_commitment, source_descriptors::text AS source_descriptors,
-                   dispatched_at, lease_expires_at
+                   dispatched_at, lease_expires_at, runtime_kind,
+                   execution_profile_commitment
             FROM agent_model_attempt_dispatches
             WHERE project_id = $1 AND id = $2 AND invocation_id = $3
               AND lease_id = $4 AND attempt = $5
@@ -5965,6 +6096,18 @@ pub async fn submit_invocation(
         let observed_context = decode_commitment(&observation.statement.context_commitment_hex)?;
         let observed_transport =
             decode_commitment(&observation.statement.transport_commitment_hex)?;
+        let endpoint_request_commitment = observation
+            .statement
+            .endpoint_request_commitment_hex
+            .as_deref()
+            .map(decode_commitment)
+            .transpose()?;
+        let observed_execution_profile_commitment = observation
+            .statement
+            .execution_profile_commitment_hex
+            .as_deref()
+            .map(decode_commitment)
+            .transpose()?;
         let observed_output = decode_commitment(
             observation
                 .statement
@@ -5981,6 +6124,29 @@ pub async fn submit_invocation(
         )?;
         let dispatched_at: DateTime<Utc> = dispatch.try_get("dispatched_at")?;
         let expires_at: DateTime<Utc> = dispatch.try_get("lease_expires_at")?;
+        let runtime_kind: String = dispatch.try_get("runtime_kind")?;
+        let dispatched_execution_profile_commitment: Option<Vec<u8>> =
+            dispatch.try_get("execution_profile_commitment")?;
+        if (runtime_kind == "client_provider_v1"
+            && (!request.endpoint_request_exact
+                || projected_endpoint_request_commitment.is_none()
+                || projected_execution_profile_commitment.is_none()
+                || request.runtime_kind.as_deref() != Some("client_provider_v1")))
+            || (runtime_kind == "legacy_0031"
+                && (request.endpoint_request_exact
+                    || projected_endpoint_request_commitment.is_some()
+                    || projected_execution_profile_commitment.is_some()
+                    || request.runtime_kind.is_some()))
+        {
+            return Err(AppError::Conflict);
+        }
+        if dispatched_execution_profile_commitment.as_deref()
+            != projected_execution_profile_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice)
+        {
+            return Err(AppError::Conflict);
+        }
         let attempt =
             u32::try_from(row.try_get::<i32, _>("attempt")?).map_err(|_| AppError::Internal)?;
         let context_principal: Uuid = row.try_get("context_principal_identity_id")?;
@@ -5992,6 +6158,10 @@ pub async fn submit_invocation(
             || observed_request.as_slice() != request_commitment.as_slice()
             || observed_context.as_slice() != context_commitment.as_slice()
             || observed_transport.as_slice() != transport_commitment.as_slice()
+            || observation.statement.endpoint_request_exact != request.endpoint_request_exact
+            || endpoint_request_commitment != projected_endpoint_request_commitment
+            || observation.statement.runtime_kind.as_deref() != request.runtime_kind.as_deref()
+            || observed_execution_profile_commitment != projected_execution_profile_commitment
             || observed_output != output_hash
             || observed_artifact != artifact_hash
             || observation
@@ -6044,6 +6214,9 @@ pub async fn submit_invocation(
             request_commitment,
             context_commitment,
             transport_commitment,
+            projected_endpoint_request_commitment,
+            projected_execution_profile_commitment,
+            runtime_kind,
             context_principal,
             dispatched_at,
         ))
@@ -6101,6 +6274,9 @@ pub async fn submit_invocation(
         request_commitment,
         context_commitment,
         transport_commitment,
+        projected_endpoint_request_commitment,
+        projected_execution_profile_commitment,
+        runtime_kind,
         context_principal,
         dispatched_at,
     )) = verified_observation
@@ -6145,6 +6321,8 @@ pub async fn submit_invocation(
                 id, project_id, dispatch_id, invocation_id, attempt, lease_id,
                 principal_identity_id, status, provider_status,
                 request_commitment, context_commitment, exposure_commitment,
+                endpoint_request_exact, endpoint_request_commitment,
+                runtime_kind, execution_profile_commitment,
                 output_commitment, artifact_commitment, structured_artifact,
                 transport_commitment, exposed_source_descriptors,
                 hidden_persistent_model_memory_available,
@@ -6153,8 +6331,9 @@ pub async fn submit_invocation(
                 observation_hash, idempotency_key, observed_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, 'succeeded', $8,
-                $9, $10, $10, $11, $12, $13::jsonb, $14, $15::jsonb,
-                false, $16, $17, $18, $19, $20, $21, $22, $23
+                $9, $10, $10, $11, $12, $13, $14,
+                $15, $16, $17::jsonb, $18, $19::jsonb,
+                false, $20, $21, $22, $23, $24, $25, $26, $27
             )
             "#,
         )
@@ -6168,6 +6347,18 @@ pub async fn submit_invocation(
         .bind(&observation.statement.provider_status)
         .bind(&request_commitment)
         .bind(&context_commitment)
+        .bind(request.endpoint_request_exact)
+        .bind(
+            projected_endpoint_request_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+        )
+        .bind(&runtime_kind)
+        .bind(
+            projected_execution_profile_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+        )
         .bind(output_hash.as_slice())
         .bind(artifact_hash.as_slice())
         .bind(&artifact_json)
@@ -6190,11 +6381,13 @@ pub async fn submit_invocation(
                 trace_id, run_id, goal_id, work_item_id, work_claim_id, work_attempt,
                 principal_identity_id, status, invocation_surface, language_task,
                 context_source_descriptors, request_commitment, context_commitment,
-                output_commitment, artifact_commitment, structured_artifact, invoked_at
+                endpoint_request_exact, endpoint_request_commitment,
+                runtime_kind, execution_profile_commitment, output_commitment,
+                artifact_commitment, structured_artifact, invoked_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                $12, 'succeeded', $13, $14::jsonb, $15::jsonb, $16, $17, $18, $19,
-                $20::jsonb, $21
+                $12, 'succeeded', $13, $14::jsonb, $15::jsonb, $16, $17,
+                $18, $19, $20, $21, $22, $23, $24::jsonb, $25
             )
             "#,
         )
@@ -6215,6 +6408,18 @@ pub async fn submit_invocation(
         .bind(governance_canonical_json(&dispatched_sources)?)
         .bind(&request_commitment)
         .bind(&context_commitment)
+        .bind(request.endpoint_request_exact)
+        .bind(
+            projected_endpoint_request_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+        )
+        .bind(&runtime_kind)
+        .bind(
+            projected_execution_profile_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+        )
         .bind(output_hash.as_slice())
         .bind(artifact_hash.as_slice())
         .bind(&artifact_json)
@@ -6305,6 +6510,19 @@ pub async fn fail_invocation(
     let attempt: i32 = attempts.try_get("attempt")?;
     let max_attempts: i32 = attempts.try_get("max_attempts")?;
     let invocation_surface: String = attempts.try_get("invocation_surface")?;
+    let projected_endpoint_request_commitment = request
+        .endpoint_request_commitment_hex
+        .as_deref()
+        .map(decode_commitment)
+        .transpose()?;
+    let projected_execution_profile_commitment = request
+        .execution_profile_commitment_hex
+        .as_deref()
+        .map(decode_commitment)
+        .transpose()?;
+    if request.endpoint_request_exact != projected_endpoint_request_commitment.is_some() {
+        return Err(AppError::Conflict);
+    }
     if invocation_surface != "generic" && request.observation.is_none() {
         return Err(AppError::BadRequest(
             "language surface failure requires a signed endpoint observation",
@@ -6321,6 +6539,10 @@ pub async fn fail_invocation(
             runner.key_version,
             request.lease_id,
             request.failure_code,
+            request.endpoint_request_exact,
+            projected_endpoint_request_commitment,
+            request.runtime_kind.as_deref(),
+            projected_execution_profile_commitment,
             observation,
             &attempts,
         )
@@ -7505,6 +7727,10 @@ async fn persist_signed_failure_observation(
     runner_key_version: i32,
     lease_id: Uuid,
     failure_code: RunnerFailureCode,
+    endpoint_request_exact: bool,
+    projected_endpoint_request_commitment: Option<[u8; 32]>,
+    projected_runtime_kind: Option<&str>,
+    projected_execution_profile_commitment: Option<[u8; 32]>,
     observation: &SignedModelEndpointObservation,
     invocation: &PgRow,
 ) -> Result<(), AppError> {
@@ -7516,7 +7742,8 @@ async fn persist_signed_failure_observation(
                runner_key_version, context_principal_identity_id,
                request_commitment, context_commitment, transport_commitment,
                source_descriptors::text AS source_descriptors,
-               dispatched_at, lease_expires_at
+               dispatched_at, lease_expires_at, runtime_kind,
+               execution_profile_commitment
         FROM agent_model_attempt_dispatches
         WHERE project_id = $1 AND id = $2 AND invocation_id = $3
           AND attempt = $4 AND lease_id = $5
@@ -7536,9 +7763,44 @@ async fn persist_signed_failure_observation(
     let request_commitment: Vec<u8> = dispatch.try_get("request_commitment")?;
     let context_commitment: Vec<u8> = dispatch.try_get("context_commitment")?;
     let transport_commitment: Vec<u8> = dispatch.try_get("transport_commitment")?;
+    let endpoint_request_commitment = observation
+        .statement
+        .endpoint_request_commitment_hex
+        .as_deref()
+        .map(decode_commitment)
+        .transpose()?;
+    let observed_execution_profile_commitment = observation
+        .statement
+        .execution_profile_commitment_hex
+        .as_deref()
+        .map(decode_commitment)
+        .transpose()?;
     let principal: Uuid = dispatch.try_get("context_principal_identity_id")?;
     let dispatched_at: DateTime<Utc> = dispatch.try_get("dispatched_at")?;
     let expires_at: DateTime<Utc> = dispatch.try_get("lease_expires_at")?;
+    let runtime_kind: String = dispatch.try_get("runtime_kind")?;
+    let dispatched_execution_profile_commitment: Option<Vec<u8>> =
+        dispatch.try_get("execution_profile_commitment")?;
+    if (runtime_kind == "client_provider_v1"
+        && (projected_runtime_kind != Some("client_provider_v1")
+            || projected_execution_profile_commitment.is_none()
+            || (failure_code.requires_endpoint_request_witness()
+                && (!endpoint_request_exact || projected_endpoint_request_commitment.is_none()))))
+        || (runtime_kind == "legacy_0031"
+            && (projected_runtime_kind.is_some()
+                || endpoint_request_exact
+                || projected_endpoint_request_commitment.is_some()
+                || projected_execution_profile_commitment.is_some()))
+    {
+        return Err(AppError::Conflict);
+    }
+    if dispatched_execution_profile_commitment.as_deref()
+        != projected_execution_profile_commitment
+            .as_ref()
+            .map(<[u8; 32]>::as_slice)
+    {
+        return Err(AppError::Conflict);
+    }
     if observation.statement.invocation_id != InvocationId::from(invocation_id)
         || observation.statement.attempt != attempt
         || observation.statement.lease_id != lease_id
@@ -7549,6 +7811,10 @@ async fn persist_signed_failure_observation(
         || observation.statement.request_commitment_hex != hex::encode(&request_commitment)
         || observation.statement.context_commitment_hex != hex::encode(&context_commitment)
         || observation.statement.transport_commitment_hex != hex::encode(&transport_commitment)
+        || observation.statement.endpoint_request_exact != endpoint_request_exact
+        || endpoint_request_commitment != projected_endpoint_request_commitment
+        || observation.statement.runtime_kind.as_deref() != projected_runtime_kind
+        || observed_execution_profile_commitment != projected_execution_profile_commitment
         || observation
             .statement
             .hidden_persistent_model_memory_available
@@ -7642,6 +7908,8 @@ async fn persist_signed_failure_observation(
             id, project_id, dispatch_id, invocation_id, attempt, lease_id,
             principal_identity_id, status, provider_status,
             request_commitment, context_commitment, exposure_commitment,
+            endpoint_request_exact, endpoint_request_commitment,
+            runtime_kind, execution_profile_commitment,
             transport_commitment, exposed_source_descriptors,
             hidden_persistent_model_memory_available,
             signer_identity_id, signer_device_id, signer_key_version,
@@ -7649,8 +7917,8 @@ async fn persist_signed_failure_observation(
             observation_hash, idempotency_key, observed_at
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, 'explicit_failure', $8,
-            $9, $10, $10, $11, $12::jsonb, false,
-            $13, $14, $15, $16, $17, $18, $19, $20
+            $9, $10, $10, $11, $12, $13, $14, $15, $16::jsonb, false,
+            $17, $18, $19, $20, $21, $22, $23, $24
         )
         "#,
     )
@@ -7664,6 +7932,18 @@ async fn persist_signed_failure_observation(
     .bind(&observation.statement.provider_status)
     .bind(&request_commitment)
     .bind(&context_commitment)
+    .bind(endpoint_request_exact)
+    .bind(
+        projected_endpoint_request_commitment
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    )
+    .bind(&runtime_kind)
+    .bind(
+        projected_execution_profile_commitment
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    )
     .bind(&transport_commitment)
     .bind(governance_canonical_json(&sources)?)
     .bind(actor.identity_id)
@@ -7683,10 +7963,12 @@ async fn persist_signed_failure_observation(
             trace_id, run_id, goal_id, work_item_id, work_claim_id, work_attempt,
             principal_identity_id, status, invocation_surface, language_task,
             context_source_descriptors, request_commitment, context_commitment,
-            invoked_at
+            endpoint_request_exact, endpoint_request_commitment, invoked_at
+            , runtime_kind, execution_profile_commitment
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-            $12, 'explicit_failure', $13, $14::jsonb, $15::jsonb, $16, $17, $18
+            $12, 'explicit_failure', $13, $14::jsonb, $15::jsonb,
+            $16, $17, $18, $19, $20, $21, $22
         )
         "#,
     )
@@ -7707,7 +7989,19 @@ async fn persist_signed_failure_observation(
     .bind(governance_canonical_json(&sources)?)
     .bind(&request_commitment)
     .bind(&context_commitment)
+    .bind(endpoint_request_exact)
+    .bind(
+        projected_endpoint_request_commitment
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    )
     .bind(dispatched_at)
+    .bind(&runtime_kind)
+    .bind(
+        projected_execution_profile_commitment
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    )
     .execute(&mut **transaction)
     .await?;
     Ok(())

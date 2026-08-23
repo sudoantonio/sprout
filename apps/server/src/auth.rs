@@ -112,6 +112,19 @@ fn agent_request_allowed(method: &Method, path: &str) -> bool {
             )
             | (
                 &Method::POST,
+                [
+                    "v1",
+                    "projects",
+                    _,
+                    "agents",
+                    _,
+                    "runner",
+                    "client-provider",
+                    "claim"
+                ]
+            )
+            | (
+                &Method::POST,
                 ["v1", "projects", _, "agents", _, "invocations", _, "submit"]
             )
             | (
@@ -653,6 +666,10 @@ mod tests {
         assert!(agent_request_allowed(
             &Method::POST,
             "/v1/projects/p/agents/a/runner/claim"
+        ));
+        assert!(agent_request_allowed(
+            &Method::POST,
+            "/v1/projects/p/agents/a/runner/client-provider/claim"
         ));
         assert!(agent_request_allowed(
             &Method::POST,

@@ -3737,7 +3737,24 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         )
         .await
         .expect("persist explicit-failure model response");
-    assert_eq!(fail_model.status(), StatusCode::OK);
+    assert_eq!(
+        fail_model.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(fail_model).await
+    );
+    let legacy_endpoint_witness = sqlx::query_as::<_, (bool, Option<Vec<u8>>)>(
+        "SELECT endpoint_request_exact, endpoint_request_commitment
+         FROM agent_model_attempt_observations
+         WHERE project_id = $1 AND id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(failed_observation_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load legacy 0031 endpoint witness");
+    assert!(!legacy_endpoint_witness.0);
+    assert!(legacy_endpoint_witness.1.is_none());
     let mut failure_surface = fixture.pool.begin().await.expect("begin failure inventory");
     sqlx::query("SELECT set_config('app.identity_id', $1, true)")
         .bind(fixture.owner_id.to_string())
@@ -3768,7 +3785,7 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
             Request::builder()
                 .method("POST")
                 .uri(format!(
-                    "/v1/projects/{}/agents/{agent_id}/invocations",
+                    "/v1/projects/{}/agents/{agent_id}/invocations/client-provider",
                     fixture.project_id
                 ))
                 .header(CONTENT_TYPE, "application/json")
@@ -3798,7 +3815,7 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
                     })
                     .to_string(),
                 ))
-                .expect("queue exact interrogation model invocation"),
+                .expect("queue exact client-provider interrogation model invocation"),
         )
         .await
         .expect("queue exact interrogation model response");
@@ -3808,7 +3825,7 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         "{}",
         json_body(queue_model).await
     );
-    let claim_model = app
+    let legacy_downgrade_claim = app
         .clone()
         .oneshot(
             Request::builder()
@@ -3819,7 +3836,37 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
                 ))
                 .header("authorization", format!("Bearer {runner_token}"))
                 .body(Body::empty())
-                .expect("claim exact interrogation model invocation"),
+                .expect("attempt legacy claim for client-provider invocation"),
+        )
+        .await
+        .expect("legacy downgrade claim response");
+    assert_eq!(legacy_downgrade_claim.status(), StatusCode::OK);
+    assert_eq!(json_body(legacy_downgrade_claim).await, Value::Null);
+    let legacy_dispatch_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_model_attempt_dispatches
+         WHERE project_id = $1 AND invocation_id = $2 AND runtime_kind = 'legacy_0031'",
+    )
+    .bind(fixture.project_id)
+    .bind(model_invocation_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count legacy downgrade dispatches");
+    assert_eq!(legacy_dispatch_count, 0);
+    let claim_model = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/runner/client-provider/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({ "execution_profile_commitment_hex": "66".repeat(32) }).to_string(),
+                ))
+                .expect("claim exact client-provider interrogation model invocation"),
         )
         .await
         .expect("claim exact interrogation model response");
@@ -3867,6 +3914,10 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
             "request_commitment_hex": claim_model["request_commitment_hex"],
             "context_commitment_hex": claim_model["context_commitment_hex"],
             "transport_commitment_hex": claim_model["transport_commitment_hex"],
+            "endpoint_request_commitment_hex": "44".repeat(32),
+            "endpoint_request_exact": true,
+            "runtime_kind": "client_provider_v1",
+            "execution_profile_commitment_hex": "66".repeat(32),
             "output_commitment_hex": output_commitment,
             "artifact_commitment_hex": artifact_commitment,
             "provider_status": "schema_valid",
@@ -3880,6 +3931,10 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
             "encrypted_output": model_output,
             "effects": [],
             "artifact": interrogation_artifact,
+            "endpoint_request_commitment_hex": "44".repeat(32),
+            "endpoint_request_exact": true,
+            "runtime_kind": "client_provider_v1",
+            "execution_profile_commitment_hex": "66".repeat(32),
             "observation": {
                 "statement": statement,
                 "signatures": signed_statement_by(
@@ -4143,6 +4198,81 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
     let model_observation_id = Uuid::new_v4();
     let exact_submit_payload =
         make_model_submit(exact_context_sources.clone(), model_observation_id);
+    let mut downgraded_client_provider = exact_submit_payload.clone();
+    downgraded_client_provider["endpoint_request_commitment_hex"] = Value::Null;
+    downgraded_client_provider["endpoint_request_exact"] = json!(false);
+    downgraded_client_provider["runtime_kind"] = Value::Null;
+    downgraded_client_provider["execution_profile_commitment_hex"] = Value::Null;
+    downgraded_client_provider["observation"]["statement"]["endpoint_request_commitment_hex"] =
+        Value::Null;
+    downgraded_client_provider["observation"]["statement"]["endpoint_request_exact"] = json!(false);
+    downgraded_client_provider["observation"]["statement"]["runtime_kind"] = Value::Null;
+    downgraded_client_provider["observation"]["statement"]["execution_profile_commitment_hex"] =
+        Value::Null;
+    let downgraded_statement = downgraded_client_provider["observation"]["statement"].clone();
+    downgraded_client_provider["observation"]["signatures"] = signed_statement_by(
+        agent_identity_id,
+        runner_device_id,
+        &runner_ed25519_private_key,
+        &runner_ml_dsa_65_private_key,
+        &downgraded_statement,
+        b"sprout-model-runtime-observation-v1",
+    );
+    let downgraded_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{model_invocation_id}/submit",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(downgraded_client_provider.to_string()))
+                .expect("client-provider downgrade request"),
+        )
+        .await
+        .expect("client-provider downgrade response");
+    assert_eq!(downgraded_response.status(), StatusCode::CONFLICT);
+    let mut mismatched_profile_projection = exact_submit_payload.clone();
+    mismatched_profile_projection["execution_profile_commitment_hex"] = json!("77".repeat(32));
+    let mismatched_profile_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{model_invocation_id}/submit",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(mismatched_profile_projection.to_string()))
+                .expect("mismatched execution-profile projection request"),
+        )
+        .await
+        .expect("mismatched execution-profile projection response");
+    assert_eq!(mismatched_profile_response.status(), StatusCode::CONFLICT);
+    let mut mismatched_endpoint_projection = exact_submit_payload.clone();
+    mismatched_endpoint_projection["endpoint_request_commitment_hex"] = json!("55".repeat(32));
+    let mismatched_endpoint_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{model_invocation_id}/submit",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(mismatched_endpoint_projection.to_string()))
+                .expect("mismatched endpoint projection request"),
+        )
+        .await
+        .expect("mismatched endpoint projection response");
+    assert_eq!(mismatched_endpoint_response.status(), StatusCode::CONFLICT);
     let exact_submit = app
         .clone()
         .oneshot(
@@ -4183,6 +4313,26 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         .await
         .expect("replay exact model response");
     assert_eq!(exact_replay.status(), StatusCode::OK);
+    let endpoint_commitments = sqlx::query_as::<_, (bool, Option<Vec<u8>>, bool, Option<Vec<u8>>)>(
+        "SELECT observation.endpoint_request_exact,
+                observation.endpoint_request_commitment,
+                projection.endpoint_request_exact,
+                projection.endpoint_request_commitment
+         FROM agent_model_attempt_observations observation
+         JOIN agent_model_invocation_projections projection
+           ON projection.project_id = observation.project_id
+          AND projection.observation_id = observation.id
+         WHERE observation.project_id = $1 AND observation.id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(model_observation_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact endpoint request commitment");
+    assert!(endpoint_commitments.0);
+    assert_eq!(endpoint_commitments.1, Some(vec![0x44; 32]));
+    assert!(endpoint_commitments.2);
+    assert_eq!(endpoint_commitments.3, Some(vec![0x44; 32]));
     let answered = json_body(
         app.clone()
             .oneshot(
@@ -4220,6 +4370,502 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
         .rollback()
         .await
         .expect("rollback surface inventory");
+
+    // A client-provider retry is a new server-owned dispatch/attempt. The
+    // first exact wire witness remains append-only when attempt two succeeds.
+    let retry_invocation_id = Uuid::new_v4();
+    let queue_retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/client-provider",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": retry_invocation_id,
+                        "local_goal_id": local_goal_id,
+                        "local_goal_revision": 1,
+                        "language_task": model_language_task,
+                        "authority_envelope": {
+                            "resource_authority": [],
+                            "tool_authority": []
+                        },
+                        "sources": exact_context_sources,
+                        "encrypted_input": encrypted(43),
+                        "surface": "generic"
+                    })
+                    .to_string(),
+                ))
+                .expect("queue client-provider retry lifecycle"),
+        )
+        .await
+        .expect("queue client-provider retry response");
+    assert_eq!(queue_retry.status(), StatusCode::OK);
+
+    let claim_retry_one = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/runner/client-provider/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({ "execution_profile_commitment_hex": "aa".repeat(32) }).to_string(),
+                ))
+                .expect("claim client-provider attempt one"),
+        )
+        .await
+        .expect("claim client-provider attempt one response");
+    assert_eq!(claim_retry_one.status(), StatusCode::OK);
+    let claim_retry_one = json_body(claim_retry_one).await;
+    assert_eq!(claim_retry_one["attempt"], 1);
+    let missing_witness_id = Uuid::new_v4();
+    let missing_witness_statement = json!({
+        "observation_id": missing_witness_id,
+        "dispatch_id": claim_retry_one["dispatch_id"],
+        "invocation_id": retry_invocation_id,
+        "attempt": 1,
+        "lease_id": claim_retry_one["lease_id"],
+        "principal_identity_id": claim_retry_one["context_principal_identity_id"],
+        "exposed_sources": exact_context_sources,
+        "request_commitment_hex": claim_retry_one["request_commitment_hex"],
+        "context_commitment_hex": claim_retry_one["context_commitment_hex"],
+        "transport_commitment_hex": claim_retry_one["transport_commitment_hex"],
+        "endpoint_request_exact": false,
+        "runtime_kind": "client_provider_v1",
+        "execution_profile_commitment_hex": "aa".repeat(32),
+        "output_commitment_hex": null,
+        "artifact_commitment_hex": null,
+        "provider_status": "provider_timeout",
+        "hidden_persistent_model_memory_available": false,
+        "idempotency_key": missing_witness_id,
+        "observed_at": Utc::now()
+    });
+    let missing_witness_failure = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{retry_invocation_id}/fail",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({
+                        "lease_id": claim_retry_one["lease_id"],
+                        "failure_code": "provider_timeout",
+                        "retryable": true,
+                        "endpoint_request_exact": false,
+                        "runtime_kind": "client_provider_v1",
+                        "execution_profile_commitment_hex": "aa".repeat(32),
+                        "observation": {
+                            "statement": missing_witness_statement,
+                            "signatures": signed_statement_by(
+                                agent_identity_id,
+                                runner_device_id,
+                                &runner_ed25519_private_key,
+                                &runner_ml_dsa_65_private_key,
+                                &missing_witness_statement,
+                                b"sprout-model-runtime-observation-v1"
+                            )
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("reject post-request failure without exact wire witness"),
+        )
+        .await
+        .expect("missing wire witness response");
+    assert_eq!(missing_witness_failure.status(), StatusCode::CONFLICT);
+    let missing_witness_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_model_attempt_observations
+         WHERE project_id = $1 AND invocation_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(retry_invocation_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count rejected attempt observations");
+    assert_eq!(missing_witness_rows, 0);
+    let failed_attempt_id = Uuid::new_v4();
+    let failed_attempt_statement = json!({
+        "observation_id": failed_attempt_id,
+        "dispatch_id": claim_retry_one["dispatch_id"],
+        "invocation_id": retry_invocation_id,
+        "attempt": 1,
+        "lease_id": claim_retry_one["lease_id"],
+        "principal_identity_id": claim_retry_one["context_principal_identity_id"],
+        "exposed_sources": exact_context_sources,
+        "request_commitment_hex": claim_retry_one["request_commitment_hex"],
+        "context_commitment_hex": claim_retry_one["context_commitment_hex"],
+        "transport_commitment_hex": claim_retry_one["transport_commitment_hex"],
+        "endpoint_request_commitment_hex": "a1".repeat(32),
+        "endpoint_request_exact": true,
+        "runtime_kind": "client_provider_v1",
+        "execution_profile_commitment_hex": "aa".repeat(32),
+        "output_commitment_hex": null,
+        "artifact_commitment_hex": null,
+        "provider_status": "provider_timeout",
+        "hidden_persistent_model_memory_available": false,
+        "idempotency_key": failed_attempt_id,
+        "observed_at": Utc::now()
+    });
+    let fail_attempt_one = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{retry_invocation_id}/fail",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({
+                        "lease_id": claim_retry_one["lease_id"],
+                        "failure_code": "provider_timeout",
+                        "retryable": true,
+                        "endpoint_request_commitment_hex": "a1".repeat(32),
+                        "endpoint_request_exact": true,
+                        "runtime_kind": "client_provider_v1",
+                        "execution_profile_commitment_hex": "aa".repeat(32),
+                        "observation": {
+                            "statement": failed_attempt_statement,
+                            "signatures": signed_statement_by(
+                                agent_identity_id,
+                                runner_device_id,
+                                &runner_ed25519_private_key,
+                                &runner_ml_dsa_65_private_key,
+                                &failed_attempt_statement,
+                                b"sprout-model-runtime-observation-v1"
+                            )
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("persist client-provider timeout attempt"),
+        )
+        .await
+        .expect("persist client-provider timeout response");
+    let fail_attempt_one_status = fail_attempt_one.status();
+    let fail_attempt_one_body = json_body(fail_attempt_one).await;
+    assert_eq!(
+        fail_attempt_one_status,
+        StatusCode::OK,
+        "{fail_attempt_one_body}"
+    );
+    assert_eq!(fail_attempt_one_body["status"], "pending");
+
+    let claim_retry_two = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/runner/client-provider/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({ "execution_profile_commitment_hex": "aa".repeat(32) }).to_string(),
+                ))
+                .expect("claim client-provider attempt two"),
+        )
+        .await
+        .expect("claim client-provider attempt two response");
+    assert_eq!(claim_retry_two.status(), StatusCode::OK);
+    let claim_retry_two = json_body(claim_retry_two).await;
+    assert_eq!(claim_retry_two["attempt"], 2);
+    let retry_output = encrypted(44);
+    let retry_structured_output = json!({
+        "items": [],
+        "max_observed_nesting_depth": 1
+    });
+    let retry_artifact = json!({
+        "kind": "grounded_output",
+        "output": retry_structured_output
+    });
+    let retry_output_projection = json!({
+        "structured_output": retry_structured_output,
+        "encrypted_output": retry_output,
+        "effects": []
+    });
+    let retry_output_commitment = sha256_hex(
+        serde_json::to_string(&retry_output_projection)
+            .unwrap()
+            .as_bytes(),
+    );
+    let retry_artifact_commitment = canonical_hash_hex(&retry_artifact);
+    let success_attempt_id = Uuid::new_v4();
+    let success_attempt_statement = json!({
+        "observation_id": success_attempt_id,
+        "dispatch_id": claim_retry_two["dispatch_id"],
+        "invocation_id": retry_invocation_id,
+        "attempt": 2,
+        "lease_id": claim_retry_two["lease_id"],
+        "principal_identity_id": claim_retry_two["context_principal_identity_id"],
+        "exposed_sources": exact_context_sources,
+        "request_commitment_hex": claim_retry_two["request_commitment_hex"],
+        "context_commitment_hex": claim_retry_two["context_commitment_hex"],
+        "transport_commitment_hex": claim_retry_two["transport_commitment_hex"],
+        "endpoint_request_commitment_hex": "a2".repeat(32),
+        "endpoint_request_exact": true,
+        "runtime_kind": "client_provider_v1",
+        "execution_profile_commitment_hex": "aa".repeat(32),
+        "output_commitment_hex": retry_output_commitment,
+        "artifact_commitment_hex": retry_artifact_commitment,
+        "provider_status": "schema_valid",
+        "hidden_persistent_model_memory_available": false,
+        "idempotency_key": success_attempt_id,
+        "observed_at": Utc::now()
+    });
+    let success_attempt_payload = json!({
+        "lease_id": claim_retry_two["lease_id"],
+        "structured_output": retry_structured_output,
+        "encrypted_output": retry_output,
+        "effects": [],
+        "artifact": retry_artifact,
+        "endpoint_request_commitment_hex": "a2".repeat(32),
+        "endpoint_request_exact": true,
+        "runtime_kind": "client_provider_v1",
+        "execution_profile_commitment_hex": "aa".repeat(32),
+        "observation": {
+            "statement": success_attempt_statement,
+            "signatures": signed_statement_by(
+                agent_identity_id,
+                runner_device_id,
+                &runner_ed25519_private_key,
+                &runner_ml_dsa_65_private_key,
+                &success_attempt_statement,
+                b"sprout-model-runtime-observation-v1"
+            )
+        }
+    });
+    let success_attempt_two = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{retry_invocation_id}/submit",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(success_attempt_payload.to_string()))
+                .expect("submit client-provider attempt two"),
+        )
+        .await
+        .expect("submit client-provider attempt two response");
+    assert_eq!(success_attempt_two.status(), StatusCode::OK);
+    let retry_observations = sqlx::query_as::<_, (i32, String, Vec<u8>)>(
+        "SELECT attempt, status, endpoint_request_commitment
+         FROM agent_model_attempt_observations
+         WHERE project_id = $1 AND invocation_id = $2 ORDER BY attempt",
+    )
+    .bind(fixture.project_id)
+    .bind(retry_invocation_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("load exact client-provider retry observations");
+    assert_eq!(
+        retry_observations,
+        vec![
+            (1, "explicit_failure".to_owned(), vec![0xa1; 32]),
+            (2, "succeeded".to_owned(), vec![0xa2; 32]),
+        ]
+    );
+    let success_attempt_replay = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{retry_invocation_id}/submit",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(success_attempt_payload.to_string()))
+                .expect("replay client-provider attempt two"),
+        )
+        .await
+        .expect("replay client-provider attempt two response");
+    assert_eq!(success_attempt_replay.status(), StatusCode::OK);
+    let retry_observation_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_model_attempt_observations
+         WHERE project_id = $1 AND invocation_id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(retry_invocation_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count replay-stable client-provider observations");
+    assert_eq!(retry_observation_count, 2);
+
+    let auth_failure_invocation_id = Uuid::new_v4();
+    let queue_auth_failure = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/client-provider",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": auth_failure_invocation_id,
+                        "local_goal_id": local_goal_id,
+                        "local_goal_revision": 1,
+                        "language_task": model_language_task,
+                        "authority_envelope": {
+                            "resource_authority": [],
+                            "tool_authority": []
+                        },
+                        "sources": exact_context_sources,
+                        "encrypted_input": encrypted(45),
+                        "surface": "generic"
+                    })
+                    .to_string(),
+                ))
+                .expect("queue non-retryable client-provider invocation"),
+        )
+        .await
+        .expect("queue non-retryable client-provider response");
+    assert_eq!(queue_auth_failure.status(), StatusCode::OK);
+    let claim_auth_failure = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/runner/client-provider/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({ "execution_profile_commitment_hex": "ab".repeat(32) }).to_string(),
+                ))
+                .expect("claim non-retryable client-provider invocation"),
+        )
+        .await
+        .expect("claim non-retryable client-provider response");
+    assert_eq!(claim_auth_failure.status(), StatusCode::OK);
+    let claim_auth_failure = json_body(claim_auth_failure).await;
+    let auth_failure_observation_id = Uuid::new_v4();
+    let auth_failure_statement = json!({
+        "observation_id": auth_failure_observation_id,
+        "dispatch_id": claim_auth_failure["dispatch_id"],
+        "invocation_id": auth_failure_invocation_id,
+        "attempt": 1,
+        "lease_id": claim_auth_failure["lease_id"],
+        "principal_identity_id": claim_auth_failure["context_principal_identity_id"],
+        "exposed_sources": exact_context_sources,
+        "request_commitment_hex": claim_auth_failure["request_commitment_hex"],
+        "context_commitment_hex": claim_auth_failure["context_commitment_hex"],
+        "transport_commitment_hex": claim_auth_failure["transport_commitment_hex"],
+        "endpoint_request_commitment_hex": "af".repeat(32),
+        "endpoint_request_exact": true,
+        "runtime_kind": "client_provider_v1",
+        "execution_profile_commitment_hex": "ab".repeat(32),
+        "output_commitment_hex": null,
+        "artifact_commitment_hex": null,
+        "provider_status": "provider_unavailable",
+        "hidden_persistent_model_memory_available": false,
+        "idempotency_key": auth_failure_observation_id,
+        "observed_at": Utc::now()
+    });
+    let fail_auth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/invocations/{auth_failure_invocation_id}/fail",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({
+                        "lease_id": claim_auth_failure["lease_id"],
+                        "failure_code": "provider_unavailable",
+                        "retryable": false,
+                        "endpoint_request_commitment_hex": "af".repeat(32),
+                        "endpoint_request_exact": true,
+                        "runtime_kind": "client_provider_v1",
+                        "execution_profile_commitment_hex": "ab".repeat(32),
+                        "observation": {
+                            "statement": auth_failure_statement,
+                            "signatures": signed_statement_by(
+                                agent_identity_id,
+                                runner_device_id,
+                                &runner_ed25519_private_key,
+                                &runner_ml_dsa_65_private_key,
+                                &auth_failure_statement,
+                                b"sprout-model-runtime-observation-v1"
+                            )
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("persist non-retryable provider auth failure"),
+        )
+        .await
+        .expect("persist non-retryable provider auth response");
+    assert_eq!(fail_auth.status(), StatusCode::OK);
+    assert_eq!(json_body(fail_auth).await["status"], "failed");
+    let non_retryable_state = sqlx::query_as::<_, (String, i32, i64)>(
+        "SELECT invocation.status, invocation.attempt,
+                (SELECT count(*) FROM agent_model_attempt_observations observation
+                 WHERE observation.project_id = invocation.project_id
+                   AND observation.invocation_id = invocation.id)
+         FROM agent_invocations invocation
+         WHERE invocation.project_id = $1 AND invocation.id = $2",
+    )
+    .bind(fixture.project_id)
+    .bind(auth_failure_invocation_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load non-retryable provider attempt state");
+    assert_eq!(non_retryable_state, ("failed".to_owned(), 1, 1));
+    let no_auth_retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{agent_id}/runner/client-provider/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {runner_token}"))
+                .body(Body::from(
+                    json!({ "execution_profile_commitment_hex": "ab".repeat(32) }).to_string(),
+                ))
+                .expect("attempt claim after non-retryable failure"),
+        )
+        .await
+        .expect("claim after non-retryable failure response");
+    assert_eq!(no_auth_retry.status(), StatusCode::OK);
+    assert_eq!(json_body(no_auth_retry).await, Value::Null);
 
     // A legacy/deterministic proxy plan remains supported, but only an exact
     // succeeded model projection may enable the R5.41 model-mediated proxy
