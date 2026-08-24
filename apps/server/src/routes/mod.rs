@@ -1,4 +1,5 @@
 pub(crate) mod agent_runs;
+pub(crate) mod agent_tools;
 mod agents;
 mod assignments;
 mod dev_auth;
@@ -189,6 +190,41 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         .route(
             "/v1/projects/{project_id}/agent-runs/{run_id}/blockers/{blocker_id}/resolve",
             post(agent_runs::resolve_blocker),
+        )
+        .route("/v1/agent-tools/catalog", get(agent_tools::catalog))
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/tool-permissions/{tool_id}/versions/{tool_version}",
+            axum::routing::put(agent_tools::grant_permission)
+                .delete(agent_tools::revoke_permission),
+        )
+        .route(
+            "/v1/projects/{project_id}/resources/{scope_id}/principals/{principal_id}/tool-permissions/{tool_id}/versions/{tool_version}",
+            axum::routing::put(agent_tools::grant_principal_permission)
+                .delete(agent_tools::revoke_principal_permission),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/tool-runtime-capabilities",
+            post(agent_tools::attest_runtime_capability),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/claims/{claim_id}/tool-calls",
+            post(agent_tools::invoke),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/tool-calls/{call_id}/claim",
+            post(agent_tools::claim),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/tool-calls/{call_id}/requests",
+            post(agent_tools::record_request),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/tool-calls/{call_id}/terminal",
+            post(agent_tools::terminal_exact),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/tool-calls/{call_id}/retry",
+            post(agent_tools::retry),
         )
         .route(
             "/v1/projects/{project_id}/user-proxy/threads",

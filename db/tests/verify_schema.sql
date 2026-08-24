@@ -379,6 +379,42 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'HLR-08 retention, exactly-once warning, or expiry controls are missing';
     END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_class relation
+        WHERE relation.oid = 'public.agent_tool_permissions'::regclass
+          AND relation.relrowsecurity
+          AND relation.relforcerowsecurity
+    ) OR NOT EXISTS (
+        SELECT 1
+        FROM pg_policy policy
+        WHERE policy.polrelid = 'public.agent_tool_permissions'::regclass
+          AND pg_get_expr(policy.polwithcheck, policy.polrelid) = 'false'
+    ) OR EXISTS (
+        SELECT 1
+        FROM pg_proc procedure
+        WHERE procedure.oid IN (
+            'sprout_private.grant_agent_tool_permission(uuid,uuid,uuid,uuid,uuid,text,integer,uuid,uuid,bytea)'::regprocedure,
+            'sprout_private.revoke_agent_tool_permission(uuid,uuid,uuid,uuid,text,integer,uuid)'::regprocedure
+        )
+          AND (
+              NOT procedure.prosecdef
+              OR NOT procedure.proconfig @> ARRAY['search_path=pg_catalog']::text[]
+              OR NOT procedure.proconfig @> ARRAY['row_security=off']::text[]
+              OR EXISTS (
+                  SELECT 1
+                  FROM aclexplode(COALESCE(
+                      procedure.proacl,
+                      acldefault('f', procedure.proowner)
+                  )) privilege
+                  WHERE privilege.grantee = 0
+                    AND privilege.privilege_type = 'EXECUTE'
+              )
+          )
+    ) THEN
+        RAISE EXCEPTION 'R5.0033 permission ledger trusted-writer boundary is missing';
+    END IF;
 END;
 $verification$;
 

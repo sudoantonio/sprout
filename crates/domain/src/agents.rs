@@ -2259,10 +2259,22 @@ impl CollaborativeRunState {
     }
 
     pub fn recover_expired_claims(&mut self, tick: u64) {
+        self.recover_expired_claims_except(tick, &HashSet::new());
+    }
+
+    pub fn recover_expired_claims_except(
+        &mut self,
+        tick: u64,
+        protected_claims: &HashSet<ClaimId>,
+    ) {
         let expired: Vec<_> = self
             .claims
             .values()
-            .filter(|claim| claim.status == ClaimStatus::Active && claim.expires_at <= tick)
+            .filter(|claim| {
+                claim.status == ClaimStatus::Active
+                    && claim.expires_at <= tick
+                    && !protected_claims.contains(&claim.id)
+            })
             .map(|claim| (claim.id, claim.work, claim.attempt))
             .collect();
         for (claim_id, work_id, attempt) in expired {
@@ -2297,11 +2309,33 @@ impl CollaborativeRunState {
         lease_ticks: u64,
         aging_step: u64,
     ) -> Result<Option<WorkClaim>, AgentValidationError> {
+        self.claim_next_except(
+            contract,
+            claimant,
+            facts,
+            tick,
+            lease_ticks,
+            aging_step,
+            &HashSet::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_next_except(
+        &mut self,
+        contract: &GoalContract,
+        claimant: UserId,
+        facts: &ContractConditionFacts,
+        tick: u64,
+        lease_ticks: u64,
+        aging_step: u64,
+        protected_claims: &HashSet<ClaimId>,
+    ) -> Result<Option<WorkClaim>, AgentValidationError> {
         self.ensure_contract(contract)?;
         if lease_ticks == 0 || aging_step == 0 {
             return Err(AgentValidationError::InvalidSchedulerBound);
         }
-        self.recover_expired_claims(tick);
+        self.recover_expired_claims_except(tick, protected_claims);
         let mut eligible: Vec<_> = self
             .work_items
             .values()
@@ -2349,10 +2383,31 @@ impl CollaborativeRunState {
             .iter()
             .find(|spec| spec.id == work.work_spec_id)
             .ok_or(AgentValidationError::UnknownWorkSpec)?;
-        if work.attempt >= spec.max_attempts {
+        let highest_prior_attempt = self
+            .claims
+            .values()
+            .filter(|claim| claim.work == work_id)
+            .map(|claim| claim.attempt)
+            .max()
+            .unwrap_or(0);
+        let claimed_attempt = if work.attempt > highest_prior_attempt {
+            // A retry re-arm transition has already materialized the exact
+            // next WorkAttempt. Claiming selects that attempt; it must not
+            // increment it a second time.
+            work.attempt
+        } else {
+            work.attempt
+                .checked_add(1)
+                .ok_or(AgentValidationError::WorkAttemptsExhausted)?
+        };
+        let exclusive_tool_bound =
+            matches!(work.kind, WorkKind::ToolInvocation | WorkKind::ToolRetry);
+        if (exclusive_tool_bound && claimed_attempt >= spec.max_attempts)
+            || (!exclusive_tool_bound && work.attempt >= spec.max_attempts)
+        {
             return Err(AgentValidationError::WorkAttemptsExhausted);
         }
-        work.attempt += 1;
+        work.attempt = claimed_attempt;
         work.status = WorkStatus::Claimed;
         if self
             .suspended_claim_resolutions
@@ -2569,6 +2624,115 @@ impl CollaborativeRunState {
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// Closes the exact WorkAttempt that already dispatched a pending external
+    /// tool request. Unlike a new invoke/retry, receipt of that terminal event
+    /// does not re-evaluate lease time or current tool readiness. The immutable
+    /// dispatch is validated by the application/DB boundary before this method.
+    pub fn close_dispatched_tool_work(
+        &mut self,
+        claim_id: ClaimId,
+        claimant: UserId,
+        attempt: u16,
+        succeeded: bool,
+    ) -> Result<WorkItemId, AgentValidationError> {
+        let claim = self
+            .claims
+            .get(&claim_id)
+            .ok_or(AgentValidationError::UnknownClaim)?;
+        let work = self
+            .work_items
+            .get(&claim.work)
+            .ok_or(AgentValidationError::UnknownWorkItem)?;
+        if claim.claimant != claimant
+            || claim.attempt != attempt
+            || work.owner != claimant
+            || work.attempt != attempt
+            || work.status != WorkStatus::Claimed
+            || !matches!(work.kind, WorkKind::ToolInvocation | WorkKind::ToolRetry)
+        {
+            return Err(AgentValidationError::ExpiredOrForeignClaim);
+        }
+        let work_id = claim.work;
+        self.close_claim_and_work(
+            claim_id,
+            work_id,
+            if succeeded {
+                WorkStatus::Succeeded
+            } else {
+                WorkStatus::Failed
+            },
+        )?;
+        Ok(work_id)
+    }
+
+    /// Materializes the *next* retry attempt only after a failed tool
+    /// WorkOutcome has already been observed in a prior semantic state.  The
+    /// exclusive WorkSpec bound is checked against the materialized attempt,
+    /// matching `RetryWorkProgress` (`later.attempt = work.attempt + 1`).
+    pub fn rearm_failed_tool_work_for_retry(
+        &mut self,
+        contract: &GoalContract,
+        work_id: WorkItemId,
+        facts: &ContractConditionFacts,
+        tick: u64,
+    ) -> Result<bool, AgentValidationError> {
+        self.ensure_contract(contract)?;
+        let work = self
+            .work_items
+            .get(&work_id)
+            .ok_or(AgentValidationError::UnknownWorkItem)?
+            .clone();
+        let spec = contract
+            .work_specs
+            .iter()
+            .find(|candidate| candidate.id == work.work_spec_id)
+            .ok_or(AgentValidationError::UnknownWorkSpec)?;
+        let next_attempt = work
+            .attempt
+            .checked_add(1)
+            .ok_or(AgentValidationError::WorkAttemptsExhausted)?;
+        if work.status != WorkStatus::Failed
+            || !matches!(work.kind, WorkKind::ToolInvocation | WorkKind::ToolRetry)
+            || !matches!(spec.failure_plan, FailurePlan::RetrySame {})
+            || !spec.allowed_actions.contains(&AgentActionClass::RetryTool)
+            || next_attempt >= spec.max_attempts
+            || self.goal_status != GoalStatus::Active
+            || self.run_status != CollaborativeRunStatus::Running
+            || !self.dependencies_closed(contract, work.serves)
+            || !spec.activation.holds(&self.effective_facts(facts))
+            || self
+                .obligations
+                .get(&work.serves)
+                .is_none_or(|obligation| obligation.status != ObligationStatus::Active)
+        {
+            return Ok(false);
+        }
+        let blocked = self.work_has_waiting_blocker(&work);
+        let current = self
+            .work_items
+            .get_mut(&work_id)
+            .ok_or(AgentValidationError::UnknownWorkItem)?;
+        current.attempt = next_attempt;
+        current.status = if blocked {
+            WorkStatus::Blocked
+        } else {
+            WorkStatus::Eligible
+        };
+        if !blocked {
+            self.dispatches.insert(
+                work_id,
+                WorkDispatch {
+                    work: work_id,
+                    attempt: next_attempt,
+                    status: DispatchStatus::Ready,
+                    enqueued_at: tick,
+                    scheduler_position: 0,
+                },
+            );
+        }
+        Ok(true)
     }
 
     fn close_claim_and_work(
@@ -2936,10 +3100,12 @@ impl LocalGoalCompilerOutput {
                     .required_tools
                     .iter()
                     .any(|tool| !envelope.language_task.allowed_tools.contains(tool))
-                || requirement
-                    .required_actions
-                    .contains(&AgentActionClass::InvokeTool)
-                    == requirement.required_tools.is_empty()
+                || requirement.required_actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        AgentActionClass::InvokeTool | AgentActionClass::RetryTool
+                    )
+                }) == requirement.required_tools.is_empty()
             {
                 return Err(AgentValidationError::CompilationEnvelopeMismatch);
             }
@@ -3011,12 +3177,10 @@ impl LocalGoalCompilerOutput {
                     action
                         .required_resource_operation()
                         .is_some_and(|operation| !policy.allowed_operations.contains(&operation))
-                        || (*action == AgentActionClass::InvokeTool
-                            && required_tools.is_empty())
-                        // A retry's exact tool is derived from the original
-                        // ToolCall at runtime. The static compiler artifact has
-                        // no such provenance and therefore fails closed.
-                        || *action == AgentActionClass::RetryTool
+                        || (matches!(
+                            action,
+                            AgentActionClass::InvokeTool | AgentActionClass::RetryTool
+                        ) && required_tools.is_empty())
                 })
             {
                 return Err(AgentValidationError::CompilationEnvelopeMismatch);
@@ -4620,6 +4784,17 @@ mod tests {
         let controller = UserId::new();
         let mut local = local_goal(agent, controller);
         local.contract.work_specs[0].allowed_actions = vec![action];
+        if matches!(
+            action,
+            AgentActionClass::InvokeTool | AgentActionClass::RetryTool
+        ) {
+            local.contract.work_specs[0].kind = if action == AgentActionClass::InvokeTool {
+                WorkKind::ToolInvocation
+            } else {
+                WorkKind::ToolRetry
+            };
+            local.contract.work_specs[0].max_attempts = 3;
+        }
         let scope = local.contract.scope;
         let obligation = local.contract.obligations[0].id;
         let output = LocalGoalCompilerOutput {
@@ -4729,6 +4904,17 @@ mod tests {
             output.validate_within_envelope(&envelope),
             Err(AgentValidationError::CompilationEnvelopeMismatch)
         );
+    }
+
+    #[test]
+    fn local_compiler_retry_policy_binds_the_allowed_original_tool_set() {
+        let (output, envelope) = local_compiler_fixture(
+            AgentActionClass::RetryTool,
+            vec!["tool-a"],
+            vec!["tool-a"],
+            vec!["tool-a"],
+        );
+        assert_eq!(output.validate_within_envelope(&envelope), Ok(()));
     }
 
     #[test]
@@ -5589,6 +5775,80 @@ mod tests {
         assert_eq!(run.run_status, CollaborativeRunStatus::Running);
         run.complete_run().unwrap();
         assert_eq!(run.run_status, CollaborativeRunStatus::Completed);
+    }
+
+    #[test]
+    fn tool_retry_preserves_failed_attempt_before_separate_exclusive_bound_rearm() {
+        let agent = UserId::new();
+        let mut local = local_goal(agent, UserId::new());
+        let spec = &mut local.contract.work_specs[0];
+        spec.kind = WorkKind::ToolInvocation;
+        spec.allowed_actions = vec![AgentActionClass::InvokeTool, AgentActionClass::RetryTool];
+        spec.max_attempts = 3;
+        spec.failure_plan = FailurePlan::RetrySame {};
+        let facts = ContractConditionFacts::default();
+        let mut run =
+            CollaborativeRunState::initialize(RunId::new(), &local.contract, &facts, 0).unwrap();
+
+        let first = run
+            .claim_next(&local.contract, agent, &facts, 1, 5, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.attempt, 1);
+        let work = first.work;
+        run.close_dispatched_tool_work(first.id, agent, 1, false)
+            .unwrap();
+        assert_eq!(run.work_items[&work].status, WorkStatus::Failed);
+        assert_eq!(run.work_items[&work].attempt, 1);
+        assert_eq!(run.claims[&first.id].status, ClaimStatus::Released);
+
+        assert!(
+            run.rearm_failed_tool_work_for_retry(&local.contract, work, &facts, 2)
+                .unwrap()
+        );
+        assert_eq!(run.work_items[&work].status, WorkStatus::Eligible);
+        assert_eq!(run.work_items[&work].attempt, 2);
+        let second = run
+            .claim_next(&local.contract, agent, &facts, 3, 5, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.work, work);
+        assert_eq!(second.attempt, 2);
+
+        run.close_dispatched_tool_work(second.id, agent, 2, false)
+            .unwrap();
+        assert_eq!(run.work_items[&work].status, WorkStatus::Failed);
+        assert_eq!(run.work_items[&work].attempt, 2);
+        assert!(
+            !run.rearm_failed_tool_work_for_retry(&local.contract, work, &facts, 4)
+                .unwrap()
+        );
+        assert_eq!(run.work_items[&work].status, WorkStatus::Failed);
+    }
+
+    #[test]
+    fn non_retryable_tool_failure_remains_terminal() {
+        let agent = UserId::new();
+        let mut local = local_goal(agent, UserId::new());
+        let spec = &mut local.contract.work_specs[0];
+        spec.kind = WorkKind::ToolInvocation;
+        spec.allowed_actions = vec![AgentActionClass::InvokeTool];
+        spec.max_attempts = 3;
+        spec.failure_plan = FailurePlan::FailGoal {};
+        let facts = ContractConditionFacts::default();
+        let mut run =
+            CollaborativeRunState::initialize(RunId::new(), &local.contract, &facts, 0).unwrap();
+        let claim = run
+            .claim_next(&local.contract, agent, &facts, 1, 5, 1)
+            .unwrap()
+            .unwrap();
+        run.close_dispatched_tool_work(claim.id, agent, claim.attempt, false)
+            .unwrap();
+        assert!(
+            !run.rearm_failed_tool_work_for_retry(&local.contract, claim.work, &facts, 2)
+                .unwrap()
+        );
+        assert_eq!(run.work_items[&claim.work].status, WorkStatus::Failed);
     }
 
     #[test]

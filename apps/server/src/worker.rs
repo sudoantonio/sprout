@@ -75,6 +75,13 @@ async fn run_cycle(
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     if !options.dry_run && matches!(options.kind, WorkerKind::AgentCompletion | WorkerKind::All) {
+        let timed_out = crate::routes::agent_tools::materialize_server_timeouts(pool).await?;
+        if timed_out > 0 {
+            tracing::info!(
+                timed_out_tool_calls = timed_out,
+                "materialized external tool timeouts"
+            );
+        }
         let recovered = crate::routes::agent_runs::recover_expired_claims(pool).await?;
         if recovered > 0 {
             tracing::info!(

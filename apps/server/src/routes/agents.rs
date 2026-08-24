@@ -78,12 +78,12 @@ pub struct CompilerIdentity {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct CompilationSignatures {
-    signer_identity_id: UserId,
-    signer_device_id: Uuid,
-    signer_device_key_version: u32,
-    classical_signature: Vec<u8>,
-    post_quantum_signature: Vec<u8>,
+pub(crate) struct CompilationSignatures {
+    pub(crate) signer_identity_id: UserId,
+    pub(crate) signer_device_id: Uuid,
+    pub(crate) signer_device_key_version: u32,
+    pub(crate) classical_signature: Vec<u8>,
+    pub(crate) post_quantum_signature: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5250,6 +5250,22 @@ async fn queue_invocation_for_runtime(
 
     let runner = active_runner(&state, actor, project_id, &agent).await?;
     for source in &request.sources {
+        if matches!(source, InformationSource::ToolOutput { .. }) {
+            validate_tool_output_context_source(
+                &state,
+                actor,
+                project_id,
+                ToolOutputContextBinding {
+                    producer_principal: agent.principal_id,
+                    context_principal,
+                    source,
+                    runner_device_id: runner.device_id,
+                    runner_key_version: runner.key_version,
+                },
+            )
+            .await?;
+            continue;
+        }
         let resource_id = supported_source_resource(&state, actor, project_id, source).await?;
         if !resource_access_for_identity(
             &state,
@@ -7383,6 +7399,115 @@ fn agent_profile_resource(agent: &AgentRecord) -> ResourceId {
     agent.profile_resource_id
 }
 
+struct ToolOutputContextBinding<'a> {
+    producer_principal: UserId,
+    context_principal: UserId,
+    source: &'a InformationSource,
+    runner_device_id: Uuid,
+    runner_key_version: i32,
+}
+
+async fn validate_tool_output_context_source(
+    state: &AppState,
+    actor: AuthSession,
+    project_id: Uuid,
+    binding: ToolOutputContextBinding<'_>,
+) -> Result<(), AppError> {
+    let InformationSource::ToolOutput { call_id } = binding.source else {
+        return Err(AppError::Internal);
+    };
+    let mut transaction = begin(state, actor, project_id).await?;
+    let exact = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM agent_tool_calls call
+            JOIN agent_tool_attempt_dispatches dispatch
+              ON dispatch.project_id = call.project_id
+             AND dispatch.call_id = call.id
+             AND dispatch.attempt = call.current_attempt
+            JOIN agent_tool_attempt_observations observation
+              ON observation.project_id = call.project_id
+             AND observation.call_id = call.id
+             AND observation.dispatch_id = dispatch.id
+             AND observation.attempt = call.current_attempt
+            JOIN agent_tool_output_key_envelopes envelope
+              ON envelope.project_id = observation.project_id
+             AND envelope.observation_id = observation.id
+             AND envelope.call_id = call.id
+            JOIN agent_external_tool_catalog catalog
+              ON catalog.tool_name = call.tool_name
+             AND catalog.version = call.tool_version
+             AND catalog.output_audience_kind = 'owner_from_canonical_input'
+            JOIN agent_run_work_slots slot
+              ON slot.project_id = call.project_id
+             AND slot.run_id = call.run_id
+             AND slot.work_item_id = call.work_item_id
+             AND slot.work_spec_ordinal = call.work_spec_ordinal
+            JOIN agent_run_claim_leases claim
+              ON claim.project_id = call.project_id
+             AND claim.id = call.work_claim_id
+             AND claim.run_id = call.run_id
+             AND claim.work_item_id = call.work_item_id
+             AND claim.attempt = call.work_attempt
+             AND claim.claimant_identity_id = call.owner_identity_id
+            JOIN agent_run_external_tool_work_outcomes outcome
+              ON outcome.project_id = call.project_id
+             AND outcome.run_id = call.run_id
+             AND outcome.work_item_id = call.work_item_id
+             AND outcome.claim_id = call.work_claim_id
+             AND outcome.attempt = call.current_attempt
+             AND outcome.observation_id = observation.id
+             AND outcome.work_status = 'succeeded'
+            JOIN device_keys key
+              ON key.identity_id = envelope.recipient_identity_id
+             AND key.device_id = envelope.recipient_device_id
+             AND key.key_version = envelope.recipient_device_key_version
+            JOIN devices device
+              ON device.identity_id = key.identity_id AND device.id = key.device_id
+            WHERE call.project_id = $1 AND call.id = $2
+              AND call.owner_identity_id = $3
+              AND call.current_status = 'succeeded'
+              AND call.output_readable_by = jsonb_build_array(call.owner_identity_id)
+              AND call.output_readable_by @> jsonb_build_array($4::uuid)
+              AND observation.terminal_status = 'succeeded'
+              AND observation.canonical_output_commitment IS NOT NULL
+              AND observation.canonical_output_commitment = call.current_output_commitment
+              AND observation.encrypted_output_payload_commitment = digest(observation.encrypted_output, 'sha256')
+              AND observation.output_readable_by = call.output_readable_by
+              AND dispatch.runner_identity_id = call.owner_identity_id
+              AND dispatch.attempt = call.work_attempt
+              AND dispatch.canonical_input_commitment = call.canonical_input_commitment
+              AND dispatch.execution_profile_commitment = observation.execution_profile_commitment
+              AND claim.acquired_at <= call.requested_at
+              AND call.requested_at < claim.expires_at
+              AND dispatch.dispatched_at < claim.expires_at
+              AND envelope.recipient_identity_id = $4
+              AND envelope.recipient_device_id = $5
+              AND envelope.recipient_device_key_version = $6
+              AND envelope.envelope_commitment = digest(envelope.encrypted_key, 'sha256')
+              AND key.revoked_at IS NULL
+              AND device.trust_state = 'trusted'
+              AND device.retired_at IS NULL
+        )
+        "#,
+    )
+    .bind(project_id)
+    .bind(*call_id)
+    .bind(Uuid::from(binding.producer_principal))
+    .bind(Uuid::from(binding.context_principal))
+    .bind(binding.runner_device_id)
+    .bind(binding.runner_key_version)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    if exact {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden)
+    }
+}
+
 async fn supported_source_resource(
     state: &AppState,
     actor: AuthSession,
@@ -9076,7 +9201,7 @@ fn governance_canonical_json(value: &impl Serialize) -> Result<String, AppError>
         .map_err(|_| AppError::BadRequest("invalid canonical governance payload"))
 }
 
-async fn verify_device_statement(
+pub(crate) async fn verify_device_statement(
     transaction: &mut Transaction<'_, Postgres>,
     actor: AuthSession,
     statement: &impl Serialize,

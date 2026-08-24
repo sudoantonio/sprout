@@ -4437,6 +4437,273 @@ BEGIN
 END;
 $test$;
 
+-- R5.0033: the runtime route uses a narrow SECURITY DEFINER writer. A
+-- NOBYPASSRLS application role cannot write the permission ledger directly or
+-- invoke the private writer, even after forging identity/project GUCs.
+INSERT INTO agent_external_tool_catalog (
+    tool_name, version, adapter_protocol, operation, risk_tier, availability,
+    effect_class, max_attempts, max_timeout_seconds, max_input_bytes,
+    max_output_bytes, input_schema, input_schema_hash, output_schema,
+    output_schema_hash, required_effects, output_audience_kind,
+    terminal_status_mapping, manifest_hash
+)
+SELECT tool_name, 2, adapter_protocol || '-test-v2', operation, risk_tier,
+       availability, effect_class, max_attempts, max_timeout_seconds,
+       max_input_bytes, max_output_bytes, input_schema, input_schema_hash,
+       output_schema, output_schema_hash, required_effects,
+       output_audience_kind, terminal_status_mapping,
+       digest('verify-behavior-web-read-v2', 'sha256')
+FROM agent_external_tool_catalog
+WHERE tool_name = 'web.read' AND version = 1;
+
+SELECT set_config('app.identity_id',
+    '10000000-0000-0000-0000-000000000001', true);
+SELECT set_config('app.project_id',
+    '30000000-0000-0000-0000-000000000001', true);
+
+SELECT permission_id
+FROM sprout_private.grant_agent_tool_permission(
+    'a3300000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000001',
+    '10000000-0000-0000-0000-000000000001', NULL,
+    'web.read', 1,
+    '10000000-0000-0000-0000-000000000001',
+    'a3300000-0000-0000-0000-000000000011',
+    digest('grant-web-read-v1', 'sha256')
+);
+SELECT permission_id
+FROM sprout_private.grant_agent_tool_permission(
+    'a3300000-0000-0000-0000-000000000002',
+    '30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000001',
+    '10000000-0000-0000-0000-000000000001', NULL,
+    'web.read', 2,
+    '10000000-0000-0000-0000-000000000001',
+    'a3300000-0000-0000-0000-000000000012',
+    digest('grant-web-read-v2', 'sha256')
+);
+
+CREATE ROLE sprout_tool_permission_app NOSUPERUSER NOBYPASSRLS NOLOGIN;
+GRANT sprout_tool_permission_app TO CURRENT_USER;
+GRANT USAGE ON SCHEMA public, sprout_private TO sprout_tool_permission_app;
+GRANT SELECT, INSERT, UPDATE ON agent_tool_permissions TO sprout_tool_permission_app;
+SET LOCAL ROLE sprout_tool_permission_app;
+
+DO $tool_permission_rls$
+BEGIN
+    BEGIN
+        INSERT INTO agent_tool_permissions (
+            id, project_id, principal_identity_id, tool_name, tool_version,
+            granted_by_identity_id, idempotency_key, grant_hash
+        ) VALUES (
+            'a3300000-0000-0000-0000-000000000003',
+            current_setting('app.project_id')::uuid,
+            current_setting('app.identity_id')::uuid,
+            'web.read', 1, current_setting('app.identity_id')::uuid,
+            'a3300000-0000-0000-0000-000000000013',
+            digest('forged-direct-grant', 'sha256')
+        );
+        RAISE EXCEPTION 'application role directly inserted tool permission';
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+    BEGIN
+        UPDATE agent_tool_permissions SET revoked_at = clock_timestamp(),
+            revoked_by_identity_id = current_setting('app.identity_id')::uuid
+        WHERE id = 'a3300000-0000-0000-0000-000000000001';
+        RAISE EXCEPTION 'application role directly revoked tool permission';
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+    BEGIN
+        PERFORM sprout_private.grant_agent_tool_permission(
+            'a3300000-0000-0000-0000-000000000004',
+            current_setting('app.project_id')::uuid,
+            '40000000-0000-0000-0000-000000000001',
+            current_setting('app.identity_id')::uuid, NULL,
+            'web.read', 1, current_setting('app.identity_id')::uuid,
+            'a3300000-0000-0000-0000-000000000014',
+            digest('forged-private-writer', 'sha256')
+        );
+        RAISE EXCEPTION 'application role executed private permission writer';
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+END;
+$tool_permission_rls$;
+RESET ROLE;
+
+-- The server obtains its database identity exclusively from DATABASE_URL.  The
+-- deployed route role needs EXECUTE on the narrow writer, not table DML.  This
+-- non-bypass role models that split explicitly instead of relying on the
+-- disposable database owner's superuser behavior.
+CREATE ROLE sprout_tool_permission_route_app NOSUPERUSER NOBYPASSRLS NOLOGIN;
+GRANT sprout_tool_permission_route_app TO CURRENT_USER;
+GRANT USAGE ON SCHEMA public, sprout_private TO sprout_tool_permission_route_app;
+GRANT EXECUTE ON FUNCTION sprout_private.grant_agent_tool_permission(
+    uuid, uuid, uuid, uuid, uuid, text, integer, uuid, uuid, bytea
+) TO sprout_tool_permission_route_app;
+SET LOCAL ROLE sprout_tool_permission_route_app;
+SELECT set_config('app.identity_id',
+    '10000000-0000-0000-0000-000000000001', true);
+SELECT set_config('app.project_id',
+    '30000000-0000-0000-0000-000000000001', true);
+DO $tool_permission_route_app$
+DECLARE
+    written uuid;
+BEGIN
+    SELECT permission_id INTO written
+    FROM sprout_private.grant_agent_tool_permission(
+        'a3300000-0000-0000-0000-000000000008',
+        '30000000-0000-0000-0000-000000000001',
+        '40000000-0000-0000-0000-000000000001',
+        '10000000-0000-0000-0000-000000000001', NULL,
+        'document.local.read', 1,
+        '10000000-0000-0000-0000-000000000001',
+        'a3300000-0000-0000-0000-000000000018',
+        digest('route-app-document-read-v1', 'sha256')
+    );
+    IF written IS DISTINCT FROM 'a3300000-0000-0000-0000-000000000008'::uuid THEN
+        RAISE EXCEPTION 'authorized route role did not use trusted writer';
+    END IF;
+END;
+$tool_permission_route_app$;
+
+SELECT set_config('app.identity_id',
+    '10000000-0000-0000-0000-000000000020', true);
+DO $tool_permission_route_forged_identity$
+BEGIN
+    BEGIN
+        PERFORM sprout_private.grant_agent_tool_permission(
+            'a3300000-0000-0000-0000-000000000009',
+            '30000000-0000-0000-0000-000000000001',
+            '40000000-0000-0000-0000-000000000001',
+            '10000000-0000-0000-0000-000000000020', NULL,
+            'document.local.read', 1,
+            '10000000-0000-0000-0000-000000000020',
+            'a3300000-0000-0000-0000-000000000019',
+            digest('forged-route-identity', 'sha256')
+        );
+        RAISE EXCEPTION 'forged route identity granted tool permission';
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+END;
+$tool_permission_route_forged_identity$;
+
+SELECT set_config('app.identity_id',
+    '10000000-0000-0000-0000-000000000001', true);
+SELECT set_config('app.project_id',
+    '30000000-0000-0000-0000-000000000002', true);
+DO $tool_permission_route_forged_project$
+BEGIN
+    BEGIN
+        PERFORM sprout_private.grant_agent_tool_permission(
+            'a3300000-0000-0000-0000-000000000010',
+            '30000000-0000-0000-0000-000000000001',
+            '40000000-0000-0000-0000-000000000001',
+            '10000000-0000-0000-0000-000000000001', NULL,
+            'document.local.read', 1,
+            '10000000-0000-0000-0000-000000000001',
+            'a3300000-0000-0000-0000-00000000001a',
+            digest('forged-route-project', 'sha256')
+        );
+        RAISE EXCEPTION 'forged route project granted tool permission';
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+END;
+$tool_permission_route_forged_project$;
+RESET ROLE;
+SELECT set_config('app.project_id',
+    '30000000-0000-0000-0000-000000000001', true);
+
+DO $tool_permission_authority$
+BEGIN
+    -- A cross-project argument cannot be smuggled under project-1 context.
+    BEGIN
+        PERFORM sprout_private.grant_agent_tool_permission(
+            'a3300000-0000-0000-0000-000000000005',
+            '30000000-0000-0000-0000-000000000002',
+            '40000000-0000-0000-0000-000000000005',
+            '10000000-0000-0000-0000-000000000001', NULL,
+            'web.read', 1,
+            '10000000-0000-0000-0000-000000000001',
+            'a3300000-0000-0000-0000-000000000015',
+            digest('cross-project-grant', 'sha256')
+        );
+        RAISE EXCEPTION 'cross-project permission writer succeeded';
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+END;
+$tool_permission_authority$;
+
+SELECT set_config('app.identity_id',
+    '10000000-0000-0000-0000-000000000020', true);
+DO $tool_permission_unauthorized$
+BEGIN
+    BEGIN
+        PERFORM sprout_private.grant_agent_tool_permission(
+            'a3300000-0000-0000-0000-000000000006',
+            '30000000-0000-0000-0000-000000000001',
+            '40000000-0000-0000-0000-000000000001',
+            '10000000-0000-0000-0000-000000000020', NULL,
+            'web.read', 1,
+            '10000000-0000-0000-0000-000000000020',
+            'a3300000-0000-0000-0000-000000000016',
+            digest('unauthorized-grant', 'sha256')
+        );
+        RAISE EXCEPTION 'member without Manage granted tool permission';
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+END;
+$tool_permission_unauthorized$;
+
+SELECT set_config('app.identity_id',
+    '91000000-0000-0000-0000-000000000001', true);
+DO $tool_permission_agent$
+BEGIN
+    BEGIN
+        PERFORM sprout_private.grant_agent_tool_permission(
+            'a3300000-0000-0000-0000-000000000007',
+            '30000000-0000-0000-0000-000000000001',
+            '40000000-0000-0000-0000-000000000003',
+            '91000000-0000-0000-0000-000000000001',
+            '92000000-0000-0000-0000-000000000001',
+            'web.read', 1,
+            '91000000-0000-0000-0000-000000000001',
+            'a3300000-0000-0000-0000-000000000017',
+            digest('agent-self-grant', 'sha256')
+        );
+        RAISE EXCEPTION 'agent self-granted tool permission';
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+END;
+$tool_permission_agent$;
+
+SELECT set_config('app.identity_id',
+    '10000000-0000-0000-0000-000000000001', true);
+SELECT permission_id
+FROM sprout_private.revoke_agent_tool_permission(
+    '30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000001',
+    '10000000-0000-0000-0000-000000000001', NULL,
+    'web.read', 1,
+    '10000000-0000-0000-0000-000000000001'
+);
+
+DO $tool_permission_versions$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM agent_tool_permissions
+        WHERE id = 'a3300000-0000-0000-0000-000000000001'
+          AND revoked_at IS NULL
+    ) OR NOT EXISTS (
+        SELECT 1 FROM agent_tool_permissions
+        WHERE id = 'a3300000-0000-0000-0000-000000000002'
+          AND tool_version = 2 AND revoked_at IS NULL
+    ) THEN
+        RAISE EXCEPTION 'version-exact tool permission revoke failed';
+    END IF;
+END;
+$tool_permission_versions$;
+
 ROLLBACK;
 
 SELECT 'sprout behavioral verification passed' AS result;

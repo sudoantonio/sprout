@@ -162,6 +162,82 @@ fn agent_request_allowed(method: &Method, path: &str) -> bool {
             )
             | (
                 &Method::POST,
+                [
+                    "v1",
+                    "projects",
+                    _,
+                    "agents",
+                    _,
+                    "tool-runtime-capabilities"
+                ]
+            )
+            | (
+                &Method::POST,
+                [
+                    "v1",
+                    "projects",
+                    _,
+                    "agent-runs",
+                    _,
+                    "claims",
+                    _,
+                    "tool-calls"
+                ]
+            )
+            | (
+                &Method::POST,
+                [
+                    "v1",
+                    "projects",
+                    _,
+                    "agent-runs",
+                    _,
+                    "tool-calls",
+                    _,
+                    "claim"
+                ]
+            )
+            | (
+                &Method::POST,
+                [
+                    "v1",
+                    "projects",
+                    _,
+                    "agent-runs",
+                    _,
+                    "tool-calls",
+                    _,
+                    "requests"
+                ]
+            )
+            | (
+                &Method::POST,
+                [
+                    "v1",
+                    "projects",
+                    _,
+                    "agent-runs",
+                    _,
+                    "tool-calls",
+                    _,
+                    "terminal"
+                ]
+            )
+            | (
+                &Method::POST,
+                [
+                    "v1",
+                    "projects",
+                    _,
+                    "agent-runs",
+                    _,
+                    "tool-calls",
+                    _,
+                    "retry"
+                ]
+            )
+            | (
+                &Method::POST,
                 ["v1", "projects", _, "agent-runs", _, "blockers"]
             )
             | (
@@ -684,6 +760,20 @@ mod tests {
             &Method::POST,
             "/v1/projects/p/agent-runs/r/claims/c/materialize-task-completion"
         ));
+        assert!(agent_request_allowed(
+            &Method::POST,
+            "/v1/projects/p/agents/a/tool-runtime-capabilities"
+        ));
+        assert!(agent_request_allowed(
+            &Method::POST,
+            "/v1/projects/p/agent-runs/r/claims/c/tool-calls"
+        ));
+        for suffix in ["claim", "requests", "terminal", "retry"] {
+            assert!(agent_request_allowed(
+                &Method::POST,
+                &format!("/v1/projects/p/agent-runs/r/tool-calls/c/{suffix}")
+            ));
+        }
         assert!(!agent_request_allowed(
             &Method::POST,
             "/v1/projects/p/tasks"

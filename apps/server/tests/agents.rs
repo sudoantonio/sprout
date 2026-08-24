@@ -9,15 +9,19 @@ use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sprout_crypto_protocol::{
-    DeviceKeyIds, DevicePublicPackage, HybridWrapMetadata, KeyAlgorithm, ResourceKey,
-    canonical_governance_json, generate_experimental_device_package, hash_bytes,
-    sign_ed25519_ml_dsa65, wrap_resource_key,
+    DeviceKeyIds, DevicePublicPackage, ExperimentalWrappedResourceKey, HybridWrapMetadata,
+    KeyAlgorithm, ResourceKey, canonical_governance_json, generate_experimental_device_package,
+    hash_bytes, sign_ed25519_ml_dsa65, unwrap_resource_key, wrap_resource_key,
 };
 use sprout_domain::{
     GlobalContractCandidate, LocalGoalContract, LocalGoalOrigin, StructuredGlobalSynthesisEnvelope,
     StructuredGlobalWorkGrounding, classify_local_goal_contract,
 };
-use sprout_server::{AppState, build_router, config::Config};
+use sprout_server::{
+    AppState, build_router,
+    config::Config,
+    worker::{self, WorkerKind, WorkerOptions},
+};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
@@ -693,6 +697,1804 @@ async fn provision_administrator_governed_agent(
             administrator_approval_id,
         },
     )
+}
+
+fn configure_exact_external_tool_governance(body: &mut Value, tool: &str) {
+    let output = body
+        .pointer_mut("/initial_local_goal/compilation/statement/output")
+        .expect("tool compiler output");
+    output["contract"]["work_specs"][0]["kind"] = json!("tool_invocation");
+    output["contract"]["work_specs"][0]["allowed_actions"] = json!(["invoke_tool", "retry_tool"]);
+    // WorkAttempt uses the Lean-exclusive bound. The fixture permits ToolCall
+    // attempts 1 through 4, so the exact WorkSpec upper bound is 5.
+    output["contract"]["work_specs"][0]["max_attempts"] = json!(5);
+    output["contract"]["work_specs"][0]["failure_plan"] = json!({"kind":"retry_same"});
+    output["requirements"][0]["required_actions"] = json!(["invoke_tool", "retry_tool"]);
+    output["requirements"][0]["required_tools"] = json!([tool]);
+    output["security_policies"][0]["allowed_operations"] = json!([]);
+    output["security_policies"][0]["allowed_tools"] = json!([tool]);
+    let output = output.clone();
+
+    let envelope = body
+        .pointer_mut("/initial_local_goal/compilation/statement/envelope")
+        .expect("tool compiler envelope");
+    envelope["language_task"]["allowed_tools"] = json!([tool]);
+    envelope["allowed_actions"] = json!(["invoke_tool", "retry_tool"]);
+    let envelope = envelope.clone();
+
+    let compilation = body
+        .pointer_mut("/initial_local_goal/compilation/statement")
+        .expect("tool compilation statement");
+    compilation["output_hash_hex"] = json!(canonical_hash_hex(&output));
+    compilation["envelope_hash_hex"] = json!(canonical_hash_hex(&envelope));
+    let compilation = compilation.clone();
+
+    let final_statement = body
+        .pointer_mut("/final_prompt_approval/statement")
+        .expect("tool final prompt statement");
+    final_statement["structured_output_hash_hex"] = json!(canonical_hash_hex(&output));
+    let approval_identity = json!({
+        "signature_context": "sprout-final-prompt-approval-v1",
+        "approval_id": final_statement["approval_id"],
+        "project_id": final_statement["project_id"],
+        "draft_id": final_statement["draft_id"],
+        "agent_principal_identity_id": final_statement["agent_principal_identity_id"],
+        "controller_identity_id": final_statement["controller_identity_id"],
+        "local_goal_id": final_statement["local_goal_id"],
+        "local_revision": final_statement["local_revision"],
+        "prompt_commitment_hex": final_statement["prompt_commitment_hex"],
+        "ciphertext_commitment_hex": final_statement["ciphertext_commitment_hex"],
+        "compilation_certificate_id": final_statement["compilation_certificate_id"],
+        "structured_output_hash_hex": final_statement["structured_output_hash_hex"],
+        "idempotency_key": final_statement["idempotency_key"],
+    });
+    final_statement["approval_identity_hash_hex"] = json!(canonical_hash_hex(&approval_identity));
+
+    let encrypted_prompt = body["initial_local_goal"]["encrypted_prompt"].clone();
+    let administrator = body
+        .pointer_mut("/administrator_creation_approval/statement")
+        .expect("tool administrator creation statement");
+    let local_contract = json!({
+        "id": compilation["local_goal_id"],
+        "revision": compilation["local_revision"],
+        "agent": compilation["agent_principal_identity_id"],
+        "controller": compilation["controller_identity_id"],
+        "encrypted_prompt": encrypted_prompt,
+        "contract": output["contract"],
+        "clauses": [{
+            "id": 1,
+            "domain": 2,
+            "scope": compilation["project_scope"],
+            "work_spec_ids": [1]
+        }],
+        "origin": {
+            "kind": "administrator_creation",
+            "approval_id": administrator["approval_id"]
+        },
+        "supersedes_revision": null
+    });
+    // The compiler envelope, rather than the compilation statement, owns the
+    // exact project scope field.
+    let mut local_contract = local_contract;
+    local_contract["clauses"][0]["scope"] = envelope["project_scope"].clone();
+    administrator["contract_hash_hex"] = json!(canonical_hash_hex(&local_contract));
+    let proposal_binding = json!({
+        "project_id": administrator["project_id"],
+        "administrator_identity_id": administrator["administrator_identity_id"],
+        "proposed_agent_identity_id": administrator["proposed_agent_identity_id"],
+        "governed_agent_id": administrator["governed_agent_id"],
+        "proposal_draft_id": administrator["proposal_draft_id"],
+        "local_goal_id": administrator["local_goal_id"],
+        "local_goal_revision": administrator["local_goal_revision"],
+        "contract_hash_hex": administrator["contract_hash_hex"],
+        "compilation_certificate_id": administrator["compilation_certificate_id"],
+        "prompt_plaintext_commitment_hex": administrator["prompt_plaintext_commitment_hex"],
+        "ciphertext_commitment_hex": administrator["ciphertext_commitment_hex"],
+        "availability": administrator["availability"],
+        "scope": administrator["scope"],
+    });
+    administrator["canonical_proposal_hash_hex"] = json!(canonical_hash_hex(&proposal_binding));
+}
+
+struct ActivatedToolRunner {
+    bearer: String,
+    x25519_private_key: Vec<u8>,
+    ml_kem_768_private_key: Vec<u8>,
+    ed25519_private_key: Vec<u8>,
+    ml_dsa_65_private_key: Vec<u8>,
+}
+
+async fn attest_exact_tool_runtime(
+    fixture: &Fixture,
+    app: &axum::Router,
+    provisioned: &ProvisionedGovernanceAgent,
+    runner: &ActivatedToolRunner,
+    manifest_hash: &[u8],
+    profile_byte: u8,
+    lifetime: ChronoDuration,
+) -> (Uuid, String) {
+    let profile_commitment_hex = format!("{profile_byte:02x}").repeat(32);
+    let witness_id = Uuid::new_v4();
+    let idempotency_key = Uuid::new_v4();
+    let issued_at = Utc::now();
+    let expires_at = issued_at + lifetime;
+    let statement = json!({
+        "signature_context":"sprout-external-tool-runtime-capability-v1",
+        "witness_id":witness_id,
+        "project_id":fixture.project_id,
+        "agent_id":provisioned.agent_id,
+        "owner_identity_id":provisioned.principal_identity_id,
+        "runner_id":provisioned.runner_id,
+        "tool_id":"web.read",
+        "tool_version":1,
+        "manifest_hash_hex":hex::encode(manifest_hash),
+        "profile_tool_available":true,
+        "runtime_available":true,
+        "execution_profile_commitment_hex":profile_commitment_hex,
+        "issued_at":issued_at,
+        "expires_at":expires_at,
+        "idempotency_key":idempotency_key
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/tool-runtime-capabilities",
+                    fixture.project_id, provisioned.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({
+                        "witness_id":witness_id,
+                        "tool_id":"web.read",
+                        "tool_version":1,
+                        "execution_profile_commitment_hex":profile_commitment_hex,
+                        "issued_at":issued_at,
+                        "expires_at":expires_at,
+                        "idempotency_key":idempotency_key,
+                        "signatures":signed_statement_by(
+                            provisioned.principal_identity_id,
+                            provisioned.runner_device_id,
+                            &runner.ed25519_private_key,
+                            &runner.ml_dsa_65_private_key,
+                            &statement,
+                            b"sprout-external-tool-runtime-capability-v1"
+                        )
+                    })
+                    .to_string(),
+                ))
+                .expect("attest exact tool runtime request"),
+        )
+        .await
+        .expect("attest exact tool runtime response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(response).await
+    );
+    (witness_id, profile_commitment_hex)
+}
+
+async fn rearm_claim_and_retry_exact_tool(
+    fixture: &Fixture,
+    app: &axum::Router,
+    runner: &ActivatedToolRunner,
+    run_id: Uuid,
+    call_id: Uuid,
+    witness_id: Uuid,
+    expected_attempt: i64,
+) -> Uuid {
+    for phase in ["re-arm", "claim"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{run_id}/claim",
+                        fixture.project_id
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {}", runner.bearer))
+                    .body(Body::from("{}"))
+                    .expect("advance exact retry WorkAttempt"),
+            )
+            .await
+            .expect("advance exact retry WorkAttempt response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{phase}: {}",
+            json_body(response).await
+        );
+    }
+    let state = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{run_id}",
+                        fixture.project_id
+                    ))
+                    .header("authorization", format!("Bearer {}", runner.bearer))
+                    .body(Body::empty())
+                    .expect("read exact claimed retry WorkAttempt"),
+            )
+            .await
+            .expect("read exact claimed retry WorkAttempt response"),
+    )
+    .await;
+    let claim_id = state["state"]["claims"]
+        .as_object()
+        .and_then(|claims| {
+            claims.iter().find_map(|(id, claim)| {
+                (claim["status"] == "active" && claim["attempt"] == expected_attempt).then_some(id)
+            })
+        })
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("exact active retry claim");
+    let retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/retry",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({
+                        "work_claim_id":claim_id,
+                        "runtime_capability_witness_id":witness_id,
+                        "idempotency_key":Uuid::new_v4()
+                    })
+                    .to_string(),
+                ))
+                .expect("retry exact ToolCall"),
+        )
+        .await
+        .expect("retry exact ToolCall response");
+    let status = retry.status();
+    let body = json_body(retry).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["attempt"], expected_attempt);
+    claim_id
+}
+
+async fn claim_exact_tool_dispatch(
+    fixture: &Fixture,
+    app: &axum::Router,
+    runner: &ActivatedToolRunner,
+    run_id: Uuid,
+    call_id: Uuid,
+) -> (Uuid, Uuid) {
+    let dispatch_id = Uuid::new_v4();
+    let lease_id = Uuid::new_v4();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({"dispatch_id":dispatch_id,"lease_id":lease_id}).to_string(),
+                ))
+                .expect("claim exact tool dispatch"),
+        )
+        .await
+        .expect("claim exact tool dispatch response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(response).await
+    );
+    (dispatch_id, lease_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_exact_tool_request(
+    fixture: &Fixture,
+    app: &axum::Router,
+    provisioned: &ProvisionedGovernanceAgent,
+    runner: &ActivatedToolRunner,
+    run_id: Uuid,
+    call_id: Uuid,
+    dispatch_id: Uuid,
+    attempt: i64,
+    canonical_input_commitment_hex: &str,
+    profile_commitment_hex: &str,
+) -> (Uuid, String) {
+    let request_id = Uuid::new_v4();
+    let idempotency_key = Uuid::new_v4();
+    let wire_request_commitment_hex = format!("{:02x}", 0x95_u8 + attempt as u8).repeat(32);
+    let signed_at = Utc::now();
+    let statement = json!({
+        "signature_context":"sprout-external-tool-request-v1",
+        "project_id":fixture.project_id,
+        "run_id":run_id,
+        "call_id":call_id,
+        "request_id":request_id,
+        "dispatch_id":dispatch_id,
+        "attempt":attempt,
+        "adapter_protocol":"sprout-edge-web-read-v1",
+        "canonical_input_commitment_hex":canonical_input_commitment_hex,
+        "wire_request_commitment_hex":wire_request_commitment_hex,
+        "execution_profile_commitment_hex":profile_commitment_hex,
+        "signed_at":signed_at,
+        "idempotency_key":idempotency_key
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/requests",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({
+                        "request_id":request_id,
+                        "dispatch_id":dispatch_id,
+                        "wire_request_commitment_hex":wire_request_commitment_hex,
+                        "signed_at":signed_at,
+                        "idempotency_key":idempotency_key,
+                        "signatures":signed_statement_by(
+                            provisioned.principal_identity_id,
+                            provisioned.runner_device_id,
+                            &runner.ed25519_private_key,
+                            &runner.ml_dsa_65_private_key,
+                            &statement,
+                            b"sprout-external-tool-request-v1"
+                        )
+                    })
+                    .to_string(),
+                ))
+                .expect("record exact external request"),
+        )
+        .await
+        .expect("record exact external request response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(response).await
+    );
+    (request_id, wire_request_commitment_hex)
+}
+
+async fn run_agent_completion_once(fixture: &Fixture, config: Config) {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    worker::run(
+        fixture.pool.clone(),
+        config,
+        WorkerOptions {
+            kind: WorkerKind::AgentCompletion,
+            dry_run: false,
+            once: true,
+            interval: Duration::from_secs(1),
+            lease_ttl_seconds: 30,
+        },
+        shutdown_rx,
+    )
+    .await
+    .expect("materialize exact tool timeout before generic claim recovery");
+}
+
+async fn activate_exact_tool_runner(
+    fixture: &Fixture,
+    app: &axum::Router,
+    provisioned: &ProvisionedGovernanceAgent,
+) -> ActivatedToolRunner {
+    let key_ids = DeviceKeyIds {
+        x25519: Uuid::new_v4(),
+        ml_kem_768: Uuid::new_v4(),
+        ed25519: Uuid::new_v4(),
+        ml_dsa_65: Uuid::new_v4(),
+    };
+    let generated =
+        generate_experimental_device_package(provisioned.runner_device_id, key_ids.clone())
+            .expect("generate exact tool runner package");
+    let public = generated.public_package();
+    let key = |algorithm| {
+        public
+            .encryption_keys
+            .iter()
+            .chain(&public.signing_keys)
+            .find(|key| key.algorithm == algorithm)
+            .expect("tool runner public key")
+            .public_key
+            .clone()
+    };
+    let package_json = public
+        .to_canonical_json()
+        .expect("serialize exact tool runner package");
+    let mut transaction = fixture.pool.begin().await.expect("begin tool runner keys");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *transaction)
+        .await
+        .expect("disable RLS for tool runner fixture");
+    sqlx::query(
+        r#"
+        INSERT INTO device_keys (
+            identity_id, device_id, key_version, encryption_public_key,
+            signing_public_key, suite_version, generation,
+            previous_package_hash, package_hash, package_json,
+            x25519_key_id, ml_kem_768_key_id, ed25519_key_id, ml_dsa_65_key_id,
+            x25519_public_key, ml_kem_768_public_key,
+            ed25519_public_key, ml_dsa_65_public_key
+        ) VALUES (
+            $1, $2, 1, $3, $4, 32769, 0, decode(repeat('00', 32), 'hex'),
+            digest($5, 'sha256'), $5, $6, $7, $8, $9, $3, $10, $4, $11
+        )
+        "#,
+    )
+    .bind(provisioned.principal_identity_id)
+    .bind(provisioned.runner_device_id)
+    .bind(key(KeyAlgorithm::X25519))
+    .bind(key(KeyAlgorithm::Ed25519))
+    .bind(package_json)
+    .bind(key_ids.x25519)
+    .bind(key_ids.ml_kem_768)
+    .bind(key_ids.ed25519)
+    .bind(key_ids.ml_dsa_65)
+    .bind(key(KeyAlgorithm::MlKem768Experimental))
+    .bind(key(KeyAlgorithm::MlDsa65Experimental))
+    .execute(&mut *transaction)
+    .await
+    .expect("insert exact tool runner key package");
+    sqlx::query(
+        "SELECT sprout_private.grant_hierarchical_permission(
+             $1, $2, $3, 'edit', 'full', 'restricted', $4, $5
+         )",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(provisioned.principal_identity_id)
+    .bind(Uuid::new_v4())
+    .bind(fixture.owner_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("grant runner exact profile permission");
+    sqlx::query(
+        r#"
+        INSERT INTO resource_key_envelopes (
+            project_id, resource_node_id, epoch, key_purpose,
+            recipient_identity_id, recipient_device_id,
+            recipient_device_key_version, encrypted_key, sender_signature,
+            sender_post_quantum_signature, created_by_identity_id,
+            created_by_device_id, created_by_device_key_version
+        ) VALUES (
+            $1, $2, 1, 'body', $3, $4, 1,
+            decode(repeat('55', 32), 'hex'), decode(repeat('66', 64), 'hex'),
+            decode('77', 'hex'), $5, $6, 1
+        )
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(provisioned.principal_identity_id)
+    .bind(provisioned.runner_device_id)
+    .bind(fixture.owner_id)
+    .bind(fixture.owner_device_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("insert runner profile key envelope");
+    transaction.commit().await.expect("commit tool runner keys");
+
+    let bearer = provisioned
+        .bootstrap_token
+        .clone()
+        .expect("tool runner bootstrap token");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/runner/activate",
+                    fixture.project_id, provisioned.agent_id
+                ))
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .expect("activate exact tool runner request"),
+        )
+        .await
+        .expect("activate exact tool runner response");
+    assert_eq!(response.status(), StatusCode::OK);
+    ActivatedToolRunner {
+        bearer,
+        x25519_private_key: generated.private_keys().x25519().to_vec(),
+        ml_kem_768_private_key: generated.private_keys().ml_kem_768().to_vec(),
+        ed25519_private_key: generated.private_keys().ed25519().to_vec(),
+        ml_dsa_65_private_key: generated.private_keys().ml_dsa_65().to_vec(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_fences() {
+    let fixture = fixture().await;
+    let mut config = Config::for_test();
+    config.agent_work_lease = Duration::from_secs(5);
+    config.body_limit_bytes = 64 * 1024;
+    let app = build_router(Arc::new(
+        AppState::new(config.clone(), fixture.pool.clone()).expect("tool test app state"),
+    ))
+    .expect("tool test router");
+    let (status, provisioned) = provision_administrator_governed_agent(
+        &fixture,
+        &app,
+        201,
+        None,
+        None,
+        |body| configure_exact_external_tool_governance(body, "web.read"),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let runner = activate_exact_tool_runner(&fixture, &app, &provisioned).await;
+
+    for (path, permission_id, idempotency_key) in [
+        (
+            format!(
+                "/v1/projects/{}/resources/{}/principals/{}/tool-permissions/web.read/versions/1",
+                fixture.project_id, fixture.profile_resource_id, fixture.owner_id
+            ),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        ),
+        (
+            format!(
+                "/v1/projects/{}/agents/{}/tool-permissions/web.read/versions/1",
+                fixture.project_id, provisioned.agent_id
+            ),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {}", fixture.owner_token))
+                    .body(Body::from(
+                        json!({
+                            "id": permission_id,
+                            "tool_version": 1,
+                            "idempotency_key": idempotency_key
+                        })
+                        .to_string(),
+                    ))
+                    .expect("grant exact tool permission request"),
+            )
+            .await
+            .expect("grant exact tool permission response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            json_body(response).await
+        );
+    }
+
+    let run_id = Uuid::new_v4();
+    let create_run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/agent-runs", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id": run_id,
+                        "source": {"kind":"local_goal", "id":provisioned.local_goal_id, "revision":1},
+                        "authority_envelope": {"resource_authority":[], "tool_authority":["web.read"]}
+                    })
+                    .to_string(),
+                ))
+                .expect("create exact tool run request"),
+        )
+        .await
+        .expect("create exact tool run response");
+    assert_eq!(
+        create_run.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(create_run).await
+    );
+
+    let claim = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from("{}"))
+                .expect("claim exact tool work request"),
+        )
+        .await
+        .expect("claim exact tool work response");
+    assert_eq!(claim.status(), StatusCode::OK, "{}", json_body(claim).await);
+    let state = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{run_id}",
+                        fixture.project_id
+                    ))
+                    .header("authorization", format!("Bearer {}", runner.bearer))
+                    .body(Body::empty())
+                    .expect("read exact tool run"),
+            )
+            .await
+            .expect("read exact tool run response"),
+    )
+    .await;
+    let (claim_id, claim_value) = state["state"]["claims"]
+        .as_object()
+        .and_then(|claims| claims.iter().next())
+        .expect("exact tool claim");
+    let claim_id = Uuid::parse_str(claim_id).expect("exact tool claim id");
+    let work_id = Uuid::parse_str(claim_value["work"].as_str().expect("exact tool claim work"))
+        .expect("exact tool work id");
+    let goal_id = Uuid::parse_str(state["state"]["goal"].as_str().expect("tool goal id"))
+        .expect("exact tool goal UUID");
+
+    let manifest_hash = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT manifest_hash FROM agent_external_tool_catalog
+         WHERE tool_name='web.read' AND version=1",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact web tool manifest");
+    let (witness_id, profile_commitment_hex) = attest_exact_tool_runtime(
+        &fixture,
+        &app,
+        &provisioned,
+        &runner,
+        &manifest_hash,
+        0x91,
+        ChronoDuration::seconds(3),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let call_id = Uuid::new_v4();
+    let call_idempotency = Uuid::new_v4();
+    let encrypted_input = json!({
+        "version": 1,
+        "algorithm": "aes-256-gcm",
+        "key_id": "fixture-tool-input-key",
+        "nonce_b64": "y8vLy8vLy8vLy8vL",
+        "ciphertext_b64": "ysw="
+    });
+    let typed_input: sprout_api_contract::EncryptedPayloadDto =
+        serde_json::from_value(encrypted_input.clone()).expect("typed tool input");
+    let encrypted_input_commitment =
+        sha256_hex(&canonical_governance_json(&typed_input).expect("canonical encrypted input"));
+    let structured_input_commitment_hex = "92".repeat(32);
+    let input_statement = json!({
+        "signature_context":"sprout-external-tool-input-v1",
+        "project_id":fixture.project_id,
+        "run_id":run_id,
+        "goal_id":goal_id,
+        "work_item_id":work_id,
+        "claim_id":claim_id,
+        "attempt":1,
+        "owner_identity_id":provisioned.principal_identity_id,
+        "tool_id":"web.read",
+        "tool_version":1,
+        "runtime_capability_witness_id":witness_id,
+        "encrypted_input_payload_commitment_hex":encrypted_input_commitment,
+        "structured_input_commitment_hex":structured_input_commitment_hex,
+        "idempotency_key":call_idempotency
+    });
+    let invoke_body = json!({
+        "id":call_id,
+        "tool_id":"web.read",
+        "tool_version":1,
+        "runtime_capability_witness_id":witness_id,
+        "encrypted_input":encrypted_input,
+        "structured_input_commitment_hex":structured_input_commitment_hex,
+        "max_attempts":4,
+        "timeout_seconds":3,
+        "idempotency_key":call_idempotency,
+        "signatures":signed_statement_by(
+            provisioned.principal_identity_id,
+            provisioned.runner_device_id,
+            &runner.ed25519_private_key,
+            &runner.ml_dsa_65_private_key,
+            &input_statement,
+            b"sprout-external-tool-input-v1"
+        )
+    });
+    let invoke = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/claims/{claim_id}/tool-calls",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(invoke_body.to_string()))
+                .expect("invoke exact external tool request"),
+        )
+        .await
+        .expect("invoke exact external tool response");
+    assert_eq!(
+        invoke.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(invoke).await
+    );
+    let (acquired_tick, requested_tick, expires_tick) = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT extract(epoch FROM claim.acquired_at)::bigint,
+                    call.requested_tick,
+                    extract(epoch FROM claim.expires_at)::bigint
+             FROM agent_tool_calls call
+             JOIN agent_run_claim_leases claim
+               ON claim.project_id=call.project_id AND claim.id=call.work_claim_id
+             WHERE call.project_id=$1 AND call.id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact requestedAt coordinates");
+    assert!(acquired_tick < requested_tick && requested_tick < expires_tick);
+
+    let replay = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/claims/{claim_id}/tool-calls",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(invoke_body.to_string()))
+                .expect("replay exact external tool request"),
+        )
+        .await
+        .expect("replay exact external tool response");
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(json_body(replay).await["replayed"], true);
+
+    let dispatch_id = Uuid::new_v4();
+    let lease_id = Uuid::new_v4();
+    let dispatch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({"dispatch_id":dispatch_id,"lease_id":lease_id}).to_string(),
+                ))
+                .expect("claim exact tool dispatch request"),
+        )
+        .await
+        .expect("claim exact tool dispatch response");
+    assert_eq!(
+        dispatch.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(dispatch).await
+    );
+    let canonical_input_commitment_hex = canonical_hash_hex(&input_statement);
+    let request_id = Uuid::new_v4();
+    let request_idempotency = Uuid::new_v4();
+    let wire_request_commitment_hex = "93".repeat(32);
+    let request_signed_at = Utc::now();
+    let request_statement = json!({
+        "signature_context":"sprout-external-tool-request-v1",
+        "project_id":fixture.project_id,
+        "run_id":run_id,
+        "call_id":call_id,
+        "request_id":request_id,
+        "dispatch_id":dispatch_id,
+        "attempt":1,
+        "adapter_protocol":"sprout-edge-web-read-v1",
+        "canonical_input_commitment_hex":canonical_input_commitment_hex,
+        "wire_request_commitment_hex":wire_request_commitment_hex,
+        "execution_profile_commitment_hex":profile_commitment_hex,
+        "signed_at":request_signed_at,
+        "idempotency_key":request_idempotency
+    });
+    let request = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/requests",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({
+                        "request_id":request_id,
+                        "dispatch_id":dispatch_id,
+                        "wire_request_commitment_hex":wire_request_commitment_hex,
+                        "signed_at":request_signed_at,
+                        "idempotency_key":request_idempotency,
+                        "signatures":signed_statement_by(
+                            provisioned.principal_identity_id,
+                            provisioned.runner_device_id,
+                            &runner.ed25519_private_key,
+                            &runner.ml_dsa_65_private_key,
+                            &request_statement,
+                            b"sprout-external-tool-request-v1"
+                        )
+                    })
+                    .to_string(),
+                ))
+                .expect("record exact external request"),
+        )
+        .await
+        .expect("record exact external request response");
+    assert_eq!(
+        request.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(request).await
+    );
+
+    let revoke = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/tool-permissions/web.read/versions/1",
+                    fixture.project_id, provisioned.agent_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("revoke exact actor tool permission"),
+        )
+        .await
+        .expect("revoke exact actor tool permission response");
+    assert_eq!(revoke.status(), StatusCode::OK);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let terminal_id = Uuid::new_v4();
+    let terminal_idempotency = Uuid::new_v4();
+    let terminal_signed_at = Utc::now();
+    let terminal_statement = json!({
+        "signature_context":"sprout-external-tool-observation-v1",
+        "project_id":fixture.project_id,
+        "run_id":run_id,
+        "call_id":call_id,
+        "observation_id":terminal_id,
+        "dispatch_id":dispatch_id,
+        "lease_id":lease_id,
+        "request_id":request_id,
+        "attempt":1,
+        "tool_id":"web.read",
+        "tool_version":1,
+        "adapter_protocol":"sprout-edge-web-read-v1",
+        "canonical_input_commitment_hex":canonical_input_commitment_hex,
+        "wire_request_commitment_hex":wire_request_commitment_hex,
+        "execution_profile_commitment_hex":profile_commitment_hex,
+        "status":"failed",
+        "encrypted_output_payload_commitment_hex":null,
+        "canonical_output_commitment_hex":null,
+        "output_readable_by":[provisioned.principal_identity_id],
+        "failure_code":"controlled_failure",
+        "output_key_envelopes":[],
+        "signed_at":terminal_signed_at,
+        "idempotency_key":terminal_idempotency
+    });
+    let terminal_body = json!({
+        "observation_id":terminal_id,
+        "dispatch_id":dispatch_id,
+        "lease_id":lease_id,
+        "request_id":request_id,
+        "status":"failed",
+        "encrypted_output":null,
+        "canonical_output_commitment_hex":null,
+        "failure_code":"controlled_failure",
+        "output_key_envelopes":[],
+        "signed_at":terminal_signed_at,
+        "idempotency_key":terminal_idempotency,
+        "signatures":signed_statement_by(
+            provisioned.principal_identity_id,
+            provisioned.runner_device_id,
+            &runner.ed25519_private_key,
+            &runner.ml_dsa_65_private_key,
+            &terminal_statement,
+            b"sprout-external-tool-observation-v1"
+        )
+    });
+    let terminal = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/terminal",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(terminal_body.to_string()))
+                .expect("record historical terminal observation"),
+        )
+        .await
+        .expect("record historical terminal response");
+    assert_eq!(
+        terminal.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(terminal).await
+    );
+    let terminal_replay = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/terminal",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(terminal_body.to_string()))
+                .expect("replay exact terminal observation"),
+        )
+        .await
+        .expect("replay exact terminal observation response");
+    let replay_status = terminal_replay.status();
+    let replay_body = json_body(terminal_replay).await;
+    assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+    assert_eq!(replay_body["replayed"], true);
+    let terminal_audit_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_tool_audit
+         WHERE project_id=$1 AND call_id=$2 AND kind='failed' AND attempt=1",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count exact replay terminal audit");
+    assert_eq!(terminal_audit_count, 1);
+
+    let terminal_snapshot = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{run_id}",
+                        fixture.project_id
+                    ))
+                    .header("authorization", format!("Bearer {}", runner.bearer))
+                    .body(Body::empty())
+                    .expect("read terminal WorkAttempt snapshot"),
+            )
+            .await
+            .expect("read terminal WorkAttempt response"),
+    )
+    .await;
+    let terminal_work = &terminal_snapshot["state"]["work_items"][work_id.to_string()];
+    assert_eq!(terminal_work["status"], "failed");
+    assert_eq!(terminal_work["attempt"], 1);
+    let terminal_rows = sqlx::query_as::<_, (String, i32, String, i32)>(
+        "SELECT call.current_status, call.current_attempt,
+                outcome.work_status, outcome.attempt
+         FROM agent_tool_calls call
+         JOIN agent_run_external_tool_work_outcomes outcome
+           ON outcome.project_id=call.project_id
+          AND outcome.run_id=call.run_id
+          AND outcome.work_item_id=call.work_item_id
+          AND outcome.attempt=call.current_attempt
+         WHERE call.project_id=$1 AND call.id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact failed ToolCall/WorkOutcome snapshot");
+    assert_eq!(terminal_rows, ("failed".into(), 1, "failed".into(), 1));
+
+    let rearm_retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from("{}"))
+                .expect("re-arm retry WorkAttempt"),
+        )
+        .await
+        .expect("re-arm retry WorkAttempt response");
+    assert_eq!(
+        rearm_retry.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(rearm_retry).await
+    );
+    let rearmed_state = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{run_id}",
+                        fixture.project_id
+                    ))
+                    .header("authorization", format!("Bearer {}", runner.bearer))
+                    .body(Body::empty())
+                    .expect("read re-armed WorkAttempt"),
+            )
+            .await
+            .expect("read re-armed WorkAttempt response"),
+    )
+    .await;
+    assert_eq!(
+        rearmed_state["state"]["work_items"][work_id.to_string()]["status"],
+        "eligible"
+    );
+    assert_eq!(
+        rearmed_state["state"]["work_items"][work_id.to_string()]["attempt"],
+        2
+    );
+
+    let claim_retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from("{}"))
+                .expect("claim exact retry WorkAttempt"),
+        )
+        .await
+        .expect("claim exact retry WorkAttempt response");
+    assert_eq!(claim_retry.status(), StatusCode::OK);
+    let retry_state = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{run_id}",
+                        fixture.project_id
+                    ))
+                    .header("authorization", format!("Bearer {}", runner.bearer))
+                    .body(Body::empty())
+                    .expect("read claimed retry WorkAttempt"),
+            )
+            .await
+            .expect("read claimed retry WorkAttempt response"),
+    )
+    .await;
+    let retry_claim_id = retry_state["state"]["claims"]
+        .as_object()
+        .and_then(|claims| {
+            claims.iter().find_map(|(id, claim)| {
+                (claim["status"] == "active" && claim["attempt"] == 2).then_some(id)
+            })
+        })
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("active retry claim");
+    let denied_retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/retry",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({
+                        "work_claim_id":retry_claim_id,
+                        "runtime_capability_witness_id":witness_id,
+                        "idempotency_key":Uuid::new_v4()
+                    })
+                    .to_string(),
+                ))
+                .expect("retry after readiness revocation"),
+        )
+        .await
+        .expect("retry after readiness revocation response");
+    assert_eq!(denied_retry.status(), StatusCode::FORBIDDEN);
+
+    let regrant = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/tool-permissions/web.read/versions/1",
+                    fixture.project_id, provisioned.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id":Uuid::new_v4(),
+                        "tool_version":1,
+                        "idempotency_key":Uuid::new_v4()
+                    })
+                    .to_string(),
+                ))
+                .expect("restore exact actor tool permission"),
+        )
+        .await
+        .expect("restore exact actor tool permission response");
+    assert_eq!(
+        regrant.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(regrant).await
+    );
+    let (retry_witness_id, _) = attest_exact_tool_runtime(
+        &fixture,
+        &app,
+        &provisioned,
+        &runner,
+        &manifest_hash,
+        0x94,
+        ChronoDuration::seconds(30),
+    )
+    .await;
+    let retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/retry",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({
+                        "work_claim_id":retry_claim_id,
+                        "runtime_capability_witness_id":retry_witness_id,
+                        "idempotency_key":Uuid::new_v4()
+                    })
+                    .to_string(),
+                ))
+                .expect("retry exact failed ToolCall"),
+        )
+        .await
+        .expect("retry exact failed ToolCall response");
+    assert_eq!(retry.status(), StatusCode::OK, "{}", json_body(retry).await);
+    let retried_call = sqlx::query_as::<_, (String, i32, Uuid, i32)>(
+        "SELECT current_status, current_attempt, work_claim_id, work_attempt
+         FROM agent_tool_calls WHERE project_id=$1 AND id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact retry ToolCall");
+    assert_eq!(retried_call, ("pending".into(), 2, retry_claim_id, 2));
+
+    let late_attempt_one = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/terminal",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({
+                        "observation_id":Uuid::new_v4(),
+                        "dispatch_id":dispatch_id,
+                        "lease_id":lease_id,
+                        "request_id":request_id,
+                        "status":"failed",
+                        "encrypted_output":null,
+                        "canonical_output_commitment_hex":null,
+                        "failure_code":"late_attempt_one",
+                        "output_key_envelopes":[],
+                        "signed_at":Utc::now(),
+                        "idempotency_key":Uuid::new_v4(),
+                        "signatures":signed_statement_by(
+                            provisioned.principal_identity_id,
+                            provisioned.runner_device_id,
+                            &runner.ed25519_private_key,
+                            &runner.ml_dsa_65_private_key,
+                            &terminal_statement,
+                            b"sprout-external-tool-observation-v1"
+                        )
+                    })
+                    .to_string(),
+                ))
+                .expect("reject late attempt-one observation"),
+        )
+        .await
+        .expect("reject late attempt-one observation response");
+    assert!(
+        matches!(
+            late_attempt_one.status(),
+            StatusCode::CONFLICT | StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST
+        ),
+        "{}",
+        json_body(late_attempt_one).await
+    );
+    let still_retry = sqlx::query_as::<_, (String, i32, Uuid)>(
+        "SELECT current_status, current_attempt, work_claim_id
+         FROM agent_tool_calls WHERE project_id=$1 AND id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load ToolCall after late attempt-one rejection");
+    assert_eq!(still_retry, ("pending".into(), 2, retry_claim_id));
+
+    // The retry attempt is already pending even though the edge never claims
+    // a dispatch. Its ToolCall deadline, not claim recovery, terminalizes the
+    // exact attempt and preserves both historical outcomes.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    run_agent_completion_once(&fixture, config.clone()).await;
+    let timed_out = sqlx::query_as::<_, (String, i32, String, i32, i64, i64)>(
+        "SELECT call.current_status, call.current_attempt,
+                transition.state_snapshot #>> ARRAY['work_items', call.work_item_id::text, 'status'],
+                (transition.state_snapshot #>> ARRAY['work_items', call.work_item_id::text, 'attempt'])::integer,
+                (SELECT count(*) FROM agent_run_external_tool_work_outcomes history
+                  WHERE history.project_id=call.project_id AND history.run_id=call.run_id
+                    AND history.work_item_id=call.work_item_id),
+                (SELECT count(*) FROM agent_tool_attempt_dispatches dispatch
+                  WHERE dispatch.project_id=call.project_id AND dispatch.call_id=call.id
+                    AND dispatch.attempt=2)
+         FROM agent_tool_calls call
+         JOIN agent_run_external_tool_work_outcomes outcome
+           ON outcome.project_id=call.project_id AND outcome.run_id=call.run_id
+          AND outcome.work_item_id=call.work_item_id AND outcome.attempt=2
+         JOIN agent_run_transitions transition
+           ON transition.project_id=outcome.project_id AND transition.id=outcome.transition_id
+         WHERE call.project_id=$1 AND call.id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact no-dispatch server timeout");
+    assert_eq!(timed_out, ("timed_out".into(), 2, "failed".into(), 2, 2, 0));
+
+    // Attempt 3 reaches dispatch but no outbound request. Timeout retains the
+    // dispatch provenance and does not invent a request witness.
+    rearm_claim_and_retry_exact_tool(
+        &fixture,
+        &app,
+        &runner,
+        run_id,
+        call_id,
+        retry_witness_id,
+        3,
+    )
+    .await;
+    let (dispatch_three, _) =
+        claim_exact_tool_dispatch(&fixture, &app, &runner, run_id, call_id).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    run_agent_completion_once(&fixture, config.clone()).await;
+    let timeout_three = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>, Option<Vec<u8>>, i64)>(
+        "SELECT observation.dispatch_id, observation.request_id,
+                observation.wire_request_commitment, outcome.attempt::bigint
+         FROM agent_tool_attempt_observations observation
+         JOIN agent_run_external_tool_work_outcomes outcome
+           ON outcome.project_id=observation.project_id
+          AND outcome.observation_id=observation.id
+         WHERE observation.project_id=$1 AND observation.call_id=$2
+           AND observation.attempt=3 AND observation.terminal_origin='server_timeout'",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load dispatch-without-request timeout");
+    assert_eq!(timeout_three, (Some(dispatch_three), None, None, 3));
+
+    // Attempt 4 persists the exact outbound witness before the edge vanishes;
+    // server timeout preserves both request identity and wire commitment.
+    rearm_claim_and_retry_exact_tool(
+        &fixture,
+        &app,
+        &runner,
+        run_id,
+        call_id,
+        retry_witness_id,
+        4,
+    )
+    .await;
+    let (dispatch_four, lease_four) =
+        claim_exact_tool_dispatch(&fixture, &app, &runner, run_id, call_id).await;
+    let profile_four = format!("{:02x}", 0x94_u8).repeat(32);
+    let (request_four, wire_four) = record_exact_tool_request(
+        &fixture,
+        &app,
+        &provisioned,
+        &runner,
+        run_id,
+        call_id,
+        dispatch_four,
+        4,
+        &canonical_input_commitment_hex,
+        &profile_four,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    run_agent_completion_once(&fixture, config).await;
+    let timeout_four = sqlx::query_as::<_, (Uuid, Vec<u8>, i64)>(
+        "SELECT observation.request_id, observation.wire_request_commitment,
+                outcome.attempt::bigint
+         FROM agent_tool_attempt_observations observation
+         JOIN agent_run_external_tool_work_outcomes outcome
+           ON outcome.project_id=observation.project_id
+          AND outcome.observation_id=observation.id
+         WHERE observation.project_id=$1 AND observation.call_id=$2
+           AND observation.attempt=4 AND observation.terminal_origin='server_timeout'",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load request-preserving timeout");
+    assert_eq!(
+        timeout_four,
+        (request_four, hex::decode(&wire_four).unwrap(), 4)
+    );
+    let late_four_id = Uuid::new_v4();
+    let late_four_idempotency = Uuid::new_v4();
+    let late_four_signed_at = Utc::now();
+    let late_four_statement = json!({
+        "signature_context":"sprout-external-tool-observation-v1",
+        "project_id":fixture.project_id,
+        "run_id":run_id,
+        "call_id":call_id,
+        "observation_id":late_four_id,
+        "dispatch_id":dispatch_four,
+        "lease_id":lease_four,
+        "request_id":request_four,
+        "attempt":4,
+        "tool_id":"web.read",
+        "tool_version":1,
+        "adapter_protocol":"sprout-edge-web-read-v1",
+        "canonical_input_commitment_hex":canonical_input_commitment_hex,
+        "wire_request_commitment_hex":wire_four,
+        "execution_profile_commitment_hex":profile_four,
+        "status":"failed",
+        "encrypted_output_payload_commitment_hex":null,
+        "canonical_output_commitment_hex":null,
+        "output_readable_by":[provisioned.principal_identity_id],
+        "failure_code":"late_after_server_timeout",
+        "output_key_envelopes":[],
+        "signed_at":late_four_signed_at,
+        "idempotency_key":late_four_idempotency
+    });
+    let late_four = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{run_id}/tool-calls/{call_id}/terminal",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from(
+                    json!({
+                        "observation_id":late_four_id,
+                        "dispatch_id":dispatch_four,
+                        "lease_id":lease_four,
+                        "request_id":request_four,
+                        "status":"failed",
+                        "encrypted_output":null,
+                        "canonical_output_commitment_hex":null,
+                        "failure_code":"late_after_server_timeout",
+                        "output_key_envelopes":[],
+                        "signed_at":late_four_signed_at,
+                        "idempotency_key":late_four_idempotency,
+                        "signatures":signed_statement_by(
+                            provisioned.principal_identity_id,
+                            provisioned.runner_device_id,
+                            &runner.ed25519_private_key,
+                            &runner.ml_dsa_65_private_key,
+                            &late_four_statement,
+                            b"sprout-external-tool-observation-v1"
+                        )
+                    })
+                    .to_string(),
+                ))
+                .expect("reject late result after exact server timeout"),
+        )
+        .await
+        .expect("reject late result after exact server timeout response");
+    assert_eq!(late_four.status(), StatusCode::FORBIDDEN);
+
+    let exact_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT
+            (SELECT count(*) FROM agent_tool_calls WHERE project_id=$1 AND id=$2),
+            (SELECT count(*) FROM agent_tool_attempt_dispatches WHERE project_id=$1 AND call_id=$2),
+            (SELECT count(*) FROM agent_tool_attempt_requests WHERE project_id=$1 AND call_id=$2),
+            (SELECT count(*) FROM agent_run_external_tool_work_outcomes WHERE project_id=$1 AND run_id=$3 AND work_item_id=$4)",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .bind(run_id)
+    .bind(work_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count exact append-only attempt records");
+    assert_eq!(exact_counts, (1, 3, 2, 4));
+
+    // A second run proves the separate non-resource ToolOutput source path.
+    let output_run = Uuid::new_v4();
+    let create_output_run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/agent-runs", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(
+                    json!({
+                        "id":output_run,
+                        "source":{"kind":"local_goal","id":provisioned.local_goal_id,"revision":1},
+                        "authority_envelope":{"resource_authority":[],"tool_authority":["web.read"]}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_output_run.status(), StatusCode::OK);
+    let claim_output = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{output_run}/claim",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim_output.status(), StatusCode::OK);
+    let output_state = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{output_run}",
+                        fixture.project_id
+                    ))
+                    .header("authorization", format!("Bearer {}", runner.bearer))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let (output_claim_text, output_claim) = output_state["state"]["claims"]
+        .as_object()
+        .and_then(|claims| claims.iter().find(|(_, claim)| claim["status"] == "active"))
+        .expect("output producer claim");
+    let output_claim_id = Uuid::parse_str(output_claim_text).unwrap();
+    let output_work_id = Uuid::parse_str(output_claim["work"].as_str().unwrap()).unwrap();
+    let output_goal_id = Uuid::parse_str(output_state["state"]["goal"].as_str().unwrap()).unwrap();
+    let (output_witness, output_profile) = attest_exact_tool_runtime(
+        &fixture,
+        &app,
+        &provisioned,
+        &runner,
+        &manifest_hash,
+        0xa1,
+        ChronoDuration::seconds(30),
+    )
+    .await;
+    let output_call_id = Uuid::new_v4();
+    let output_call_idempotency = Uuid::new_v4();
+    let output_input = json!({
+        "version":1,"algorithm":"aes-256-gcm","key_id":"output-source-input",
+        "nonce_b64":"y8vLy8vLy8vLy8vL","ciphertext_b64":"ysw="
+    });
+    let output_input_typed: sprout_api_contract::EncryptedPayloadDto =
+        serde_json::from_value(output_input.clone()).unwrap();
+    let output_input_payload_commitment =
+        sha256_hex(&canonical_governance_json(&output_input_typed).unwrap());
+    let output_input_statement = json!({
+        "signature_context":"sprout-external-tool-input-v1",
+        "project_id":fixture.project_id,"run_id":output_run,"goal_id":output_goal_id,
+        "work_item_id":output_work_id,"claim_id":output_claim_id,"attempt":1,
+        "owner_identity_id":provisioned.principal_identity_id,
+        "tool_id":"web.read","tool_version":1,
+        "runtime_capability_witness_id":output_witness,
+        "encrypted_input_payload_commitment_hex":output_input_payload_commitment,
+        "structured_input_commitment_hex":"a2".repeat(32),
+        "idempotency_key":output_call_idempotency
+    });
+    let output_invoke = app.clone().oneshot(
+        Request::builder().method("POST")
+            .uri(format!("/v1/projects/{}/agent-runs/{output_run}/claims/{output_claim_id}/tool-calls", fixture.project_id))
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Bearer {}", runner.bearer))
+            .body(Body::from(json!({
+                "id":output_call_id,"tool_id":"web.read","tool_version":1,
+                "runtime_capability_witness_id":output_witness,"encrypted_input":output_input,
+                "structured_input_commitment_hex":"a2".repeat(32),"max_attempts":1,
+                "timeout_seconds":10,"idempotency_key":output_call_idempotency,
+                "signatures":signed_statement_by(
+                    provisioned.principal_identity_id, provisioned.runner_device_id,
+                    &runner.ed25519_private_key, &runner.ml_dsa_65_private_key,
+                    &output_input_statement, b"sprout-external-tool-input-v1")
+            }).to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(
+        output_invoke.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(output_invoke).await
+    );
+    let (output_dispatch, output_lease) =
+        claim_exact_tool_dispatch(&fixture, &app, &runner, output_run, output_call_id).await;
+    let output_input_commitment = canonical_hash_hex(&output_input_statement);
+    let (output_request, output_wire) = record_exact_tool_request(
+        &fixture,
+        &app,
+        &provisioned,
+        &runner,
+        output_run,
+        output_call_id,
+        output_dispatch,
+        1,
+        &output_input_commitment,
+        &output_profile,
+    )
+    .await;
+
+    let package_json = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT package_json FROM device_keys WHERE identity_id=$1 AND device_id=$2 AND key_version=1"
+    ).bind(provisioned.principal_identity_id).bind(provisioned.runner_device_id)
+        .fetch_one(&fixture.pool).await.unwrap();
+    let package = DevicePublicPackage::from_json(&package_json).unwrap();
+    let x25519 = package
+        .encryption_keys
+        .iter()
+        .find(|key| key.algorithm == KeyAlgorithm::X25519)
+        .unwrap();
+    let ml_kem = package
+        .encryption_keys
+        .iter()
+        .find(|key| key.algorithm == KeyAlgorithm::MlKem768Experimental)
+        .unwrap();
+    let output_key = ResourceKey::from_slice(&[0x5a; 32]).unwrap();
+    let output_metadata = HybridWrapMetadata::new(
+        output_call_id,
+        provisioned.runner_device_id,
+        1,
+        hash_bytes(
+            format!(
+                "sprout-resource-key-genesis-v1/{}/{}",
+                fixture.project_id, output_call_id
+            )
+            .as_bytes(),
+        ),
+        b"sprout-tool-output-test-v1".to_vec(),
+    )
+    .unwrap();
+    let wrapped = wrap_resource_key(
+        &output_key,
+        &x25519.public_key,
+        &ml_kem.public_key,
+        output_metadata.clone(),
+    )
+    .unwrap();
+    let wrapped_bytes = wrapped.to_bytes().unwrap();
+    let parsed = ExperimentalWrappedResourceKey::from_bytes(&wrapped_bytes).unwrap();
+    let opened = unwrap_resource_key(
+        &parsed,
+        &runner.x25519_private_key,
+        &runner.ml_kem_768_private_key,
+        &output_metadata,
+    )
+    .unwrap();
+    assert_eq!(opened.as_bytes(), output_key.as_bytes());
+    let envelope_id = Uuid::new_v4();
+    let envelope_statement = json!({
+        "signature_context":"sprout-tool-output-key-envelope-v1",
+        "project_id":fixture.project_id,"call_id":output_call_id,"attempt":1,
+        "envelope_version":2,"key_purpose":"tool_output",
+        "recipient_identity_id":provisioned.principal_identity_id,
+        "recipient_device_id":provisioned.runner_device_id,
+        "recipient_device_key_version":1,
+        "sender_identity_id":provisioned.principal_identity_id,
+        "sender_device_id":provisioned.runner_device_id,"sender_device_key_version":1,
+        "encrypted_key_commitment_hex":sha256_hex(&wrapped_bytes)
+    });
+    let envelope_signatures = sign_ed25519_ml_dsa65(
+        &runner.ed25519_private_key,
+        &runner.ml_dsa_65_private_key,
+        &canonical_governance_json(&envelope_statement).unwrap(),
+        b"sprout-tool-output-key-envelope-v1",
+    )
+    .unwrap();
+    let output_envelope = json!({
+        "id":envelope_id,"envelope_version":2,"key_purpose":"tool_output",
+        "recipient_identity_id":provisioned.principal_identity_id,
+        "recipient_device_id":provisioned.runner_device_id,"recipient_device_key_version":1,
+        "sender_device_key_version":1,
+        "encrypted_key_b64":STANDARD.encode(&wrapped_bytes),
+        "sender_signature_b64":STANDARD.encode(envelope_signatures.ed25519()),
+        "sender_post_quantum_signature_b64":STANDARD.encode(envelope_signatures.ml_dsa_65())
+    });
+    let output_payload = json!({
+        "version":1,"algorithm":"aes-256-gcm","key_id":"tool-output-key",
+        "nonce_b64":"zMzMzMzMzMzMzMzM","ciphertext_b64":"zc4="
+    });
+    let output_payload_typed: sprout_api_contract::EncryptedPayloadDto =
+        serde_json::from_value(output_payload.clone()).unwrap();
+    let output_payload_commitment =
+        sha256_hex(&canonical_governance_json(&output_payload_typed).unwrap());
+    let output_observation = Uuid::new_v4();
+    let output_terminal_idempotency = Uuid::new_v4();
+    let output_signed_at = Utc::now();
+    let output_statement = json!({
+        "signature_context":"sprout-external-tool-observation-v1",
+        "project_id":fixture.project_id,"run_id":output_run,"call_id":output_call_id,
+        "observation_id":output_observation,"dispatch_id":output_dispatch,"lease_id":output_lease,
+        "request_id":output_request,"attempt":1,"tool_id":"web.read","tool_version":1,
+        "adapter_protocol":"sprout-edge-web-read-v1",
+        "canonical_input_commitment_hex":output_input_commitment,
+        "wire_request_commitment_hex":output_wire,
+        "execution_profile_commitment_hex":output_profile,"status":"succeeded",
+        "encrypted_output_payload_commitment_hex":output_payload_commitment,
+        "canonical_output_commitment_hex":"a3".repeat(32),
+        "output_readable_by":[provisioned.principal_identity_id],"failure_code":null,
+        "output_key_envelopes":[output_envelope],"signed_at":output_signed_at,
+        "idempotency_key":output_terminal_idempotency
+    });
+    let output_terminal = app.clone().oneshot(
+        Request::builder().method("POST")
+            .uri(format!("/v1/projects/{}/agent-runs/{output_run}/tool-calls/{output_call_id}/terminal", fixture.project_id))
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Bearer {}", runner.bearer))
+            .body(Body::from(json!({
+                "observation_id":output_observation,"dispatch_id":output_dispatch,"lease_id":output_lease,
+                "request_id":output_request,"status":"succeeded","encrypted_output":output_payload,
+                "canonical_output_commitment_hex":"a3".repeat(32),"failure_code":null,
+                "output_key_envelopes":[output_envelope],"signed_at":output_signed_at,
+                "idempotency_key":output_terminal_idempotency,
+                "signatures":signed_statement_by(
+                    provisioned.principal_identity_id, provisioned.runner_device_id,
+                    &runner.ed25519_private_key, &runner.ml_dsa_65_private_key,
+                    &output_statement, b"sprout-external-tool-observation-v1")
+            }).to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(
+        output_terminal.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(output_terminal).await
+    );
+
+    let queue_tool_output = |source_call: Uuid| {
+        json!({
+            "id":Uuid::new_v4(),"local_goal_id":provisioned.local_goal_id,"local_goal_revision":1,
+            "language_task":{
+                "id":Uuid::new_v4(),"kind":"answer_from_authorized_context",
+                "input_item_count":2,"max_input_items":2,"max_output_items":1,
+                "max_nesting_depth":2,"max_attempts":1,"closed_output_schema":true,
+                "grounded_identifiers_only":true,"requires_formal_proof":false,
+                "requires_permission_decision":false,"requires_exact_semantic_equivalence":false,
+                "requires_exhaustive_world_knowledge":false,
+                "allowed_resource_ids":[fixture.profile_resource_id],
+                "allowed_principal_ids":[provisioned.principal_identity_id],"allowed_tools":[]
+            },
+            "authority_envelope":{"resource_authority":[],"tool_authority":[]},
+            "sources":[
+                {"kind":"resource_body","resource_id":fixture.profile_resource_id},
+                {"kind":"tool_output","call_id":source_call}
+            ],
+            "encrypted_input":encrypted(203)
+        })
+    };
+    let valid_source = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/invocations",
+                    fixture.project_id, provisioned.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(queue_tool_output(output_call_id).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        valid_source.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(valid_source).await
+    );
+    let wrong_call_source = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/invocations",
+                    fixture.project_id, provisioned.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(queue_tool_output(Uuid::new_v4()).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_call_source.status(), StatusCode::FORBIDDEN);
 }
 
 async fn create_active_compiled_responsibility(

@@ -9,14 +9,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sprout_api_contract::EncryptedPayloadDto;
 use sprout_domain::{
-    AgentActionClass, AgentAvailabilityMode, BlockScope, BlockerId, BlockerResolutionFacts,
-    BlockerResolutionObservation, BlockerStatus, ClaimId, CollaborativeCausalLink,
-    CollaborativeCausalNode, CollaborativeRunState, CollaborativeRunStatus, ContractCondition,
-    ContractConditionFacts, ContractEvidenceSubject, CurrentLocalObligationContext, EvidenceId,
-    EvidenceKind, EvidenceRecord, EvidenceSubject, EvidenceVerificationMode, ExternalBlockerFacts,
-    GlobalContractCandidate, GoalContract, GoalStatus, GovernedAgent, LocalGoalContract,
-    ObservedTerminalOutcome, ResourceId, RunId, TaskObligationProvenance, UserId, WaitingCondition,
-    WorkClaim, WorkItemId, WorkKind, task_obligation_provenance_valid_at,
+    AgentActionClass, AgentAvailabilityMode, AuthorityEnvelope, BlockScope, BlockerId,
+    BlockerResolutionFacts, BlockerResolutionObservation, BlockerStatus, ClaimId,
+    CollaborativeCausalLink, CollaborativeCausalNode, CollaborativeRunState,
+    CollaborativeRunStatus, ContractCondition, ContractConditionFacts, ContractEvidenceSubject,
+    CurrentLocalObligationContext, EvidenceId, EvidenceKind, EvidenceRecord, EvidenceSubject,
+    EvidenceVerificationMode, ExternalBlockerFacts, GlobalContractCandidate, GoalContract,
+    GoalStatus, GovernedAgent, LocalGoalCompilerOutput, LocalGoalContract, ObservedTerminalOutcome,
+    ResourceId, RunId, TaskObligationProvenance, UserId, WaitingCondition, WorkClaim, WorkItemId,
+    WorkKind, WorkStatus, task_obligation_provenance_valid_at,
 };
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -37,6 +38,8 @@ const SCHEDULER_AGING_STEP: u64 = 1;
 pub struct CreateRunRequest {
     id: RunId,
     source: RunContractSource,
+    #[serde(default)]
+    authority_envelope: AuthorityEnvelope,
 }
 
 #[derive(Deserialize)]
@@ -155,27 +158,28 @@ struct LoadedContract {
     controller: Option<Uuid>,
 }
 
+#[derive(Clone, Copy)]
 enum PersistedSource {
     Local { id: Uuid, revision: i64 },
     Global { id: Uuid, revision: i64 },
 }
 
-struct LockedRun {
-    contract: GoalContract,
-    state: CollaborativeRunState,
-    state_hash: Vec<u8>,
-    state_version: i64,
+pub(crate) struct LockedRun {
+    pub(crate) contract: GoalContract,
+    pub(crate) state: CollaborativeRunState,
+    pub(crate) state_hash: Vec<u8>,
+    pub(crate) state_version: i64,
 }
 
-struct PersistedTransition {
-    id: Uuid,
-    version: u64,
+pub(crate) struct PersistedTransition {
+    pub(crate) id: Uuid,
+    pub(crate) version: u64,
 }
 
-struct TransitionMetadata {
-    kind: &'static str,
-    tick: u64,
-    observation: Option<(&'static str, Uuid)>,
+pub(crate) struct TransitionMetadata {
+    pub(crate) kind: &'static str,
+    pub(crate) tick: u64,
+    pub(crate) observation: Option<(&'static str, Uuid)>,
 }
 
 struct ValidatedWorkOutcome {
@@ -285,6 +289,16 @@ pub async fn create(
     .bind(actor.identity_id)
     .execute(&mut *transaction)
     .await?;
+    persist_tool_security_snapshot(
+        &mut transaction,
+        project_id,
+        request.id,
+        loaded.source,
+        actor.identity_id,
+        &request.authority_envelope,
+        &loaded.contract,
+    )
+    .await?;
     persist_participants(
         &mut transaction,
         project_id,
@@ -318,6 +332,138 @@ pub async fn create(
         state_version: 1,
         state,
     }))
+}
+
+async fn persist_tool_security_snapshot(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    run_id: RunId,
+    source: PersistedSource,
+    run_sponsor_identity_id: Uuid,
+    authority_envelope: &AuthorityEnvelope,
+    contract: &GoalContract,
+) -> Result<(), AppError> {
+    let declares_tool_work = contract.work_specs.iter().any(|spec| {
+        matches!(spec.kind, WorkKind::ToolInvocation | WorkKind::ToolRetry)
+            || spec.allowed_actions.iter().any(|action| {
+                matches!(
+                    action,
+                    AgentActionClass::InvokeTool | AgentActionClass::RetryTool
+                )
+            })
+    });
+    if authority_envelope.tool_authority.is_empty() && !declares_tool_work {
+        // Native-only runs need no external-tool snapshot. The absent snapshot
+        // remains a structural fail-closed fence against later tool invoke.
+        return Ok(());
+    }
+    let PersistedSource::Local { id, revision } = source else {
+        // Global synthesis is not an authoritative tool-policy compiler in
+        // 0033. Global runs therefore receive no synthetic tool ceiling.
+        return Ok(());
+    };
+    let canonical_output = sqlx::query_scalar::<_, serde_json::Value>(
+        r#"
+        SELECT certificate.canonical_output
+        FROM agent_local_goal_contracts local
+        JOIN agent_compilation_certificates certificate
+          ON certificate.project_id = local.project_id
+         AND certificate.id = local.compilation_certificate_id
+         AND certificate.task_kind = 'local_goal'
+         AND certificate.verification_state = 'verified'
+        WHERE local.project_id = $1 AND local.id = $2 AND local.revision = $3
+          AND local.state = 'active'
+        "#,
+    )
+    .bind(project_id)
+    .bind(id)
+    .bind(revision)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::Conflict)?;
+    let compiler: LocalGoalCompilerOutput =
+        serde_json::from_value(canonical_output).map_err(|_| AppError::Internal)?;
+    authority_envelope.validate_unique().map_err(domain_error)?;
+    let mut run_ceiling = authority_envelope.tool_authority.clone();
+    run_ceiling.sort();
+    for tool in &run_ceiling {
+        let manifest = sprout_domain::external_tool_catalog_entry(tool, 1)
+            .ok_or(AppError::BadRequest("unknown run tool authority"))?;
+        if manifest.availability != sprout_domain::ExternalToolAvailability::Executable
+            || !compiler
+                .security_policies
+                .iter()
+                .any(|policy| policy.allowed_tools.contains(tool))
+            || !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM agent_tool_permissions
+                 WHERE project_id=$1 AND principal_identity_id=$2
+                   AND tool_name=$3 AND tool_version=1 AND revoked_at IS NULL)",
+            )
+            .bind(project_id)
+            .bind(run_sponsor_identity_id)
+            .bind(tool)
+            .fetch_one(&mut **transaction)
+            .await?
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
+    let run_ceiling_json = canonical_value(&run_ceiling)?;
+    let run_ceiling_hash = digest_json(&run_ceiling_json)?;
+    let mut policies = Vec::with_capacity(compiler.security_policies.len());
+    for policy in &compiler.security_policies {
+        let work_spec = compiler
+            .contract
+            .work_specs
+            .iter()
+            .find(|work| work.id == policy.work_spec_id)
+            .ok_or(AppError::Internal)?;
+        let policy_json = canonical_value(policy)?;
+        let policy_hash = digest_json(&policy_json)?;
+        let mut tool_ceiling: Vec<_> = policy
+            .allowed_tools
+            .iter()
+            .filter(|tool| run_ceiling.contains(tool))
+            .cloned()
+            .collect();
+        tool_ceiling.sort();
+        tool_ceiling.dedup();
+        let tool_ceiling_json = canonical_value(&tool_ceiling)?;
+        let tool_ceiling_hash = digest_json(&tool_ceiling_json)?;
+        policies.push(serde_json::json!({
+            "work_spec_id": policy.work_spec_id,
+            "max_attempts": work_spec.max_attempts,
+            "policy": policy_json,
+            "policy_hash_hex": hex::encode(policy_hash),
+            "tool_ceiling": tool_ceiling_json,
+            "tool_ceiling_hash_hex": hex::encode(tool_ceiling_hash),
+        }));
+    }
+    policies.sort_by_key(|entry| entry["work_spec_id"].as_u64().unwrap_or(u64::MAX));
+    let policies_json = canonical_value(&policies)?;
+    let policies_hash = digest_json(&policies_json)?;
+    sqlx::query(
+        r#"
+        INSERT INTO agent_run_tool_security_snapshots (
+            project_id, run_id, contract_source_kind, contract_source_id,
+            contract_source_revision, run_sponsor_identity_id,
+            run_tool_ceiling, run_tool_ceiling_hash,
+            work_policies, work_policies_hash
+        ) VALUES ($1,$2,'local',$3,$4,$5,$6,$7,$8,$9)
+        "#,
+    )
+    .bind(project_id)
+    .bind(Uuid::from(run_id))
+    .bind(id)
+    .bind(revision)
+    .bind(run_sponsor_identity_id)
+    .bind(run_ceiling_json)
+    .bind(run_ceiling_hash.as_slice())
+    .bind(policies_json)
+    .bind(policies_hash.as_slice())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 pub async fn get(
@@ -367,7 +513,11 @@ pub async fn refresh(
         &locked.state,
     )
     .await?;
-    locked.state.recover_expired_claims(tick);
+    let protected_tool_claims =
+        pending_tool_dispatch_claims(&mut transaction, project_id, run_id).await?;
+    locked
+        .state
+        .recover_expired_claims_except(tick, &protected_tool_claims);
     locked
         .state
         .refresh_frontier(&locked.contract, &facts, tick)
@@ -411,20 +561,56 @@ pub async fn claim(
         &locked.state,
     )
     .await?;
-    locked.state.recover_expired_claims(tick);
+    let protected_tool_claims =
+        pending_tool_dispatch_claims(&mut transaction, project_id, run_id).await?;
+    locked
+        .state
+        .recover_expired_claims_except(tick, &protected_tool_claims);
     locked
         .state
         .refresh_frontier(&locked.contract, &facts, tick)
         .map_err(domain_error)?;
+    if rearm_one_failed_tool_work(
+        &mut transaction,
+        project_id,
+        run_id,
+        &mut locked.state,
+        &locked.contract,
+        &facts,
+        tick,
+    )
+    .await?
+    {
+        let transition = persist_transition(
+            &mut transaction,
+            project_id,
+            Some(actor),
+            &locked,
+            &facts,
+            TransitionMetadata {
+                kind: "tool_retry_rearmed",
+                tick,
+                observation: None,
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        return Ok(Json(ClaimResponse {
+            run_id: RunId::from(run_id),
+            state_version: transition.version,
+            claim: None,
+        }));
+    }
     let claim = locked
         .state
-        .claim_next(
+        .claim_next_except(
             &locked.contract,
             UserId::from(actor.identity_id),
             &facts,
             tick,
             app.config.agent_work_lease.as_secs(),
             SCHEDULER_AGING_STEP,
+            &protected_tool_claims,
         )
         .map_err(domain_error)?;
     let transition = persist_transition(
@@ -532,7 +718,14 @@ pub async fn materialize_task_completion(
         &locked.state,
     )
     .await?;
-    locked.state.recover_expired_claims(tick);
+    recover_expired_claims_preserving_tool_dispatches(
+        &mut transaction,
+        project_id,
+        run_id,
+        &mut locked.state,
+        tick,
+    )
+    .await?;
     locked
         .state
         .refresh_frontier(&locked.contract, &facts, tick)
@@ -859,7 +1052,14 @@ async fn terminal_work(
         &locked.state,
     )
     .await?;
-    locked.state.recover_expired_claims(tick);
+    recover_expired_claims_preserving_tool_dispatches(
+        &mut transaction,
+        project_id,
+        run_id,
+        &mut locked.state,
+        tick,
+    )
+    .await?;
     locked
         .state
         .refresh_frontier(&locked.contract, &facts, tick)
@@ -1032,7 +1232,14 @@ pub async fn complete(
         &locked.state,
     )
     .await?;
-    locked.state.recover_expired_claims(tick);
+    recover_expired_claims_preserving_tool_dispatches(
+        &mut transaction,
+        project_id,
+        run_id,
+        &mut locked.state,
+        tick,
+    )
+    .await?;
     locked
         .state
         .refresh_frontier(&locked.contract, &facts, tick)
@@ -1078,7 +1285,14 @@ pub async fn create_blocker(
         &locked.state,
     )
     .await?;
-    locked.state.recover_expired_claims(tick);
+    recover_expired_claims_preserving_tool_dispatches(
+        &mut transaction,
+        project_id,
+        run_id,
+        &mut locked.state,
+        tick,
+    )
+    .await?;
     locked
         .state
         .refresh_frontier(&locked.contract, &facts, tick)
@@ -1217,7 +1431,14 @@ pub(crate) async fn recover_expired_claims(pool: &sqlx::PgPool) -> Result<u64, A
             &locked.state,
         )
         .await?;
-        locked.state.recover_expired_claims(tick);
+        recover_expired_claims_preserving_tool_dispatches(
+            &mut transaction,
+            project_id,
+            run_id,
+            &mut locked.state,
+            tick,
+        )
+        .await?;
         locked
             .state
             .refresh_frontier(&locked.contract, &facts, tick)
@@ -1247,6 +1468,95 @@ pub(crate) async fn recover_expired_claims(pool: &sqlx::PgPool) -> Result<u64, A
         transaction.commit().await?;
     }
     Ok(recovered)
+}
+
+async fn recover_expired_claims_preserving_tool_dispatches(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    run_id: Uuid,
+    state: &mut CollaborativeRunState,
+    tick: u64,
+) -> Result<(), AppError> {
+    let protected = pending_tool_dispatch_claims(transaction, project_id, run_id).await?;
+    state.recover_expired_claims_except(tick, &protected);
+    Ok(())
+}
+
+async fn pending_tool_dispatch_claims(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    run_id: Uuid,
+) -> Result<HashSet<ClaimId>, AppError> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT DISTINCT call.work_claim_id
+        FROM agent_tool_calls call
+        LEFT JOIN agent_tool_attempt_observations observation
+          ON observation.project_id=call.project_id
+         AND observation.call_id=call.id
+         AND observation.attempt=call.current_attempt
+        WHERE call.project_id=$1 AND call.run_id=$2
+          AND call.current_status='pending'
+          AND call.tool_deadline_at > clock_timestamp()
+          AND observation.id IS NULL
+        "#,
+    )
+    .bind(project_id)
+    .bind(run_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(ids.into_iter().map(ClaimId::from).collect())
+}
+
+/// Separates the terminal failed WorkOutcome snapshot from the later
+/// `RetryWorkProgress` transition. At most one exact failed tool work is
+/// re-armed per scheduler poll, and the domain kernel enforces the exclusive
+/// WorkSpec attempt bound before materializing attempt N+1.
+async fn rearm_one_failed_tool_work(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    run_id: Uuid,
+    state: &mut CollaborativeRunState,
+    contract: &GoalContract,
+    facts: &ContractConditionFacts,
+    tick: u64,
+) -> Result<bool, AppError> {
+    let rows = sqlx::query(
+        "SELECT work_item_id, current_attempt, max_attempts
+         FROM agent_tool_calls
+         WHERE project_id=$1 AND run_id=$2
+           AND current_status IN ('failed', 'timed_out')
+           AND current_attempt < max_attempts
+         ORDER BY terminal_at, id
+         FOR SHARE",
+    )
+    .bind(project_id)
+    .bind(run_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for row in rows {
+        let work_id = WorkItemId::from(row.try_get::<Uuid, _>("work_item_id")?);
+        let attempt = u16::try_from(row.try_get::<i32, _>("current_attempt")?)
+            .map_err(|_| AppError::Internal)?;
+        let call_max_attempts = u16::try_from(row.try_get::<i32, _>("max_attempts")?)
+            .map_err(|_| AppError::Internal)?;
+        let Some(work) = state.work_items.get(&work_id) else {
+            continue;
+        };
+        if work.status != WorkStatus::Failed
+            || work.attempt != attempt
+            || attempt >= call_max_attempts
+        {
+            continue;
+        }
+        if state
+            .rearm_failed_tool_work_for_retry(contract, work_id, facts, tick)
+            .map_err(domain_error)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn load_requested_contract(
@@ -1352,7 +1662,7 @@ async fn authorize_run_creation(
     }
 }
 
-async fn lock_run(
+pub(crate) async fn lock_run(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     run_id: Uuid,
@@ -1896,7 +2206,7 @@ fn collect_contract_references(
     }
 }
 
-async fn persist_transition(
+pub(crate) async fn persist_transition(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     actor: Option<AuthSession>,
@@ -2324,7 +2634,7 @@ async fn persist_participants(
     Ok(())
 }
 
-async fn require_active_runner(
+pub(crate) async fn require_active_runner(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     actor: AuthSession,
@@ -2364,7 +2674,7 @@ async fn require_active_runner(
     }
 }
 
-async fn require_current_run_authority(
+pub(crate) async fn require_current_run_authority(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     actor: AuthSession,
@@ -2389,7 +2699,7 @@ async fn require_current_run_authority(
     }
 }
 
-async fn require_current_run_party(
+pub(crate) async fn require_current_run_party(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     actor: AuthSession,
@@ -2419,7 +2729,7 @@ async fn require_current_run_party(
     }
 }
 
-async fn begin<'a>(
+pub(crate) async fn begin<'a>(
     app: &'a AppState,
     actor: AuthSession,
     project_id: Uuid,
@@ -2473,11 +2783,11 @@ fn digest_json(value: &impl Serialize) -> Result<[u8; 32], AppError> {
     Ok(Sha256::digest(encoded).into())
 }
 
-fn runtime_tick() -> Result<u64, AppError> {
+pub(crate) fn runtime_tick() -> Result<u64, AppError> {
     u64::try_from(Utc::now().timestamp()).map_err(|_| AppError::Internal)
 }
 
-fn tick_datetime(tick: u64) -> Result<DateTime<Utc>, AppError> {
+pub(crate) fn tick_datetime(tick: u64) -> Result<DateTime<Utc>, AppError> {
     let seconds = i64::try_from(tick).map_err(|_| AppError::Internal)?;
     Utc.timestamp_opt(seconds, 0)
         .single()
