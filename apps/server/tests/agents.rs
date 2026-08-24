@@ -1077,6 +1077,26 @@ async fn record_exact_tool_request(
     (request_id, wire_request_commitment_hex)
 }
 
+async fn tool_trace_structural_hash(pool: &PgPool, project_id: Uuid) -> Vec<u8> {
+    sqlx::query_scalar(
+        r#"
+        SELECT digest(convert_to(concat_ws(E'\n',
+          COALESCE((SELECT string_agg(encode(root_hash,'hex'), ',' ORDER BY trace_number)
+                    FROM agent_r540_tool_trace_roots WHERE project_id=$1), ''),
+          COALESCE((SELECT string_agg(encode(event_hash,'hex'), ',' ORDER BY trace_number,ordinal)
+                    FROM agent_r540_tool_trace_inventory WHERE project_id=$1), ''),
+          COALESCE((SELECT string_agg(encode(certificate_hash,'hex'), ','
+                                      ORDER BY trace_number,version)
+                    FROM agent_r540_tool_trace_certificates WHERE project_id=$1), '')
+        ), 'UTF8'), 'sha256')
+        "#,
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .expect("hash structural tool trace")
+}
+
 async fn run_agent_completion_once(fixture: &Fixture, config: Config) {
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     worker::run(
@@ -1321,6 +1341,34 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
         StatusCode::OK,
         "{}",
         json_body(create_run).await
+    );
+    let initialized_trace = sqlx::query_as::<_, (i64, i64, i64, String, String, Value, Value)>(
+        r#"
+        SELECT root.trace_number, root.start_tick, transition.semantic_tick,
+               certificate.tool_gate_mode, certificate.outcome_gate_mode,
+               certificate.tool_event_inventory, certificate.work_outcome_inventory
+        FROM agent_r540_tool_trace_roots root
+        JOIN agent_run_transitions transition
+          ON transition.id=root.initialization_transition_id
+        JOIN agent_r540_exact_tool_trace_certificates certificate
+          ON certificate.trace_number=root.trace_number AND certificate.version=1
+        WHERE root.project_id=$1 AND root.run_id=$2
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load run-level trace root before the first tool event");
+    assert!(initialized_trace.0 > 0);
+    assert_eq!(initialized_trace.1, initialized_trace.2);
+    assert_eq!(
+        (initialized_trace.3.as_str(), initialized_trace.4.as_str()),
+        ("disabled_fail_closed", "disabled_fail_closed")
+    );
+    assert_eq!(
+        (initialized_trace.5, initialized_trace.6),
+        (json!([]), json!([]))
     );
 
     let claim = app
@@ -2177,6 +2225,135 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
     .expect("count exact append-only attempt records");
     assert_eq!(exact_counts, (1, 3, 2, 4));
 
+    // R5.40 tool-cluster projection: one server-owned run trace, four exact
+    // WorkAttempts, pending+terminal ToolEvents per attempt, and four exact
+    // WorkOutcomes. The latest certificate stores the same ordered lists that
+    // are independently rebuilt from the immutable ordinal inventory.
+    let trace_exactness = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            i64,
+            i32,
+            i32,
+            i32,
+            i32,
+            String,
+            String,
+            bool,
+            bool,
+        ),
+    >(
+        r#"
+        SELECT root.trace_number, root.start_tick, initialization.semantic_tick,
+               certificate.version,
+               jsonb_array_length(certificate.work_attempt_inventory),
+               jsonb_array_length(certificate.tool_event_inventory),
+               jsonb_array_length(certificate.work_outcome_inventory),
+               certificate.tool_gate_mode, certificate.outcome_gate_mode,
+               certificate.work_attempt_inventory = actual.work_attempt_inventory
+                 AND certificate.tool_event_inventory = actual.tool_event_inventory
+                 AND certificate.work_outcome_inventory = actual.work_outcome_inventory,
+               NOT EXISTS (
+                 SELECT 1 FROM (
+                   SELECT ordinal, row_number() OVER (ORDER BY ordinal) AS expected
+                   FROM agent_r540_tool_trace_inventory
+                   WHERE trace_number = root.trace_number
+                 ) ordered WHERE ordered.ordinal <> ordered.expected
+               )
+        FROM agent_r540_tool_trace_roots root
+        JOIN agent_run_transitions initialization
+          ON initialization.id = root.initialization_transition_id
+        JOIN agent_r540_exact_tool_trace_certificates certificate
+          ON certificate.trace_number = root.trace_number
+        JOIN agent_r540_tool_trace_inventory_state actual
+          ON actual.trace_number = root.trace_number
+        WHERE root.project_id=$1 AND root.run_id=$2
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact ordered R540 tool trace certificate");
+    assert!(trace_exactness.0 > 0);
+    assert_eq!(trace_exactness.1, trace_exactness.2);
+    assert_eq!(trace_exactness.3, 9); // initialization + 4 pending + 4 terminal prefixes
+    assert_eq!(
+        (trace_exactness.4, trace_exactness.5, trace_exactness.6),
+        (4, 8, 4)
+    );
+    assert_eq!(
+        (trace_exactness.7.as_str(), trace_exactness.8.as_str()),
+        ("enabled", "enabled")
+    );
+    assert!(
+        trace_exactness.9,
+        "certificate inventories must be list-exact"
+    );
+    assert!(
+        trace_exactness.10,
+        "trace ordinals must be gap-free and total"
+    );
+
+    let projected_surface_counts = sqlx::query_as::<_, (i64, i64, String, String)>(
+        "SELECT
+           (SELECT count(*) FROM agent_r541_tool_surface_records
+             WHERE project_id=$1 AND run_id=$2),
+           (SELECT count(*) FROM agent_r541_tool_outcome_surface_records
+             WHERE project_id=$1 AND run_id=$2),
+           tool_mode, outcome_mode
+         FROM agent_r541_tool_run_surface_gates WHERE project_id=$1 AND run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load list-exact R5.41 tool and outcome gates");
+    assert_eq!(
+        projected_surface_counts,
+        (8, 4, "enabled".into(), "enabled".into())
+    );
+
+    let timeout_shapes = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT
+           count(*) FILTER (WHERE terminal_origin='server_timeout'
+             AND dispatch_id IS NULL AND request_id IS NULL),
+           count(*) FILTER (WHERE terminal_origin='server_timeout'
+             AND dispatch_id IS NOT NULL AND request_id IS NULL),
+           count(*) FILTER (WHERE terminal_origin='server_timeout'
+             AND dispatch_id IS NOT NULL AND request_id IS NOT NULL
+             AND wire_request_commitment IS NOT NULL)
+         FROM agent_r540_tool_attempt_events
+         WHERE project_id=$1 AND run_id=$2 AND phase='terminal'",
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact server-timeout trace shapes");
+    assert_eq!(timeout_shapes, (1, 1, 1));
+
+    let terminal_transitions_are_exact = sqlx::query_scalar::<_, bool>(
+        "SELECT bool_and(
+           outcome.status = transition.state_snapshot #>>
+             ARRAY['work_items', outcome.work_item_id::text, 'status']
+           AND outcome.attempt = (transition.state_snapshot #>>
+             ARRAY['work_items', outcome.work_item_id::text, 'attempt'])::integer
+           AND transition.transition_kind IN ('work_succeeded','work_failed')
+         )
+         FROM agent_r540_work_outcome_events outcome
+         JOIN agent_run_transitions transition ON transition.id=outcome.transition_id
+         WHERE outcome.project_id=$1 AND outcome.run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify failed/succeeded snapshots are not retry-rearm transitions");
+    assert!(terminal_transitions_are_exact);
+
     // A second run proves the separate non-resource ToolOutput source path.
     let output_run = Uuid::new_v4();
     let create_output_run = app
@@ -2434,6 +2611,60 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
         "{}",
         json_body(output_terminal).await
     );
+    let output_trace = sqlx::query_as::<_, (i64, i64, i64, String, String)>(
+        "SELECT root.trace_number,
+                jsonb_array_length(certificate.tool_event_inventory)::bigint,
+                jsonb_array_length(certificate.work_outcome_inventory)::bigint,
+                certificate.tool_gate_mode, certificate.outcome_gate_mode
+         FROM agent_r540_tool_trace_roots root
+         JOIN agent_r540_exact_tool_trace_certificates certificate
+           ON certificate.trace_number=root.trace_number
+         WHERE root.project_id=$1 AND root.run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(output_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load succeeded ToolOutput producer trace");
+    assert!(output_trace.0 > 0);
+    assert_eq!(output_trace.1, 2);
+    assert_eq!(output_trace.2, 1);
+    assert_eq!(
+        (output_trace.3.as_str(), output_trace.4.as_str()),
+        ("enabled", "enabled")
+    );
+    let mut corrupted_projection = fixture.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corrupted_projection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE agent_r540_tool_attempt_events SET owner_identity_id=$3
+         WHERE project_id=$1 AND run_id=$2 AND phase='terminal'",
+    )
+    .bind(fixture.project_id)
+    .bind(output_run)
+    .bind(fixture.owner_id)
+    .execute(&mut *corrupted_projection)
+    .await
+    .unwrap();
+    let corrupted_gate = sqlx::query_as::<_, (String, Value, i64)>(
+        "SELECT gate.tool_mode, gate.tool_records,
+                (SELECT count(*) FROM agent_r541_tool_surface_records surface
+                  WHERE surface.project_id=$1 AND surface.run_id=$2)
+         FROM agent_r541_tool_run_surface_gates gate
+         WHERE gate.project_id=$1 AND gate.run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(output_run)
+    .fetch_one(&mut *corrupted_projection)
+    .await
+    .unwrap();
+    assert_eq!(
+        corrupted_gate,
+        ("disabled_fail_closed".into(), json!([]), 0)
+    );
+    corrupted_projection.rollback().await.unwrap();
 
     let queue_tool_output = |source_call: Uuid| {
         json!({
@@ -2495,6 +2726,390 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
         .await
         .unwrap();
     assert_eq!(wrong_call_source.status(), StatusCode::FORBIDDEN);
+
+    sqlx::raw_sql(
+        "DO $role$ BEGIN
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='sprout_0034_trace_app') THEN
+             CREATE ROLE sprout_0034_trace_app NOSUPERUSER NOBYPASSRLS NOLOGIN;
+           END IF;
+         END $role$;
+         GRANT sprout_0034_trace_app TO CURRENT_USER;
+         GRANT USAGE ON SCHEMA public, sprout_private TO sprout_0034_trace_app;
+         GRANT SELECT, INSERT, UPDATE, DELETE ON
+           agent_r540_tool_trace_roots, agent_r540_work_attempt_events,
+           agent_r540_tool_attempt_events, agent_r540_work_outcome_events,
+           agent_r540_tool_trace_inventory, agent_r540_tool_trace_certificates
+         TO sprout_0034_trace_app",
+    )
+    .execute(&fixture.pool)
+    .await
+    .expect("prepare non-bypass trace application role");
+    let before_structural_rows = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_r540_tool_trace_inventory WHERE project_id=$1",
+    )
+    .bind(fixture.project_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    let before_structural_hash =
+        tool_trace_structural_hash(&fixture.pool, fixture.project_id).await;
+    let mut untrusted = fixture.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE sprout_0034_trace_app")
+        .execute(&mut *untrusted)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT set_config('app.identity_id',$1,true), set_config('app.project_id',$2,true)",
+    )
+    .bind(provisioned.principal_identity_id.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *untrusted)
+    .await
+    .unwrap();
+    let direct_insert = sqlx::query(
+        "INSERT INTO agent_r540_tool_trace_roots
+           (project_id,run_id,goal_id,start_tick,initialization_transition_id,root_hash)
+         VALUES ($1,$2,$3,0,$4,digest('forged','sha256'))",
+    )
+    .bind(fixture.project_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&mut *untrusted)
+    .await;
+    assert!(direct_insert.is_err());
+    untrusted.rollback().await.unwrap();
+    assert_eq!(
+        tool_trace_structural_hash(&fixture.pool, fixture.project_id).await,
+        before_structural_hash
+    );
+
+    let mut untrusted = fixture.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE sprout_0034_trace_app")
+        .execute(&mut *untrusted)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT set_config('app.identity_id',$1,true), set_config('app.project_id',$2,true)",
+    )
+    .bind(provisioned.principal_identity_id.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *untrusted)
+    .await
+    .unwrap();
+    let updated = sqlx::query(
+        "UPDATE agent_r540_tool_trace_roots SET root_hash=root_hash
+         WHERE project_id=$1 AND run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(output_run)
+    .execute(&mut *untrusted)
+    .await;
+    assert!(updated.is_err() || updated.unwrap().rows_affected() == 0);
+    untrusted.rollback().await.unwrap();
+    assert_eq!(
+        tool_trace_structural_hash(&fixture.pool, fixture.project_id).await,
+        before_structural_hash
+    );
+
+    let mut untrusted = fixture.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE sprout_0034_trace_app")
+        .execute(&mut *untrusted)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT set_config('app.identity_id',$1,true), set_config('app.project_id',$2,true)",
+    )
+    .bind(provisioned.principal_identity_id.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *untrusted)
+    .await
+    .unwrap();
+    let deleted = sqlx::query(
+        "DELETE FROM agent_r540_tool_trace_inventory
+         WHERE project_id=$1 AND trace_number=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(output_trace.0)
+    .execute(&mut *untrusted)
+    .await;
+    assert!(deleted.is_err() || deleted.unwrap().rows_affected() == 0);
+    let private_projector =
+        sqlx::query("SELECT sprout_private.project_agent_tool_attempt($1,$2,$3,$4)")
+            .bind(fixture.project_id)
+            .bind(output_run)
+            .bind(output_call_id)
+            .bind(Uuid::new_v4())
+            .execute(&mut *untrusted)
+            .await;
+    assert!(private_projector.is_err());
+    untrusted.rollback().await.unwrap();
+    assert_eq!(
+        tool_trace_structural_hash(&fixture.pool, fixture.project_id).await,
+        before_structural_hash
+    );
+
+    let mut forged_context = fixture.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE sprout_0034_trace_app")
+        .execute(&mut *forged_context)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT set_config('app.identity_id',$1,true), set_config('app.project_id',$2,true)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(Uuid::new_v4().to_string())
+    .execute(&mut *forged_context)
+    .await
+    .unwrap();
+    let forged_guc_insert = sqlx::query(
+        "INSERT INTO agent_r540_tool_trace_roots
+           (project_id,run_id,goal_id,start_tick,initialization_transition_id,root_hash)
+         VALUES ($1,$2,$3,0,$4,digest('forged-guc','sha256'))",
+    )
+    .bind(fixture.project_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&mut *forged_context)
+    .await;
+    assert!(forged_guc_insert.is_err());
+    forged_context.rollback().await.unwrap();
+    assert_eq!(
+        tool_trace_structural_hash(&fixture.pool, fixture.project_id).await,
+        before_structural_hash
+    );
+
+    let mut cross_project_context = fixture.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE sprout_0034_trace_app")
+        .execute(&mut *cross_project_context)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT set_config('app.identity_id',$1,true), set_config('app.project_id',$2,true)",
+    )
+    .bind(provisioned.principal_identity_id.to_string())
+    .bind(fixture.project_id.to_string())
+    .execute(&mut *cross_project_context)
+    .await
+    .unwrap();
+    let cross_project_projector =
+        sqlx::query("SELECT sprout_private.project_agent_tool_attempt($1,$2,$3,$4)")
+            .bind(Uuid::new_v4())
+            .bind(output_run)
+            .bind(output_call_id)
+            .bind(Uuid::new_v4())
+            .execute(&mut *cross_project_context)
+            .await;
+    assert!(cross_project_projector.is_err());
+    cross_project_context.rollback().await.unwrap();
+    assert_eq!(
+        tool_trace_structural_hash(&fixture.pool, fixture.project_id).await,
+        before_structural_hash
+    );
+    let after_structural_rows = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_r540_tool_trace_inventory WHERE project_id=$1",
+    )
+    .bind(fixture.project_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(after_structural_rows, before_structural_rows);
+    assert_eq!(
+        tool_trace_structural_hash(&fixture.pool, fixture.project_id).await,
+        before_structural_hash
+    );
+
+    let retained_tool_trace_before = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT jsonb_build_object(
+          'root', (SELECT COALESCE(jsonb_agg(to_jsonb(root) - 'recorded_at'
+                    ORDER BY root.trace_number), '[]'::jsonb)
+                   FROM agent_r540_tool_trace_roots root
+                   WHERE root.project_id=$1 AND root.run_id=$2),
+          'work_attempts', (SELECT COALESCE(jsonb_agg(to_jsonb(event) - 'recorded_at'
+                    ORDER BY event.id), '[]'::jsonb)
+                   FROM agent_r540_work_attempt_events event
+                   WHERE event.project_id=$1 AND event.run_id=$2),
+          'tool_events', (SELECT COALESCE(jsonb_agg(to_jsonb(event) - 'recorded_at'
+                    ORDER BY event.id), '[]'::jsonb)
+                   FROM agent_r540_tool_attempt_events event
+                   WHERE event.project_id=$1 AND event.run_id=$2),
+          'work_outcomes', (SELECT COALESCE(jsonb_agg(to_jsonb(event) - 'recorded_at'
+                    ORDER BY event.id), '[]'::jsonb)
+                   FROM agent_r540_work_outcome_events event
+                   WHERE event.project_id=$1 AND event.run_id=$2),
+          'inventory', (SELECT COALESCE(jsonb_agg(to_jsonb(item) - 'recorded_at'
+                    ORDER BY item.ordinal), '[]'::jsonb)
+                   FROM agent_r540_tool_trace_inventory item
+                   JOIN agent_r540_tool_trace_roots root
+                     ON root.trace_number=item.trace_number
+                   WHERE root.project_id=$1 AND root.run_id=$2),
+          'certificates', (SELECT COALESCE(jsonb_agg(to_jsonb(certificate) - 'recorded_at'
+                    ORDER BY certificate.version), '[]'::jsonb)
+                   FROM agent_r540_tool_trace_certificates certificate
+                   JOIN agent_r540_tool_trace_roots root
+                     ON root.trace_number=certificate.trace_number
+                   WHERE root.project_id=$1 AND root.run_id=$2)
+        )::text
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(output_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("snapshot complete structural tool trace before retention");
+    let payloads_before = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        "SELECT
+           (SELECT count(*) FROM agent_tool_calls
+             WHERE project_id=$1 AND id=$2 AND encrypted_input IS NOT NULL),
+           (SELECT count(*) FROM agent_tool_attempt_observations
+             WHERE project_id=$1 AND call_id=$2 AND encrypted_output IS NOT NULL),
+           (SELECT count(*) FROM agent_tool_output_key_envelopes
+             WHERE project_id=$1 AND call_id=$2),
+           (SELECT count(*) FROM agent_r541_tool_surface_records
+             WHERE project_id=$1 AND run_id=$3),
+           (SELECT count(*) FROM agent_r541_tool_outcome_surface_records
+             WHERE project_id=$1 AND run_id=$3)",
+    )
+    .bind(fixture.project_id)
+    .bind(output_call_id)
+    .bind(output_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load payload and surface counts before retention");
+    assert_eq!(payloads_before, (1, 1, 1, 2, 1));
+
+    let retention_subject_id = Uuid::new_v4();
+    let retention_lease_token = Uuid::new_v4();
+    let retention_now = Utc::now();
+    let deleted_at = retention_now - ChronoDuration::days(20);
+    let mut retention = fixture.pool.begin().await.expect("begin tool retention");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *retention)
+        .await
+        .expect("disable RLS for retention fixture");
+    sqlx::query("UPDATE resource_nodes SET deleted_at=$3 WHERE project_id=$1 AND id=$2")
+        .bind(fixture.project_id)
+        .bind(fixture.profile_resource_id)
+        .bind(deleted_at)
+        .execute(&mut *retention)
+        .await
+        .expect("soft-delete governed-agent profile for tool retention");
+    sqlx::query(
+        r#"
+        INSERT INTO retention_subjects (
+          id, project_id, source_kind, source_id, resource_node_id,
+          owner_identity_id, retention_class, source_at, warning_at, purge_at,
+          state, lease_owner, lease_token, leased_until
+        ) VALUES ($1,$2,'resource_deleted',$3,$3,$4,'deleted_or_obsolete',
+                  $5,$6,$7,'purging',$8,$9,$10)
+        "#,
+    )
+    .bind(retention_subject_id)
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(fixture.owner_id)
+    .bind(deleted_at)
+    .bind(deleted_at + ChronoDuration::days(1))
+    .bind(deleted_at + ChronoDuration::days(15))
+    .bind(Uuid::new_v4())
+    .bind(retention_lease_token)
+    .bind(retention_now + ChronoDuration::hours(1))
+    .execute(&mut *retention)
+    .await
+    .expect("insert active tool retention lease");
+    retention
+        .commit()
+        .await
+        .expect("commit tool retention setup");
+    let purged =
+        sqlx::query_scalar::<_, bool>("SELECT sprout_private.purge_retention_subject($1,$2,$3)")
+            .bind(retention_subject_id)
+            .bind(retention_lease_token)
+            .bind(retention_now)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("purge governed external-tool payloads");
+    assert!(purged);
+
+    let retained_tool_trace_after = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT jsonb_build_object(
+          'root', (SELECT COALESCE(jsonb_agg(to_jsonb(root) - 'recorded_at'
+                    ORDER BY root.trace_number), '[]'::jsonb)
+                   FROM agent_r540_tool_trace_roots root
+                   WHERE root.project_id=$1 AND root.run_id=$2),
+          'work_attempts', (SELECT COALESCE(jsonb_agg(to_jsonb(event) - 'recorded_at'
+                    ORDER BY event.id), '[]'::jsonb)
+                   FROM agent_r540_work_attempt_events event
+                   WHERE event.project_id=$1 AND event.run_id=$2),
+          'tool_events', (SELECT COALESCE(jsonb_agg(to_jsonb(event) - 'recorded_at'
+                    ORDER BY event.id), '[]'::jsonb)
+                   FROM agent_r540_tool_attempt_events event
+                   WHERE event.project_id=$1 AND event.run_id=$2),
+          'work_outcomes', (SELECT COALESCE(jsonb_agg(to_jsonb(event) - 'recorded_at'
+                    ORDER BY event.id), '[]'::jsonb)
+                   FROM agent_r540_work_outcome_events event
+                   WHERE event.project_id=$1 AND event.run_id=$2),
+          'inventory', (SELECT COALESCE(jsonb_agg(to_jsonb(item) - 'recorded_at'
+                    ORDER BY item.ordinal), '[]'::jsonb)
+                   FROM agent_r540_tool_trace_inventory item
+                   JOIN agent_r540_tool_trace_roots root
+                     ON root.trace_number=item.trace_number
+                   WHERE root.project_id=$1 AND root.run_id=$2),
+          'certificates', (SELECT COALESCE(jsonb_agg(to_jsonb(certificate) - 'recorded_at'
+                    ORDER BY certificate.version), '[]'::jsonb)
+                   FROM agent_r540_tool_trace_certificates certificate
+                   JOIN agent_r540_tool_trace_roots root
+                     ON root.trace_number=certificate.trace_number
+                   WHERE root.project_id=$1 AND root.run_id=$2)
+        )::text
+        "#,
+    )
+    .bind(fixture.project_id)
+    .bind(output_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("snapshot complete structural tool trace after retention");
+    assert_eq!(retained_tool_trace_after, retained_tool_trace_before);
+    let payloads_after = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        "SELECT
+           (SELECT count(*) FROM agent_tool_calls
+             WHERE project_id=$1 AND id=$2 AND encrypted_input IS NOT NULL),
+           (SELECT count(*) FROM agent_tool_attempt_observations
+             WHERE project_id=$1 AND call_id=$2 AND encrypted_output IS NOT NULL),
+           (SELECT count(*) FROM agent_tool_output_key_envelopes
+             WHERE project_id=$1 AND call_id=$2),
+           (SELECT count(*) FROM agent_r541_tool_surface_records
+             WHERE project_id=$1 AND run_id=$3),
+           (SELECT count(*) FROM agent_r541_tool_outcome_surface_records
+             WHERE project_id=$1 AND run_id=$3)",
+    )
+    .bind(fixture.project_id)
+    .bind(output_call_id)
+    .bind(output_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load payload and surface counts after retention");
+    assert_eq!(payloads_after, (0, 0, 0, 0, 0));
+
+    let unavailable_after_purge = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agents/{}/invocations",
+                    fixture.project_id, provisioned.agent_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(queue_tool_output(output_call_id).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unavailable_after_purge.status(), StatusCode::NOT_FOUND);
 }
 
 async fn create_active_compiled_responsibility(
@@ -7987,6 +8602,23 @@ async fn edge_runner_is_a_revocable_device_and_cannot_bypass_governance() {
             .await
             .expect("purge agent resource through retention pipeline");
     assert!(purged);
+    let retained_trace_structure = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT
+           (SELECT count(*) FROM agent_r540_tool_trace_roots
+             WHERE project_id=$1 AND run_id=$2),
+           (SELECT count(*) FROM agent_r540_tool_trace_certificates certificate
+             JOIN agent_r540_tool_trace_roots root
+               ON root.trace_number=certificate.trace_number
+             WHERE root.project_id=$1 AND root.run_id=$2),
+           (SELECT count(*) FROM agent_r541_tool_run_surface_gates
+             WHERE project_id=$1 AND run_id=$2)",
+    )
+    .bind(fixture.project_id)
+    .bind(collaborative_run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load retained structural trace after operational run purge");
+    assert_eq!(retained_trace_structure, (1, 1, 0));
     let remaining_agent_owned_records = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT sum(row_count)::bigint FROM (

@@ -706,26 +706,31 @@ pub async fn invoke(
         claim_expires_at: claim.expires_at,
     };
     validate_external_tool_authorization(&authorization).map_err(|_| AppError::Forbidden)?;
-    let request_hash = digest(&json!({
-        "call": call,
-        "run_id": run_id,
-        "goal_id": Uuid::from(work.goal),
-        "work_item_id": Uuid::from(work.id),
-        "work_claim_id": claim_id,
-        "work_spec_id": spec.id,
-        "encrypted_input_payload_commitment": hex::encode(encrypted_input_payload_commitment),
-        "structured_input_commitment": hex::encode(structured_input_commitment),
-        "canonical_input_commitment": hex::encode(canonical_input_commitment),
-        "runtime_capability_witness_id": request.runtime_capability_witness_id,
-        "security_policy": policy,
-        "run_tool_ceiling": run_ceiling,
-        "work_tool_ceiling": work_ceiling,
-        "required_effects": required_effects,
-        "output_readable_by": &output_readable_by_ids,
-        "idempotency_key": request.idempotency_key,
-    }))?;
+    let request_hash_for = |exact_call: &ExternalToolCallRecord| {
+        digest(&json!({
+            "call": exact_call,
+            "run_id": run_id,
+            "goal_id": Uuid::from(work.goal),
+            "work_item_id": Uuid::from(work.id),
+            "work_claim_id": claim_id,
+            "work_spec_id": spec.id,
+            "encrypted_input_payload_commitment": hex::encode(encrypted_input_payload_commitment),
+            "structured_input_commitment": hex::encode(structured_input_commitment),
+            "canonical_input_commitment": hex::encode(canonical_input_commitment),
+            "runtime_capability_witness_id": request.runtime_capability_witness_id,
+            "security_policy": policy,
+            "run_tool_ceiling": run_ceiling,
+            "work_tool_ceiling": work_ceiling,
+            "required_effects": required_effects,
+            "output_readable_by": &output_readable_by_ids,
+            "idempotency_key": request.idempotency_key,
+        }))
+    };
+    let request_hash = request_hash_for(&call)?;
     if let Some(existing) = sqlx::query(
-        "SELECT id, request_hash, current_status, current_attempt FROM agent_tool_calls
+        "SELECT id, request_hash, current_status, current_attempt,
+                requested_tick, tool_deadline_tick
+         FROM agent_tool_calls
          WHERE project_id = $1 AND owner_identity_id = $2 AND idempotency_key = $3
          FOR UPDATE",
     )
@@ -735,7 +740,13 @@ pub async fn invoke(
     .fetch_optional(&mut *transaction)
     .await?
     {
-        if existing.try_get::<Vec<u8>, _>("request_hash")? != request_hash {
+        let mut replay_call = call.clone();
+        replay_call.requested_at = u64::try_from(existing.try_get::<i64, _>("requested_tick")?)
+            .map_err(|_| AppError::Internal)?;
+        replay_call.tool_deadline_at =
+            u64::try_from(existing.try_get::<i64, _>("tool_deadline_tick")?)
+                .map_err(|_| AppError::Internal)?;
+        if existing.try_get::<Vec<u8>, _>("request_hash")? != request_hash_for(&replay_call)? {
             return Err(AppError::Conflict);
         }
         let response = ToolCallResponse {
@@ -830,6 +841,19 @@ pub async fn invoke(
     )?)
     .execute(&mut *transaction)
     .await?;
+    let transition = persist_transition(
+        &mut transaction,
+        project_id,
+        Some(actor),
+        &locked,
+        &facts,
+        TransitionMetadata {
+            kind: "tool_attempt_opened",
+            tick,
+            observation: Some(("tool_attempt", request.id)),
+        },
+    )
+    .await?;
     insert_audit(
         &mut transaction,
         AuditCoordinates::new(
@@ -852,6 +876,14 @@ pub async fn invoke(
         request.timeout_seconds,
         None,
         request.idempotency_key,
+    )
+    .await?;
+    project_r540_tool_attempt(
+        &mut transaction,
+        project_id,
+        run_id,
+        request.id,
+        transition.id,
     )
     .await?;
     transaction.commit().await?;
@@ -1521,6 +1553,16 @@ pub async fn terminal_exact(
         request.idempotency_key,
     )
     .await?;
+    project_r540_signed_tool_terminal(
+        &mut transaction,
+        project_id,
+        run_id,
+        call_id,
+        call.attempt,
+        request.observation_id,
+        transition.id,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(Json(ToolCallResponse {
         id: call_id,
@@ -1724,6 +1766,16 @@ pub(crate) async fn materialize_server_timeouts(pool: &sqlx::PgPool) -> Result<u
             call.timeout_seconds,
             Some(observation_id),
             idempotency_key,
+        )
+        .await?;
+        project_r540_server_timeout(
+            &mut transaction,
+            project_id,
+            run_id,
+            call_id,
+            call.attempt,
+            observation_id,
+            transition.id,
         )
         .await?;
         transaction.commit().await?;
@@ -1948,6 +2000,19 @@ pub async fn retry(
     call.work_attempt = next_attempt;
     call.attempt = next_attempt;
     call.runtime_capability_witness_id = request.runtime_capability_witness_id;
+    let transition = persist_transition(
+        &mut transaction,
+        project_id,
+        Some(actor),
+        &locked,
+        &facts,
+        TransitionMetadata {
+            kind: "tool_attempt_opened",
+            tick: requested_tick,
+            observation: Some(("tool_attempt", call_id)),
+        },
+    )
+    .await?;
     insert_audit_with_hash(
         &mut transaction,
         call.coordinates(project_id),
@@ -1961,6 +2026,7 @@ pub async fn retry(
         replay_hash,
     )
     .await?;
+    project_r540_tool_attempt(&mut transaction, project_id, run_id, call_id, transition.id).await?;
     transaction.commit().await?;
     Ok(Json(ToolCallResponse {
         id: call_id,
@@ -2227,6 +2293,69 @@ async fn persist_tool_work_outcome(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+async fn project_r540_tool_attempt(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    run_id: Uuid,
+    call_id: Uuid,
+    transition_id: Uuid,
+) -> Result<Option<i64>, AppError> {
+    sqlx::query_scalar("SELECT sprout_private.project_agent_tool_attempt($1,$2,$3,$4)")
+        .bind(project_id)
+        .bind(run_id)
+        .bind(call_id)
+        .bind(transition_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(AppError::from)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn project_r540_signed_tool_terminal(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    run_id: Uuid,
+    call_id: Uuid,
+    attempt: u16,
+    observation_id: Uuid,
+    transition_id: Uuid,
+) -> Result<Option<i64>, AppError> {
+    sqlx::query_scalar(
+        "SELECT sprout_private.project_agent_tool_signed_terminal($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(project_id)
+    .bind(run_id)
+    .bind(call_id)
+    .bind(i32::from(attempt))
+    .bind(observation_id)
+    .bind(transition_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(AppError::from)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn project_r540_server_timeout(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    run_id: Uuid,
+    call_id: Uuid,
+    attempt: u16,
+    observation_id: Uuid,
+    transition_id: Uuid,
+) -> Result<Option<i64>, AppError> {
+    sqlx::query_scalar("SELECT sprout_private.project_agent_tool_server_timeout($1,$2,$3,$4,$5,$6)")
+        .bind(project_id)
+        .bind(run_id)
+        .bind(call_id)
+        .bind(i32::from(attempt))
+        .bind(observation_id)
+        .bind(transition_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(AppError::from)
 }
 
 #[derive(Clone)]

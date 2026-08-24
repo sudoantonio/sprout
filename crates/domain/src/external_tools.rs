@@ -26,6 +26,158 @@ pub const MAIL_SEND_TOOL: &str = "mail.send";
 pub const TELEGRAM_RECEIVE_TOOL: &str = "telegram.receive";
 pub const TELEGRAM_SEND_TOOL: &str = "telegram.send";
 
+/// Concrete scope of the additive 0034 projection. Lean R5.40 uses one trace
+/// per run; retries are distinct events in this same positive trace.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct ExternalToolTraceId(pub u64);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSurfaceMode {
+    Enabled,
+    DisabledFailClosed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTraceEventKind {
+    WorkAttempt,
+    ToolEvent,
+    WorkOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderedToolTraceBinding {
+    pub ordinal: u64,
+    pub event_id: uuid::Uuid,
+    pub event_hash: [u8; 32],
+    pub kind: ToolTraceEventKind,
+}
+
+/// List-exact prefix certificate used by the DB writer. The three lists are
+/// filtered, order-preserving projections of one immutable total inventory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactToolTraceInventoryCertificate {
+    pub trace_id: ExternalToolTraceId,
+    pub version: u32,
+    pub start_tick: u64,
+    pub end_tick: u64,
+    pub inventory: Vec<OrderedToolTraceBinding>,
+    pub certified_work_attempts: Vec<OrderedToolTraceBinding>,
+    pub certified_work_outcomes: Vec<OrderedToolTraceBinding>,
+    pub certified_tool_events: Vec<OrderedToolTraceBinding>,
+    pub outcome_gate: TraceSurfaceMode,
+    pub tool_gate: TraceSurfaceMode,
+    pub previous_certificate_hash: Option<[u8; 32]>,
+    pub certificate_hash: [u8; 32],
+}
+
+/// Principal separation for consuming `InformationSource.toolOutput`.
+///
+/// The producer/effect actor is fixed by `toolContextSourceOwned`; the reader
+/// is authorized independently by the trusted, principal-level tool audience.
+/// Device-envelope and runner checks are deliberately separate from both.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolOutputAccessBinding {
+    pub call_owner: UserId,
+    pub effect_actor: UserId,
+    pub reader_principal: UserId,
+    pub producer_work: WorkItemId,
+    pub consumer_work: WorkItemId,
+    pub trusted_output_readable_by: Vec<UserId>,
+    pub exact_reader_device_envelope: bool,
+    pub exact_runner_binding: bool,
+}
+
+impl ToolOutputAccessBinding {
+    pub fn validate(&self) -> Result<(), ExternalToolValidationError> {
+        if self.call_owner != self.effect_actor
+            || self
+                .trusted_output_readable_by
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || !self
+                .trusted_output_readable_by
+                .contains(&self.reader_principal)
+            || !self.exact_reader_device_envelope
+            || !self.exact_runner_binding
+        {
+            return Err(ExternalToolValidationError::OutputAudienceMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl ExactToolTraceInventoryCertificate {
+    pub fn validate(&self) -> Result<(), ExternalToolValidationError> {
+        if self.trace_id.0 == 0
+            || self.version == 0
+            || self.start_tick > self.end_tick
+            || (self.version == 1) != self.previous_certificate_hash.is_none()
+        {
+            return Err(ExternalToolValidationError::InvalidTraceCertificate);
+        }
+        for (index, binding) in self.inventory.iter().enumerate() {
+            if binding.ordinal != u64::try_from(index).unwrap_or(u64::MAX) + 1 {
+                return Err(ExternalToolValidationError::InvalidTraceCertificate);
+            }
+        }
+        let project = |kind| {
+            self.inventory
+                .iter()
+                .filter(|binding| binding.kind == kind)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if self.certified_work_attempts != project(ToolTraceEventKind::WorkAttempt)
+            || self.certified_work_outcomes != project(ToolTraceEventKind::WorkOutcome)
+            || self.certified_tool_events != project(ToolTraceEventKind::ToolEvent)
+        {
+            return Err(ExternalToolValidationError::InvalidTraceCertificate);
+        }
+        let gate_exact = |mode, records: &[OrderedToolTraceBinding]| match mode {
+            TraceSurfaceMode::Enabled => !records.is_empty(),
+            TraceSurfaceMode::DisabledFailClosed => records.is_empty(),
+        };
+        if !gate_exact(self.tool_gate, &self.certified_tool_events)
+            || !gate_exact(self.outcome_gate, &self.certified_work_outcomes)
+        {
+            return Err(ExternalToolValidationError::InvalidTraceCertificate);
+        }
+        Ok(())
+    }
+
+    pub fn validate_exact_successor(
+        &self,
+        previous: &Self,
+    ) -> Result<(), ExternalToolValidationError> {
+        self.validate()?;
+        previous.validate()?;
+        if self.trace_id != previous.trace_id
+            || self.version != previous.version.saturating_add(1)
+            || self.start_tick != previous.start_tick
+            || self.end_tick < previous.end_tick
+            || self.previous_certificate_hash != Some(previous.certificate_hash)
+            || self.inventory.len() <= previous.inventory.len()
+            || !self.inventory.starts_with(&previous.inventory)
+            || !self
+                .certified_work_attempts
+                .starts_with(&previous.certified_work_attempts)
+            || !self
+                .certified_work_outcomes
+                .starts_with(&previous.certified_work_outcomes)
+            || !self
+                .certified_tool_events
+                .starts_with(&previous.certified_tool_events)
+        {
+            return Err(ExternalToolValidationError::InvalidTraceCertificate);
+        }
+        Ok(())
+    }
+}
+
 /// Concrete, persisted evidence for the first materialization of a WorkItem.
 ///
 /// 0033 can prove run initialization and contract-generated continuation
@@ -703,6 +855,8 @@ pub enum ExternalToolValidationError {
     CyclicWorkAuthorityOrigin,
     #[error("human task delegation is not concretely certified in checkpoint 0033")]
     HumanDelegationUnsupported,
+    #[error("R540 tool-cluster inventory/certificate is not list-exact")]
+    InvalidTraceCertificate,
 }
 
 #[cfg(test)]
@@ -711,6 +865,241 @@ mod tests {
     use crate::{FailurePlan, WorkStatus};
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn r540_tool_cluster_certificate_is_ordered_list_exact_and_nonvacuous() {
+        let work = OrderedToolTraceBinding {
+            ordinal: 1,
+            event_id: Uuid::now_v7(),
+            event_hash: [1; 32],
+            kind: ToolTraceEventKind::WorkAttempt,
+        };
+        let tool = OrderedToolTraceBinding {
+            ordinal: 2,
+            event_id: Uuid::now_v7(),
+            event_hash: [2; 32],
+            kind: ToolTraceEventKind::ToolEvent,
+        };
+        let outcome = OrderedToolTraceBinding {
+            ordinal: 3,
+            event_id: Uuid::now_v7(),
+            event_hash: [3; 32],
+            kind: ToolTraceEventKind::WorkOutcome,
+        };
+        let exact = ExactToolTraceInventoryCertificate {
+            trace_id: ExternalToolTraceId(1),
+            version: 2,
+            start_tick: 10,
+            end_tick: 12,
+            inventory: vec![work.clone(), tool.clone(), outcome.clone()],
+            certified_work_attempts: vec![work.clone()],
+            certified_work_outcomes: vec![outcome.clone()],
+            certified_tool_events: vec![tool.clone()],
+            outcome_gate: TraceSurfaceMode::Enabled,
+            tool_gate: TraceSurfaceMode::Enabled,
+            previous_certificate_hash: Some([6; 32]),
+            certificate_hash: [7; 32],
+        };
+        assert_eq!(exact.validate(), Ok(()));
+
+        let mut reordered = exact.clone();
+        reordered.certified_tool_events = vec![outcome];
+        assert_eq!(
+            reordered.validate(),
+            Err(ExternalToolValidationError::InvalidTraceCertificate)
+        );
+
+        let mut vacuous = exact;
+        vacuous.certified_tool_events.clear();
+        assert_eq!(
+            vacuous.validate(),
+            Err(ExternalToolValidationError::InvalidTraceCertificate)
+        );
+    }
+
+    #[test]
+    fn r540_tool_cluster_certificate_rejects_missing_duplicate_or_gapped_ordinals() {
+        let binding = OrderedToolTraceBinding {
+            ordinal: 2,
+            event_id: Uuid::now_v7(),
+            event_hash: [7; 32],
+            kind: ToolTraceEventKind::ToolEvent,
+        };
+        let invalid = ExactToolTraceInventoryCertificate {
+            trace_id: ExternalToolTraceId(9),
+            version: 1,
+            start_tick: 1,
+            end_tick: 1,
+            inventory: vec![binding.clone()],
+            certified_work_attempts: vec![],
+            certified_work_outcomes: vec![],
+            certified_tool_events: vec![binding],
+            outcome_gate: TraceSurfaceMode::DisabledFailClosed,
+            tool_gate: TraceSurfaceMode::Enabled,
+            previous_certificate_hash: None,
+            certificate_hash: [8; 32],
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(ExternalToolValidationError::InvalidTraceCertificate)
+        );
+    }
+
+    #[test]
+    fn r540_tool_cluster_hash_chain_requires_a_strict_monotone_prefix() {
+        let work = OrderedToolTraceBinding {
+            ordinal: 1,
+            event_id: uuid::Uuid::from_u128(1),
+            event_hash: [1; 32],
+            kind: ToolTraceEventKind::WorkAttempt,
+        };
+        let pending = OrderedToolTraceBinding {
+            ordinal: 2,
+            event_id: uuid::Uuid::from_u128(2),
+            event_hash: [2; 32],
+            kind: ToolTraceEventKind::ToolEvent,
+        };
+        let terminal = OrderedToolTraceBinding {
+            ordinal: 3,
+            event_id: uuid::Uuid::from_u128(3),
+            event_hash: [3; 32],
+            kind: ToolTraceEventKind::ToolEvent,
+        };
+        let first = ExactToolTraceInventoryCertificate {
+            trace_id: ExternalToolTraceId(1),
+            version: 1,
+            start_tick: 10,
+            end_tick: 12,
+            inventory: vec![work.clone(), pending.clone()],
+            certified_work_attempts: vec![work.clone()],
+            certified_work_outcomes: vec![],
+            certified_tool_events: vec![pending.clone()],
+            outcome_gate: TraceSurfaceMode::DisabledFailClosed,
+            tool_gate: TraceSurfaceMode::Enabled,
+            previous_certificate_hash: None,
+            certificate_hash: [4; 32],
+        };
+        let second = ExactToolTraceInventoryCertificate {
+            trace_id: first.trace_id,
+            version: 2,
+            start_tick: first.start_tick,
+            end_tick: 15,
+            inventory: vec![work.clone(), pending.clone(), terminal.clone()],
+            certified_work_attempts: vec![work],
+            certified_work_outcomes: vec![],
+            certified_tool_events: vec![pending, terminal],
+            outcome_gate: TraceSurfaceMode::DisabledFailClosed,
+            tool_gate: TraceSurfaceMode::Enabled,
+            previous_certificate_hash: Some(first.certificate_hash),
+            certificate_hash: [5; 32],
+        };
+        assert_eq!(second.validate_exact_successor(&first), Ok(()));
+
+        let mut wrong_link = second.clone();
+        wrong_link.previous_certificate_hash = Some([9; 32]);
+        assert_eq!(
+            wrong_link.validate_exact_successor(&first),
+            Err(ExternalToolValidationError::InvalidTraceCertificate)
+        );
+
+        let mut rewritten_prefix = second;
+        rewritten_prefix.inventory[0].event_hash = [6; 32];
+        assert_eq!(
+            rewritten_prefix.validate_exact_successor(&first),
+            Err(ExternalToolValidationError::InvalidTraceCertificate)
+        );
+    }
+
+    fn exact_tool_output_access() -> ToolOutputAccessBinding {
+        let owner = UserId::new();
+        ToolOutputAccessBinding {
+            call_owner: owner,
+            effect_actor: owner,
+            reader_principal: owner,
+            producer_work: WorkItemId::new(),
+            consumer_work: WorkItemId::new(),
+            trusted_output_readable_by: vec![owner],
+            exact_reader_device_envelope: true,
+            exact_runner_binding: true,
+        }
+    }
+
+    #[test]
+    fn tool_output_exact_effect_actor_and_authorized_reader_are_accepted() {
+        assert_eq!(exact_tool_output_access().validate(), Ok(()));
+    }
+
+    #[test]
+    fn tool_output_wrong_effect_actor_is_rejected_even_for_authorized_reader() {
+        let mut wrong_actor = exact_tool_output_access();
+        wrong_actor.effect_actor = UserId::new();
+        assert_eq!(
+            wrong_actor.validate(),
+            Err(ExternalToolValidationError::OutputAudienceMismatch)
+        );
+    }
+
+    #[test]
+    fn tool_output_reader_outside_trusted_audience_is_rejected() {
+        let mut wrong_reader = exact_tool_output_access();
+        wrong_reader.reader_principal = UserId::new();
+        assert_eq!(
+            wrong_reader.validate(),
+            Err(ExternalToolValidationError::OutputAudienceMismatch)
+        );
+    }
+
+    #[test]
+    fn tool_output_wrong_runner_or_reader_envelope_is_rejected() {
+        let mut wrong_runner = exact_tool_output_access();
+        wrong_runner.exact_runner_binding = false;
+        assert_eq!(
+            wrong_runner.validate(),
+            Err(ExternalToolValidationError::OutputAudienceMismatch)
+        );
+        let mut wrong_envelope = exact_tool_output_access();
+        wrong_envelope.exact_reader_device_envelope = false;
+        assert_eq!(
+            wrong_envelope.validate(),
+            Err(ExternalToolValidationError::OutputAudienceMismatch)
+        );
+    }
+
+    #[test]
+    fn tool_output_old_producer_work_is_valid_for_distinct_consumer_work() {
+        let exact = exact_tool_output_access();
+        assert_ne!(exact.producer_work, exact.consumer_work);
+        assert_eq!(exact.validate(), Ok(()));
+    }
+
+    #[test]
+    fn tool_output_cross_owner_substitution_is_rejected() {
+        let mut substitution = exact_tool_output_access();
+        substitution.call_owner = UserId::new();
+        assert_eq!(
+            substitution.validate(),
+            Err(ExternalToolValidationError::OutputAudienceMismatch)
+        );
+    }
+
+    #[test]
+    fn tool_output_rejects_duplicate_or_unsorted_trusted_audience() {
+        let owner = UserId::new();
+        let duplicate = ToolOutputAccessBinding {
+            call_owner: owner,
+            effect_actor: owner,
+            reader_principal: owner,
+            producer_work: WorkItemId::new(),
+            consumer_work: WorkItemId::new(),
+            trusted_output_readable_by: vec![owner, owner],
+            exact_reader_device_envelope: true,
+            exact_runner_binding: true,
+        };
+        assert_eq!(
+            duplicate.validate(),
+            Err(ExternalToolValidationError::OutputAudienceMismatch)
+        );
+    }
 
     fn call() -> ExternalToolCallRecord {
         ExternalToolCallRecord {

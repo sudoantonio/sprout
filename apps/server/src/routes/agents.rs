@@ -5251,14 +5251,26 @@ async fn queue_invocation_for_runtime(
     let runner = active_runner(&state, actor, project_id, &agent).await?;
     for source in &request.sources {
         if matches!(source, InformationSource::ToolOutput { .. }) {
+            let reader_device = current_context_reader_device(
+                &state,
+                actor,
+                project_id,
+                context_principal,
+                agent.principal_id,
+                runner,
+            )
+            .await?;
             validate_tool_output_context_source(
                 &state,
                 actor,
                 project_id,
                 ToolOutputContextBinding {
-                    producer_principal: agent.principal_id,
-                    context_principal,
+                    effect_actor: agent.principal_id,
+                    reader_principal: context_principal,
                     source,
+                    reader_device_id: reader_device.device_id,
+                    reader_key_version: reader_device.key_version,
+                    runner_identity: agent.principal_id,
                     runner_device_id: runner.device_id,
                     runner_key_version: runner.key_version,
                 },
@@ -7400,11 +7412,63 @@ fn agent_profile_resource(agent: &AgentRecord) -> ResourceId {
 }
 
 struct ToolOutputContextBinding<'a> {
-    producer_principal: UserId,
-    context_principal: UserId,
+    effect_actor: UserId,
+    reader_principal: UserId,
     source: &'a InformationSource,
+    reader_device_id: Uuid,
+    reader_key_version: i32,
+    runner_identity: UserId,
     runner_device_id: Uuid,
     runner_key_version: i32,
+}
+
+#[derive(Clone, Copy)]
+struct ContextReaderDevice {
+    device_id: Uuid,
+    key_version: i32,
+}
+
+async fn current_context_reader_device(
+    state: &AppState,
+    actor: AuthSession,
+    project_id: Uuid,
+    reader_principal: UserId,
+    agent_principal: UserId,
+    runner: RunnerRecord,
+) -> Result<ContextReaderDevice, AppError> {
+    if reader_principal == agent_principal {
+        return Ok(ContextReaderDevice {
+            device_id: runner.device_id,
+            key_version: runner.key_version,
+        });
+    }
+    if Uuid::from(reader_principal) != actor.identity_id {
+        return Err(AppError::Forbidden);
+    }
+    let mut transaction = begin(state, actor, project_id).await?;
+    let key_version = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT key.key_version
+        FROM device_keys key
+        JOIN devices device
+          ON device.identity_id=key.identity_id AND device.id=key.device_id
+        WHERE key.identity_id=$1 AND key.device_id=$2
+          AND key.revoked_at IS NULL
+          AND device.trust_state='trusted' AND device.retired_at IS NULL
+        ORDER BY key.key_version DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(actor.identity_id)
+    .bind(actor.device_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    transaction.commit().await?;
+    Ok(ContextReaderDevice {
+        device_id: actor.device_id,
+        key_version,
+    })
 }
 
 async fn validate_tool_output_context_source(
@@ -7486,6 +7550,12 @@ async fn validate_tool_output_context_source(
               AND envelope.recipient_device_id = $5
               AND envelope.recipient_device_key_version = $6
               AND envelope.envelope_commitment = digest(envelope.encrypted_key, 'sha256')
+              AND envelope.sender_identity_id = dispatch.runner_identity_id
+              AND envelope.sender_device_id = dispatch.runner_device_id
+              AND envelope.sender_device_key_version = dispatch.runner_key_version
+              AND dispatch.runner_identity_id = $7
+              AND dispatch.runner_device_id = $8
+              AND dispatch.runner_key_version = $9
               AND key.revoked_at IS NULL
               AND device.trust_state = 'trusted'
               AND device.retired_at IS NULL
@@ -7494,8 +7564,11 @@ async fn validate_tool_output_context_source(
     )
     .bind(project_id)
     .bind(*call_id)
-    .bind(Uuid::from(binding.producer_principal))
-    .bind(Uuid::from(binding.context_principal))
+    .bind(Uuid::from(binding.effect_actor))
+    .bind(Uuid::from(binding.reader_principal))
+    .bind(binding.reader_device_id)
+    .bind(binding.reader_key_version)
+    .bind(Uuid::from(binding.runner_identity))
     .bind(binding.runner_device_id)
     .bind(binding.runner_key_version)
     .fetch_one(&mut *transaction)

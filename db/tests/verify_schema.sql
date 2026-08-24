@@ -415,6 +415,63 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'R5.0033 permission ledger trusted-writer boundary is missing';
     END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='agent_run_transitions'
+          AND column_name='semantic_tick' AND is_nullable='YES'
+    ) OR EXISTS (
+        SELECT 1 FROM (VALUES
+          ('agent_r540_tool_trace_roots'),
+          ('agent_r540_work_attempt_events'),
+          ('agent_r540_tool_attempt_events'),
+          ('agent_r540_work_outcome_events'),
+          ('agent_r540_tool_trace_inventory'),
+          ('agent_r540_tool_trace_certificates')
+        ) expected(name)
+        WHERE NOT EXISTS (
+          SELECT 1 FROM pg_class relation
+          WHERE relation.oid = ('public.' || expected.name)::regclass
+            AND relation.relrowsecurity AND relation.relforcerowsecurity
+        )
+    ) THEN
+        RAISE EXCEPTION 'R5.0034 trace tables or semantic tick are not hardened';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname='public' AND indexname='agent_r540_inventory_tool_event_unique'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgrelid='public.agent_r540_tool_trace_inventory'::regclass
+          AND tgname='agent_r540_inventory_immutable' AND NOT tgisinternal
+    ) OR to_regclass('public.agent_r540_exact_tool_trace_certificates') IS NULL
+      OR to_regclass('public.agent_r541_tool_run_surface_gates') IS NULL
+      OR to_regclass('public.agent_r541_tool_outcome_surface_records') IS NULL THEN
+        RAISE EXCEPTION 'R5.0034 ordered inventory/certificate/gate surfaces are missing';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM pg_proc procedure
+        WHERE procedure.oid IN (
+          'sprout_private.initialize_agent_tool_trace(uuid,uuid,uuid)'::regprocedure,
+          'sprout_private.project_agent_tool_attempt(uuid,uuid,uuid,uuid)'::regprocedure,
+          'sprout_private.project_agent_tool_signed_terminal(uuid,uuid,uuid,integer,uuid,uuid)'::regprocedure,
+          'sprout_private.project_agent_tool_server_timeout(uuid,uuid,uuid,integer,uuid,uuid)'::regprocedure
+        ) AND (
+          NOT procedure.prosecdef
+          OR NOT procedure.proconfig @> ARRAY['search_path=pg_catalog']::text[]
+          OR NOT procedure.proconfig @> ARRAY['row_security=off']::text[]
+          OR EXISTS (
+            SELECT 1 FROM aclexplode(COALESCE(
+              procedure.proacl, acldefault('f', procedure.proowner)
+            )) privilege
+            WHERE privilege.grantee=0 AND privilege.privilege_type='EXECUTE'
+          )
+        )
+    ) THEN
+        RAISE EXCEPTION 'R5.0034 trusted projector boundary is not pinned/private';
+    END IF;
 END;
 $verification$;
 

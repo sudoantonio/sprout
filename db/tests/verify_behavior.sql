@@ -4704,6 +4704,20 @@ BEGIN
 END;
 $tool_permission_versions$;
 
+-- R5.0034 populated SQL fixtures predate an exact initialization semantic
+-- tick. The additive migration must not synthesize a run trace or promote an
+-- operational 0033 audit row into the formal tool surface.
+DO $tool_trace_legacy_fail_closed$
+BEGIN
+    IF EXISTS (SELECT 1 FROM agent_r540_tool_trace_roots)
+       OR EXISTS (SELECT 1 FROM agent_r540_tool_trace_inventory)
+       OR EXISTS (SELECT 1 FROM agent_r540_tool_trace_certificates)
+       OR EXISTS (SELECT 1 FROM agent_r541_tool_surface_records) THEN
+        RAISE EXCEPTION 'R5.0034 synthesized a trace/certificate for legacy fixtures';
+    END IF;
+END;
+$tool_trace_legacy_fail_closed$;
+
 ROLLBACK;
 
 SELECT 'sprout behavioral verification passed' AS result;

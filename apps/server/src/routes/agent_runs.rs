@@ -322,10 +322,17 @@ pub async fn create(
         &facts_hash,
         &state_json,
         &fact_references,
+        tick,
         None,
     )
     .await?;
     persist_kernel_certificates(&mut transaction, project_id, &state, transition_id, tick).await?;
+    let _: i64 = sqlx::query_scalar("SELECT sprout_private.initialize_agent_tool_trace($1,$2,$3)")
+        .bind(project_id)
+        .bind(Uuid::from(request.id))
+        .bind(transition_id)
+        .fetch_one(&mut *transaction)
+        .await?;
     transaction.commit().await?;
     Ok(Json(RunResponse {
         id: request.id,
@@ -2258,6 +2265,7 @@ pub(crate) async fn persist_transition(
         &facts_hash,
         &state_json,
         &fact_references,
+        metadata.tick,
         metadata.observation,
     )
     .await?;
@@ -2542,6 +2550,7 @@ async fn insert_transition(
     facts_hash: &[u8; 32],
     state_snapshot: &serde_json::Value,
     fact_references: &AuthoritativeFactReferences,
+    semantic_tick: u64,
     observation: Option<(&'static str, Uuid)>,
 ) -> Result<(), AppError> {
     let (observation_kind, observation_id) = observation.unzip();
@@ -2556,10 +2565,10 @@ async fn insert_transition(
             runtime_actor_kind, actor_identity_id, actor_device_id,
             observation_kind, observation_id,
             previous_state_hash, next_state_hash, facts_hash,
-            state_snapshot, fact_references
+            state_snapshot, fact_references, semantic_tick
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15
+            $11, $12, $13, $14, $15, $16
         )
         "#,
     )
@@ -2582,6 +2591,7 @@ async fn insert_transition(
     .bind(facts_hash.as_slice())
     .bind(state_snapshot)
     .bind(canonical_value(fact_references)?)
+    .bind(i64::try_from(semantic_tick).map_err(|_| AppError::Internal)?)
     .execute(&mut **transaction)
     .await?;
     Ok(())
