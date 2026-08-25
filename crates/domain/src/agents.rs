@@ -1875,6 +1875,26 @@ impl CollaborativeRunState {
         )
     }
 
+    /// Record the canonical grounding used by a `taskFromWork` waiting rule.
+    /// This direction is intentionally distinct from the Work -> Task edge
+    /// produced by an agent task effect: the pre-existing human task is the
+    /// authoritative predecessor that grounds the blocked WorkItem.
+    pub fn record_task_waiting_causal_link(
+        &mut self,
+        task: ResourceId,
+        work: WorkItemId,
+        tick: u64,
+    ) -> Result<(), AgentValidationError> {
+        if !self.work_items.contains_key(&work) {
+            return Err(AgentValidationError::UnknownWorkItem);
+        }
+        self.push_causal_link(
+            CollaborativeCausalNode::Task { task },
+            CollaborativeCausalNode::Work { work },
+            tick,
+        )
+    }
+
     #[must_use]
     pub fn task_is_causal_successor(&self, work: WorkItemId, task: ResourceId) -> bool {
         self.causal_links.iter().any(|link| {
@@ -6640,6 +6660,32 @@ mod tests {
             link.predecessor == CollaborativeCausalNode::Task { task }
                 && link.successor == CollaborativeCausalNode::Work { work }
         }));
+        assert!(run.causal_rank_decreases_on_every_link());
+    }
+
+    #[test]
+    fn task_from_work_waiting_rule_projects_exact_task_to_work_grounding() {
+        let agent = UserId::new();
+        let local = local_goal(agent, UserId::new());
+        let facts = ContractConditionFacts::default();
+        let mut run =
+            CollaborativeRunState::initialize(RunId::new(), &local.contract, &facts, 0).unwrap();
+        let work = run.work_items.values().next().unwrap().id;
+        let task = ResourceId::new();
+
+        run.record_task_waiting_causal_link(task, work, 1).unwrap();
+        run.record_task_waiting_causal_link(task, work, 2).unwrap();
+
+        assert_eq!(
+            run.causal_links
+                .iter()
+                .filter(|link| {
+                    link.predecessor == CollaborativeCausalNode::Task { task }
+                        && link.successor == CollaborativeCausalNode::Work { work }
+                })
+                .count(),
+            1
+        );
         assert!(run.causal_rank_decreases_on_every_link());
     }
 

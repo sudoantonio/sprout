@@ -22,8 +22,9 @@ use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use super::agent_runs::{
-    TransitionMetadata, authoritative_condition_facts, begin, lock_run, persist_transition,
-    require_active_runner, require_current_run_authority, runtime_tick, tick_datetime,
+    TransitionMetadata, allocate_run_semantic_tick, allocate_tool_terminal_semantic_tick,
+    authoritative_condition_facts, begin, lock_run, operational_now, persist_transition,
+    require_active_runner, require_current_run_authority, runtime_tick,
 };
 use crate::{
     AppState,
@@ -547,7 +548,17 @@ pub async fn invoke(
     require_active_runner(&mut transaction, project_id, actor).await?;
     let locked = lock_run(&mut transaction, project_id, run_id).await?;
     require_current_run_authority(&mut transaction, project_id, actor, &locked.state).await?;
-    let tick = runtime_tick()?;
+    let tick = allocate_run_semantic_tick(
+        &mut transaction,
+        project_id,
+        run_id,
+        request.id,
+        "tool_attempt_opened",
+        &request,
+    )
+    .await?;
+    let requested_at = operational_now()?;
+    let tool_deadline_at = requested_at + Duration::seconds(i64::from(request.timeout_seconds));
     let facts = authoritative_condition_facts(
         &mut transaction,
         project_id,
@@ -831,14 +842,12 @@ pub async fn invoke(
     .bind(request.idempotency_key)
     .bind(&request_hash)
     .bind(i64::try_from(tick).map_err(|_| AppError::Internal)?)
-    .bind(tick_datetime(tick)?)
+    .bind(requested_at)
     .bind(
         i64::try_from(tick.saturating_add(u64::from(request.timeout_seconds)))
             .map_err(|_| AppError::Internal)?,
     )
-    .bind(tick_datetime(
-        tick.saturating_add(u64::from(request.timeout_seconds)),
-    )?)
+    .bind(tool_deadline_at)
     .execute(&mut *transaction)
     .await?;
     let transition = persist_transition(
@@ -1425,6 +1434,16 @@ pub async fn terminal_exact(
             replayed: true,
         }));
     }
+    let terminal_tick = allocate_tool_terminal_semantic_tick(
+        &mut transaction,
+        project_id,
+        run_id,
+        request.observation_id,
+        &statement,
+        call_id,
+        call.attempt,
+    )
+    .await?;
     let observed_at: DateTime<Utc> = sqlx::query_scalar(
         r#"
         INSERT INTO agent_tool_attempt_observations (
@@ -1523,7 +1542,7 @@ pub async fn terminal_exact(
             } else {
                 "work_failed"
             },
-            tick: runtime_tick()?,
+            tick: terminal_tick,
             observation: Some(("tool_terminal", request.observation_id)),
         },
     )
@@ -1672,6 +1691,16 @@ pub(crate) async fn materialize_server_timeouts(pool: &sqlx::PgPool) -> Result<u
             "wire_request_commitment": exact_request.as_ref().map(|request| hex::encode(&request.1)),
             "idempotency_key": idempotency_key,
         }))?;
+        let terminal_tick = allocate_tool_terminal_semantic_tick(
+            &mut transaction,
+            project_id,
+            run_id,
+            observation_id,
+            &observation_hash,
+            call_id,
+            call.attempt,
+        )
+        .await?;
         let observed_at: DateTime<Utc> = sqlx::query_scalar(
             r#"
             INSERT INTO agent_tool_attempt_observations (
@@ -1738,7 +1767,7 @@ pub(crate) async fn materialize_server_timeouts(pool: &sqlx::PgPool) -> Result<u
             &facts,
             TransitionMetadata {
                 kind: "work_failed",
-                tick: runtime_tick()?,
+                tick: terminal_tick,
                 observation: Some(("tool_terminal", observation_id)),
             },
         )
@@ -1873,7 +1902,17 @@ pub async fn retry(
         .find(|candidate| candidate.id == work.serves)
         .ok_or(AppError::Conflict)?;
     let next_attempt = call.attempt.checked_add(1).ok_or(AppError::Conflict)?;
-    let requested_tick = runtime_tick()?;
+    let requested_tick = allocate_run_semantic_tick(
+        &mut transaction,
+        project_id,
+        run_id,
+        request.idempotency_key,
+        "tool_attempt_opened",
+        &request,
+    )
+    .await?;
+    let requested_at = operational_now()?;
+    let tool_deadline_at = requested_at + Duration::seconds(i64::from(call.timeout_seconds));
     if claim.claimant != UserId::from(actor.identity_id)
         || claim.status != ClaimStatus::Active
         || claim.acquired_at > requested_tick
@@ -1985,14 +2024,12 @@ pub async fn retry(
     .bind(snapshot.work_authority_principal)
     .bind(serde_json::to_value(&required_effects).map_err(|_| AppError::Internal)?)
     .bind(i64::try_from(requested_tick).map_err(|_| AppError::Internal)?)
-    .bind(tick_datetime(requested_tick)?)
+    .bind(requested_at)
     .bind(
         i64::try_from(requested_tick.saturating_add(u64::from(call.timeout_seconds)))
             .map_err(|_| AppError::Internal)?,
     )
-    .bind(tick_datetime(
-        requested_tick.saturating_add(u64::from(call.timeout_seconds)),
-    )?)
+    .bind(tool_deadline_at)
     .execute(&mut *transaction)
     .await?;
     call.work_item_id = Uuid::from(work.id);

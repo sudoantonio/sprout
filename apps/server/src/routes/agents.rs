@@ -47,6 +47,8 @@ use crate::{
     error::AppError,
 };
 
+use super::agent_runs::{allocate_run_semantic_tick, runtime_tick};
+
 const RUNNER_LEASE: Duration = Duration::from_secs(300);
 const COMPILATION_SIGNATURE_CONTEXT: &[u8] = b"sprout-governance-compilation-v1";
 const FINAL_PROMPT_APPROVAL_SIGNATURE_CONTEXT: &[u8] = b"sprout-final-prompt-approval-v1";
@@ -3791,6 +3793,7 @@ pub async fn record_interrogation(
     }
     let transcript = serialize_ciphertext(&request.encrypted_transcript)?;
     let delta_json = canonical_json(&request.causal_delta)?;
+    let interrogation_semantic_tick = runtime_tick()?;
     let mut transaction = begin(&state, actor, project_id).await?;
     let epoch_active = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM resource_epochs
@@ -3810,8 +3813,8 @@ pub async fn record_interrogation(
         INSERT INTO agent_interrogations (
             id, project_id, creator_identity_id, target_agent_id,
             target_agent_identity_id, transcript_resource_node_id,
-            key_epoch, encrypted_transcript, causal_delta, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+            key_epoch, encrypted_transcript, causal_delta, created_at, semantic_tick
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
         "#,
     )
     .bind(Uuid::from(request.id))
@@ -3824,6 +3827,7 @@ pub async fn record_interrogation(
     .bind(transcript)
     .bind(delta_json)
     .bind(created_at)
+    .bind(i64::try_from(interrogation_semantic_tick).map_err(|_| AppError::Internal)?)
     .execute(&mut *transaction)
     .await?;
     append_audit(
@@ -3924,19 +3928,6 @@ pub async fn create_proxy_thread(
     }
     require_project_access(&state.pool, actor, project_id, ProjectAccess::Member).await?;
     let created_at = Utc::now();
-    let proxy = UserProxy {
-        id: request.proxy_id,
-        user: actor.identity_id.into(),
-    };
-    let thread = UserProxyThread {
-        id: request.thread_id,
-        proxy_id: request.proxy_id,
-        creator: actor.identity_id.into(),
-        created_at,
-    };
-    if !thread.valid_for(&proxy) || !thread.readable_by(actor.identity_id.into()) {
-        return Err(AppError::Forbidden);
-    }
     let mut transaction = begin(&state, actor, project_id).await?;
     sqlx::query(
         r#"
@@ -3957,8 +3948,18 @@ pub async fn create_proxy_thread(
     .bind(actor.identity_id)
     .fetch_one(&mut *transaction)
     .await?;
-    if actual_proxy_id != request.proxy_id {
-        return Err(AppError::Conflict);
+    let proxy = UserProxy {
+        id: actual_proxy_id,
+        user: actor.identity_id.into(),
+    };
+    let thread = UserProxyThread {
+        id: request.thread_id,
+        proxy_id: actual_proxy_id,
+        creator: actor.identity_id.into(),
+        created_at,
+    };
+    if !thread.valid_for(&proxy) || !thread.readable_by(actor.identity_id.into()) {
+        return Err(AppError::Forbidden);
     }
     sqlx::query(
         "INSERT INTO user_proxy_threads (
@@ -3967,14 +3968,14 @@ pub async fn create_proxy_thread(
     )
     .bind(Uuid::from(request.thread_id))
     .bind(project_id)
-    .bind(request.proxy_id)
+    .bind(actual_proxy_id)
     .bind(actor.identity_id)
     .bind(created_at)
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
     Ok(Json(ProxyThreadResponse {
-        proxy_id: request.proxy_id,
+        proxy_id: actual_proxy_id,
         thread_id: request.thread_id,
         created_at,
     }))
@@ -5567,7 +5568,7 @@ async fn claim_invocation_for_runtime(
     let mut transaction = begin(&state, actor, project_id).await?;
     let candidate = sqlx::query(
         r#"
-        SELECT id, language_task::text AS language_task,
+        SELECT id, run_id, language_task::text AS language_task,
                authority_envelope::text AS authority_envelope,
                encrypted_input, attempt, context_principal_identity_id,
                request_hash
@@ -5636,6 +5637,20 @@ async fn claim_invocation_for_runtime(
     });
     let transport_commitment: [u8; 32] =
         Sha256::digest(governance_canonical_bytes(&transport_projection)?).into();
+    let dispatch_semantic_tick =
+        if let Some(run_id) = candidate.try_get::<Option<Uuid>, _>("run_id")? {
+            allocate_run_semantic_tick(
+                &mut transaction,
+                project_id,
+                run_id,
+                dispatch_id,
+                "model_invocation",
+                &transport_projection,
+            )
+            .await?
+        } else {
+            runtime_tick()?
+        };
     sqlx::query(
         r#"
         UPDATE agent_invocations
@@ -5662,10 +5677,10 @@ async fn claim_invocation_for_runtime(
             context_principal_identity_id, request_commitment,
             context_commitment, exposure_commitment, transport_commitment,
             source_descriptors, dispatched_at, lease_expires_at, runtime_kind,
-            execution_profile_commitment
+            execution_profile_commitment, semantic_tick
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $12, $13, $14::jsonb, $15, $16, $17, $18
+            $11, $12, $12, $13, $14::jsonb, $15, $16, $17, $18, $19
         )
         "#,
     )
@@ -5691,6 +5706,7 @@ async fn claim_invocation_for_runtime(
             .as_ref()
             .map(<[u8; 32]>::as_slice),
     )
+    .bind(i64::try_from(dispatch_semantic_tick).map_err(|_| AppError::Internal)?)
     .execute(&mut *transaction)
     .await?;
     append_audit(
@@ -6100,7 +6116,7 @@ pub async fn submit_invocation(
                    request_commitment, context_commitment, exposure_commitment,
                    transport_commitment, source_descriptors::text AS source_descriptors,
                    dispatched_at, lease_expires_at, runtime_kind,
-                   execution_profile_commitment
+                   execution_profile_commitment, semantic_tick
             FROM agent_model_attempt_dispatches
             WHERE project_id = $1 AND id = $2 AND invocation_id = $3
               AND lease_id = $4 AND attempt = $5
@@ -6153,6 +6169,7 @@ pub async fn submit_invocation(
         let dispatched_at: DateTime<Utc> = dispatch.try_get("dispatched_at")?;
         let expires_at: DateTime<Utc> = dispatch.try_get("lease_expires_at")?;
         let runtime_kind: String = dispatch.try_get("runtime_kind")?;
+        let dispatch_semantic_tick: Option<i64> = dispatch.try_get("semantic_tick")?;
         let dispatched_execution_profile_commitment: Option<Vec<u8>> =
             dispatch.try_get("execution_profile_commitment")?;
         if (runtime_kind == "client_provider_v1"
@@ -6247,6 +6264,7 @@ pub async fn submit_invocation(
             runtime_kind,
             context_principal,
             dispatched_at,
+            dispatch_semantic_tick,
         ))
     } else {
         None
@@ -6307,6 +6325,7 @@ pub async fn submit_invocation(
         runtime_kind,
         context_principal,
         dispatched_at,
+        dispatch_semantic_tick,
     )) = verified_observation
     {
         if let Some(run_id) = row.try_get::<Option<Uuid>, _>("run_id")? {
@@ -6411,11 +6430,11 @@ pub async fn submit_invocation(
                 context_source_descriptors, request_commitment, context_commitment,
                 endpoint_request_exact, endpoint_request_commitment,
                 runtime_kind, execution_profile_commitment, output_commitment,
-                artifact_commitment, structured_artifact, invoked_at
+                artifact_commitment, structured_artifact, invoked_at, semantic_tick
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                 $12, 'succeeded', $13, $14::jsonb, $15::jsonb, $16, $17,
-                $18, $19, $20, $21, $22, $23, $24::jsonb, $25
+                $18, $19, $20, $21, $22, $23, $24::jsonb, $25, $26
             )
             "#,
         )
@@ -6452,9 +6471,24 @@ pub async fn submit_invocation(
         .bind(artifact_hash.as_slice())
         .bind(&artifact_json)
         .bind(dispatched_at)
+        .bind(dispatch_semantic_tick)
         .execute(&mut *transaction)
         .await?;
         if invocation_surface == "interrogation" {
+            let answer_semantic_tick =
+                if let Some(run_id) = row.try_get::<Option<Uuid>, _>("run_id")? {
+                    allocate_run_semantic_tick(
+                        &mut transaction,
+                        project_id,
+                        run_id,
+                        observation.statement.observation_id,
+                        "interrogation_answer",
+                        &observation.statement,
+                    )
+                    .await?
+                } else {
+                    runtime_tick()?
+                };
             persist_interrogation_answer(
                 &mut transaction,
                 project_id,
@@ -6463,7 +6497,10 @@ pub async fn submit_invocation(
                     .ok_or(AppError::Internal)?,
                 &artifact,
                 &dispatched_sources,
-                observation.statement.observed_at,
+                InterrogationAnswerTiming {
+                    answered_at: observation.statement.observed_at,
+                    semantic_tick: answer_semantic_tick,
+                },
             )
             .await?;
         }
@@ -6651,7 +6688,7 @@ pub async fn apply_info_effect(
     let row = sqlx::query(
         r#"
         SELECT proposal.invocation_id, proposal.effect::text AS effect,
-               proposal.encrypted_materialization
+               proposal.encrypted_materialization, invocation.run_id
         FROM agent_effect_proposals proposal
         JOIN agent_invocations invocation
           ON invocation.project_id = proposal.project_id
@@ -6686,6 +6723,23 @@ pub async fn apply_info_effect(
         idempotency_key,
     } = descriptor.materialization;
     let resource_id = Uuid::from(descriptor.effect.resource_id);
+    let effect_semantic_tick = if let Some(run_id) = row.try_get::<Option<Uuid>, _>("run_id")? {
+        allocate_run_semantic_tick(
+            &mut transaction,
+            project_id,
+            run_id,
+            effect_id,
+            "disclosure_effect_applied",
+            &serde_json::json!({
+                "invocation_id": invocation_id,
+                "effect_id": effect_id,
+                "resource_id": resource_id,
+            }),
+        )
+        .await?
+    } else {
+        runtime_tick()?
+    };
     let current_resource = sqlx::query_scalar::<_, Uuid>(
         "SELECT resource_node_id FROM info_documents
          WHERE project_id = $1 AND id = $2 AND deleted_at IS NULL",
@@ -6777,11 +6831,13 @@ pub async fn apply_info_effect(
     .await?;
     sqlx::query(
         "UPDATE agent_effect_proposals
-         SET status = 'applied', applied_at = clock_timestamp()
+         SET status = 'applied', applied_at = clock_timestamp(),
+             applied_semantic_tick = $3
          WHERE project_id = $1 AND id = $2 AND status = 'accepted'",
     )
     .bind(project_id)
     .bind(effect_id)
+    .bind(i64::try_from(effect_semantic_tick).map_err(|_| AppError::Internal)?)
     .execute(&mut *transaction)
     .await?;
     append_audit(
@@ -7812,6 +7868,11 @@ async fn interrogation_read_only_fingerprint(
     Ok(Sha256::digest(snapshot.as_bytes()).into())
 }
 
+struct InterrogationAnswerTiming {
+    answered_at: DateTime<Utc>,
+    semantic_tick: u64,
+}
+
 async fn persist_interrogation_answer(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
@@ -7819,7 +7880,7 @@ async fn persist_interrogation_answer(
     interrogation_id: Uuid,
     artifact: &StructuredLanguageArtifact,
     actual_sources: &[InformationSource],
-    answered_at: DateTime<Utc>,
+    timing: InterrogationAnswerTiming,
 ) -> Result<(), AppError> {
     let StructuredLanguageArtifact::InterrogationAnswer {
         session_id,
@@ -7874,8 +7935,9 @@ async fn persist_interrogation_answer(
         INSERT INTO agent_interrogation_answers (
             id, project_id, interrogation_id, invocation_id,
             encrypted_answer, context_source_descriptors,
-            question_state_fingerprint, answer_state_fingerprint, answered_at
-        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+            question_state_fingerprint, answer_state_fingerprint, answered_at,
+            semantic_tick
+        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10)
         "#,
     )
     .bind(derived_governance_id(
@@ -7889,7 +7951,8 @@ async fn persist_interrogation_answer(
     .bind(governance_canonical_json(context_sources)?)
     .bind(question_fingerprint.as_slice())
     .bind(after.as_slice())
-    .bind(answered_at)
+    .bind(timing.answered_at)
+    .bind(i64::try_from(timing.semantic_tick).map_err(|_| AppError::Internal)?)
     .execute(&mut **transaction)
     .await?;
     if rows.rows_affected() == 1 {
@@ -8387,7 +8450,7 @@ async fn resource_access_for_identity(
     Ok(allowed)
 }
 
-async fn resource_access_in_transaction(
+pub(crate) async fn resource_access_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     principal_id: Uuid,

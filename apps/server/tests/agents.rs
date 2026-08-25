@@ -39,6 +39,720 @@ struct Fixture {
     owner_ml_dsa_65_private_key: Vec<u8>,
 }
 
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn native_comments_preserve_exact_depth_replay_and_r541_gate() {
+    let fixture = fixture().await;
+    let app = app(&fixture);
+    let (ordinary_user_id, _ordinary_device_id, ordinary_user_token, _ordinary_permission) =
+        add_human_member(&fixture, "member").await;
+    let (first_status, first) =
+        provision_administrator_governed_agent(&fixture, &app, 211, None, None, |_| {}, true).await;
+    assert_eq!(first_status, StatusCode::OK);
+    let (second_status, second) =
+        provision_administrator_governed_agent(&fixture, &app, 221, None, None, |_| {}, true).await;
+    assert_eq!(second_status, StatusCode::OK);
+    let first_runner = activate_exact_tool_runner(&fixture, &app, &first).await;
+    let second_runner = activate_exact_tool_runner(&fixture, &app, &second).await;
+    let mut permission = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin comment permission setup");
+    sqlx::query("SET LOCAL row_security = off")
+        .execute(&mut *permission)
+        .await
+        .expect("disable RLS for comment permission fixture");
+    sqlx::query(
+        "SELECT sprout_private.grant_hierarchical_permission(
+           $1,$2,$3,'edit','full','restricted',$4,$3)",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(fixture.owner_id)
+    .bind(Uuid::new_v4())
+    .execute(&mut *permission)
+    .await
+    .expect("grant owner exact Comment capability");
+    permission
+        .commit()
+        .await
+        .expect("commit comment permission setup");
+
+    async fn create_and_claim_comment_run(
+        fixture: &Fixture,
+        app: &axum::Router,
+        provisioned: &ProvisionedGovernanceAgent,
+        bearer: &str,
+    ) -> (Uuid, Uuid, Uuid) {
+        let run_id = Uuid::new_v4();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/projects/{}/agent-runs", fixture.project_id))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {}", fixture.owner_token))
+                    .body(Body::from(
+                        json!({
+                            "id":run_id,
+                            "source":{"kind":"local_goal","id":provisioned.local_goal_id,"revision":1},
+                            "authority_envelope":{
+                                "resource_authority":[{
+                                    "resource_id":fixture.profile_resource_id,
+                                    "operation":"post_comment"
+                                }],
+                                "tool_authority":[]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("create native-comment run"),
+            )
+            .await
+            .expect("create native-comment run response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            json_body(response).await
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{run_id}/claim",
+                        fixture.project_id
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::from("{}"))
+                    .expect("claim native-comment work"),
+            )
+            .await
+            .expect("claim native-comment work response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            json_body(response).await
+        );
+        let state = json_body(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/v1/projects/{}/agent-runs/{run_id}",
+                            fixture.project_id
+                        ))
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .expect("read native-comment run"),
+                )
+                .await
+                .expect("read native-comment run response"),
+        )
+        .await;
+        let (claim_id, claim) = state["state"]["claims"]
+            .as_object()
+            .and_then(|claims| claims.iter().next())
+            .expect("native-comment claim");
+        (
+            run_id,
+            Uuid::parse_str(claim_id).expect("native-comment claim UUID"),
+            Uuid::parse_str(claim["work"].as_str().expect("native-comment work"))
+                .expect("native-comment work UUID"),
+        )
+    }
+
+    async fn post_agent_comment_request(
+        fixture: &Fixture,
+        app: &axum::Router,
+        bearer: &str,
+        run_id: Uuid,
+        claim_id: Uuid,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/projects/{}/agent-runs/{run_id}/claims/{claim_id}/comments",
+                        fixture.project_id
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::from(body.to_string()))
+                    .expect("post bound agent comment"),
+            )
+            .await
+            .expect("post bound agent comment response");
+        let status = response.status();
+        (status, json_body(response).await)
+    }
+
+    let (first_run, first_claim, first_work) =
+        create_and_claim_comment_run(&fixture, &app, &first, &first_runner.bearer).await;
+    let payload = |seed: u8| {
+        json!({
+            "version":1,
+            "algorithm":"aes-256-gcm",
+            "key_id":format!("comment-key-{seed}"),
+            "nonce_b64":STANDARD.encode([seed;12]),
+            "ciphertext_b64":STANDARD.encode([seed,seed.wrapping_add(1)])
+        })
+    };
+
+    let administrator_key = Uuid::new_v4();
+    let administrator_body = json!({
+        "recipient_id":first.principal_identity_id,
+        "target_id":fixture.profile_resource_id,
+        "parent_id":null,
+        "encrypted_payload":payload(1),
+        "key_epoch":1,
+        "idempotency_key":administrator_key,
+        "run_id":first_run
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/comments", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(administrator_body.to_string()))
+                .expect("post administrator comment"),
+        )
+        .await
+        .expect("post administrator comment response");
+    let administrator_status = response.status();
+    let administrator_response = json_body(response).await;
+    assert_eq!(
+        administrator_status,
+        StatusCode::OK,
+        "{administrator_response}"
+    );
+    let administrator_id = Uuid::parse_str(
+        administrator_response["id"]
+            .as_str()
+            .expect("administrator comment id"),
+    )
+    .expect("administrator comment UUID");
+
+    let user_comment_body = json!({
+        "recipient_id":first.principal_identity_id,
+        "target_id":fixture.profile_resource_id,
+        "parent_id":null,
+        "encrypted_payload":payload(4),
+        "key_epoch":1,
+        "idempotency_key":Uuid::new_v4(),
+        "run_id":first_run
+    });
+    let user_comment = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/comments", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {ordinary_user_token}"))
+                .body(Body::from(user_comment_body.to_string()))
+                .expect("post ordinary-user comment"),
+        )
+        .await
+        .expect("post ordinary-user comment response");
+    let user_status = user_comment.status();
+    let user_response = json_body(user_comment).await;
+    assert_eq!(user_status, StatusCode::OK, "{user_response}");
+    let user_comment_id = Uuid::parse_str(user_response["id"].as_str().expect("user comment id"))
+        .expect("user comment UUID");
+    assert_ne!(ordinary_user_id, fixture.owner_id);
+    let priority_source_ticks = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT high.semantic_tick,low.semantic_tick
+         FROM native_comments high,native_comments low
+         WHERE high.project_id=$1 AND high.id=$2
+           AND low.project_id=$1 AND low.id=$3",
+    )
+    .bind(fixture.project_id)
+    .bind(administrator_id)
+    .bind(user_comment_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load non-vacuous Comment priority source ticks");
+    assert!(priority_source_ticks.0 < priority_source_ticks.1);
+
+    let root_key = Uuid::new_v4();
+    let root_body = json!({
+        "recipient_id":second.principal_identity_id,
+        "target_id":fixture.profile_resource_id,
+        "parent_id":null,
+        "encrypted_payload":payload(2),
+        "key_epoch":1,
+        "idempotency_key":root_key,
+        "work_item_id":first_work,
+        "attempt":1
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{first_run}/claims/{first_claim}/comments",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", first_runner.bearer))
+                .body(Body::from(root_body.to_string()))
+                .expect("post agent root comment"),
+        )
+        .await
+        .expect("post agent root comment response");
+    let root_status = response.status();
+    let root_response = json_body(response).await;
+    assert_eq!(root_status, StatusCode::OK, "{root_response}");
+    let root_id = Uuid::parse_str(root_response["id"].as_str().expect("root comment id"))
+        .expect("root comment UUID");
+
+    let allocations_before_replay = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_run_semantic_tick_allocations
+         WHERE project_id=$1 AND run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(first_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count semantic allocations before Comment replay");
+
+    let replay = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{first_run}/claims/{first_claim}/comments",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", first_runner.bearer))
+                .body(Body::from(root_body.to_string()))
+                .expect("replay agent root comment"),
+        )
+        .await
+        .expect("replay agent root response");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay = json_body(replay).await;
+    assert_eq!(replay["id"], root_response["id"]);
+    assert_eq!(replay["replayed"], true);
+    let allocations_after_replay = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_run_semantic_tick_allocations
+         WHERE project_id=$1 AND run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(first_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count semantic allocations after Comment replay");
+    assert_eq!(allocations_after_replay, allocations_before_replay);
+
+    let priority_reply = |parent_id: Uuid, seed: u8| {
+        json!({
+            "recipient_id":second.principal_identity_id,
+            "target_id":fixture.profile_resource_id,
+            "parent_id":parent_id,
+            "encrypted_payload":payload(seed),
+            "key_epoch":1,
+            "idempotency_key":Uuid::new_v4(),
+            "work_item_id":first_work,
+            "attempt":1
+        })
+    };
+    let (low_first_status, _) = post_agent_comment_request(
+        &fixture,
+        &app,
+        &first_runner.bearer,
+        first_run,
+        first_claim,
+        priority_reply(user_comment_id, 5),
+    )
+    .await;
+    assert_eq!(low_first_status, StatusCode::FORBIDDEN);
+    let (high_status, high_body) = post_agent_comment_request(
+        &fixture,
+        &app,
+        &first_runner.bearer,
+        first_run,
+        first_claim,
+        priority_reply(administrator_id, 6),
+    )
+    .await;
+    assert_eq!(high_status, StatusCode::OK, "{high_body}");
+    let (low_after_high_status, low_after_high_body) = post_agent_comment_request(
+        &fixture,
+        &app,
+        &first_runner.bearer,
+        first_run,
+        first_claim,
+        priority_reply(user_comment_id, 7),
+    )
+    .await;
+    assert_eq!(
+        low_after_high_status,
+        StatusCode::OK,
+        "{low_after_high_body}"
+    );
+
+    let (second_run, second_claim, second_work) =
+        create_and_claim_comment_run(&fixture, &app, &second, &second_runner.bearer).await;
+    let reply_body = json!({
+        "recipient_id":first.principal_identity_id,
+        "target_id":fixture.profile_resource_id,
+        "parent_id":root_id,
+        "encrypted_payload":payload(3),
+        "key_epoch":1,
+        "idempotency_key":Uuid::new_v4(),
+        "work_item_id":second_work,
+        "attempt":1
+    });
+    let reply = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{second_run}/claims/{second_claim}/comments",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", second_runner.bearer))
+                .body(Body::from(reply_body.to_string()))
+                .expect("post agent reply comment"),
+        )
+        .await
+        .expect("post agent reply comment response");
+    assert_eq!(reply.status(), StatusCode::OK, "{}", json_body(reply).await);
+
+    // Two independent Comment events racing on one run serialize through the
+    // canonical run clock.  Neither wall-clock delay nor timestamp precision
+    // participates in collision freedom.
+    let concurrent_body = |seed: u8| {
+        json!({
+            "recipient_id":first.principal_identity_id,
+            "target_id":fixture.profile_resource_id,
+            "parent_id":null,
+            "encrypted_payload":payload(seed),
+            "key_epoch":1,
+            "idempotency_key":Uuid::new_v4(),
+            "run_id":first_run
+        })
+    };
+    let concurrent_request = |body: Value| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/comments", fixture.project_id))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::from(body.to_string()))
+                .expect("build concurrent Comment request"),
+        )
+    };
+    let (concurrent_a, concurrent_b) = tokio::join!(
+        concurrent_request(concurrent_body(8)),
+        concurrent_request(concurrent_body(9))
+    );
+    assert_eq!(
+        concurrent_a
+            .expect("first concurrent Comment response")
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        concurrent_b
+            .expect("second concurrent Comment response")
+            .status(),
+        StatusCode::OK
+    );
+
+    let collision_freedom = sqlx::query_as::<_, (i64, i64, i64, bool)>(
+        "SELECT count(*),count(DISTINCT comment.semantic_tick),
+                count(DISTINCT allocation.semantic_tick),
+                bool_and(comment.semantic_tick=allocation.semantic_tick)
+         FROM native_comments comment
+         JOIN native_comment_events event
+           ON event.project_id=comment.project_id AND event.comment_id=comment.id
+         JOIN agent_run_semantic_tick_allocations allocation
+           ON allocation.project_id=comment.project_id AND allocation.run_id=comment.run_id
+          AND allocation.event_key=event.id AND allocation.event_kind='comment_posted'
+         WHERE comment.project_id=$1 AND comment.run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(first_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify Comment run tick collision freedom");
+    assert_eq!(collision_freedom.0, collision_freedom.1);
+    assert_eq!(collision_freedom.0, collision_freedom.2);
+    assert!(collision_freedom.3);
+    let cross_family_ticks = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT count(*),count(DISTINCT semantic_tick) FROM (
+           SELECT transition.semantic_tick
+           FROM agent_run_transitions transition
+           WHERE transition.project_id=$1 AND transition.run_id=$2
+           UNION ALL
+           SELECT event.semantic_tick
+           FROM native_comment_events event
+           WHERE event.project_id=$1 AND event.run_id=$2
+         ) formal_events",
+    )
+    .bind(fixture.project_id)
+    .bind(first_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify cross-family run Event tick collision freedom");
+    assert_eq!(cross_family_ticks.0, cross_family_ticks.1);
+
+    let exact = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
+        "SELECT
+           count(*) FILTER (WHERE author_kind='administrator' AND agent_depth=0),
+           count(*) FILTER (WHERE author_kind='user' AND agent_depth=0),
+           count(*) FILTER (WHERE author_kind='agent' AND parent_comment_id IS NULL AND agent_depth=1),
+           count(*) FILTER (WHERE author_kind='agent' AND parent_comment_id IS NOT NULL AND agent_depth=1),
+           count(*) FILTER (WHERE author_kind='agent' AND parent_comment_id IS NOT NULL AND agent_depth=2),
+           (SELECT count(*) FROM agent_r541_comment_surface_records WHERE project_id=$1),
+           (SELECT count(*) FROM native_comment_notifications WHERE project_id=$1)
+         FROM native_comments WHERE project_id=$1",
+    )
+    .bind(fixture.project_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact native comment ledger");
+    assert_eq!(exact, (3, 1, 1, 2, 1, 8, 8));
+    let semantic_exactness = sqlx::query_as::<_, (i64, i64, i64, bool, bool, i64)>(
+        "SELECT
+           (SELECT count(*) FROM agent_r541_typed_exact_comment_records WHERE project_id=$1),
+           count(*),count(DISTINCT event.comment_id),
+           NOT EXISTS (SELECT 1 FROM (
+             SELECT project_ordinal,row_number() OVER (ORDER BY project_ordinal) expected
+             FROM native_comment_events WHERE project_id=$1
+           ) ordered WHERE ordered.project_ordinal<>ordered.expected),
+           bool_and(event.semantic_state_hash=digest(convert_to(concat_ws(E'\\n',
+             'sprout-native-comment-semantic-state-v1',event.project_id::text,
+             event.project_ordinal::text,COALESCE(encode(event.previous_state_hash,'hex'),''),
+             encode(event.event_hash,'hex')),'UTF8'),'sha256')),
+           (SELECT count(*) FROM native_comment_responses WHERE project_id=$1)
+         FROM native_comment_events event WHERE event.project_id=$1",
+    )
+    .bind(fixture.project_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify canonical Comment semantic-state append");
+    assert_eq!(semantic_exactness, (8, 8, 8, true, true, 3));
+
+    let exact_payload = sqlx::query_scalar::<_, Value>(
+        "SELECT exact_comment->'payload'
+         FROM agent_r541_typed_exact_comment_records
+         WHERE project_id=$1 AND comment_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(root_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("reconstruct exact encrypted Comment payload");
+    assert_eq!(exact_payload, payload(2));
+    let comments_exist_in_exact_semantic_state = sqlx::query_scalar::<_, bool>(
+        "SELECT bool_and(semantic_state_comments @> jsonb_build_array(exact_comment))
+         FROM agent_r541_typed_exact_comment_records WHERE project_id=$1",
+    )
+    .bind(fixture.project_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify each R541 Comment exists in the canonical semantic-state prefix");
+    assert!(comments_exist_in_exact_semantic_state);
+
+    let mut duplicate_event = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin duplicate commentPosted attack");
+    sqlx::query("SET LOCAL row_security=off")
+        .execute(&mut *duplicate_event)
+        .await
+        .expect("disable RLS for migration-owner invariant attack");
+    let duplicate = sqlx::query(
+        "INSERT INTO native_comment_events(
+           id,project_id,comment_id,project_ordinal,run_id,trace_number,semantic_tick,
+           event_kind,action_path,comment_snapshot,event_hash,previous_state_hash,semantic_state_hash)
+         SELECT gen_random_uuid(),project_id,comment_id,
+           (SELECT max(project_ordinal)+1 FROM native_comment_events WHERE project_id=$1),
+           run_id,trace_number,semantic_tick+1,event_kind,action_path,comment_snapshot,
+           digest(convert_to('duplicate-comment-event','UTF8'),'sha256'),semantic_state_hash,
+           digest(convert_to('duplicate-comment-state','UTF8'),'sha256')
+         FROM native_comment_events WHERE project_id=$1 AND comment_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(root_id)
+    .execute(&mut *duplicate_event)
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "one CommentId cannot have a second commentPosted tick"
+    );
+    duplicate_event
+        .rollback()
+        .await
+        .expect("rollback duplicate commentPosted attack");
+
+    let gates = sqlx::query_as::<_, (i64, String, i32, i64, i64)>(
+        "SELECT gate.trace_number,gate.comment_mode,jsonb_array_length(gate.comment_records),
+           (SELECT count(*) FROM agent_r541_exact_comment_certificates exact
+             WHERE exact.trace_number=gate.trace_number),
+           (SELECT count(*) FROM agent_r541_typed_exact_comment_records exact
+             WHERE exact.trace_number=gate.trace_number)
+         FROM agent_r541_comment_surface_gates gate
+         WHERE gate.project_id=$1 AND gate.run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(first_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact first-run comment gate");
+    assert!(gates.0 > 0);
+    assert_eq!(
+        (gates.1.as_str(), gates.2, gates.3, gates.4),
+        ("enabled", 7, 1, 7)
+    );
+
+    let allocations_before_equivocation = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_run_semantic_tick_allocations
+         WHERE project_id=$1 AND run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(first_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count semantic allocations before Comment equivocation");
+    let mut equivocated = root_body;
+    equivocated["encrypted_payload"] = payload(9);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/projects/{}/agent-runs/{first_run}/claims/{first_claim}/comments",
+                    fixture.project_id
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {}", first_runner.bearer))
+                .body(Body::from(equivocated.to_string()))
+                .expect("reject comment equivocation"),
+        )
+        .await
+        .expect("reject comment equivocation response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let allocations_after_equivocation = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_run_semantic_tick_allocations
+         WHERE project_id=$1 AND run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(first_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count semantic allocations after Comment equivocation");
+    assert_eq!(
+        allocations_after_equivocation,
+        allocations_before_equivocation
+    );
+
+    let comment_retention_state = |pool: PgPool, project_id: Uuid| async move {
+        sqlx::query_as::<_, (i64, i64, i64, i64, i64, String)>(
+            "SELECT
+               (SELECT count(*) FROM native_comments
+                 WHERE project_id=$1 AND encrypted_payload IS NOT NULL),
+               (SELECT count(*) FROM agent_r541_typed_exact_comment_records
+                 WHERE project_id=$1),
+               (SELECT count(*) FROM agent_r541_comment_records WHERE project_id=$1),
+               (SELECT count(*) FROM agent_r541_comment_inventory WHERE project_id=$1),
+               (SELECT count(*) FROM agent_r541_comment_certificates WHERE project_id=$1),
+               encode(digest(convert_to(concat_ws(E'\\n',
+                 COALESCE((SELECT jsonb_agg(to_jsonb(comment)-'encrypted_payload'
+                   -'payload_purged_at'-'recorded_at' ORDER BY comment.id)::text
+                   FROM native_comments comment WHERE comment.project_id=$1),'[]'),
+                 COALESCE((SELECT jsonb_agg(to_jsonb(event)-'recorded_at'
+                   ORDER BY event.project_ordinal)::text FROM native_comment_events event
+                   WHERE event.project_id=$1),'[]'),
+                 COALESCE((SELECT jsonb_agg(to_jsonb(record)-'recorded_at'
+                   ORDER BY record.trace_number,record.semantic_tick,record.id)::text
+                   FROM agent_r541_comment_records record WHERE record.project_id=$1),'[]'),
+                 COALESCE((SELECT jsonb_agg(to_jsonb(inventory)-'recorded_at'
+                   ORDER BY inventory.trace_number,inventory.ordinal)::text
+                   FROM agent_r541_comment_inventory inventory WHERE inventory.project_id=$1),'[]'),
+                 COALESCE((SELECT jsonb_agg(to_jsonb(certificate)-'recorded_at'
+                   ORDER BY certificate.trace_number,certificate.version)::text
+                   FROM agent_r541_comment_certificates certificate
+                   WHERE certificate.project_id=$1),'[]')),'UTF8'),'sha256'),'hex')",
+        )
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot immutable Comment structure")
+    };
+    let before_retention = comment_retention_state(fixture.pool.clone(), fixture.project_id).await;
+    assert_eq!(before_retention.0, 8);
+    assert_eq!(before_retention.1, 8);
+    assert_eq!(before_retention.2, 8);
+    assert_eq!(before_retention.3, 8);
+    assert!(before_retention.4 >= 2);
+
+    purge_resource_through_retention(&fixture, fixture.profile_resource_id, fixture.owner_id).await;
+
+    let after_retention = comment_retention_state(fixture.pool.clone(), fixture.project_id).await;
+    assert_eq!(after_retention.0, 0);
+    assert_eq!(after_retention.1, 0);
+    assert_eq!(after_retention.2, before_retention.2);
+    assert_eq!(after_retention.3, before_retention.3);
+    assert_eq!(after_retention.4, before_retention.4);
+    assert_eq!(after_retention.5, before_retention.5);
+    let retained_gate = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT count(*),
+           count(*) FILTER (WHERE comment_mode='disabled_fail_closed'
+             AND comment_records='[]'::jsonb),
+           (SELECT count(*) FROM agent_r541_comment_surface_records
+             WHERE project_id=$1 AND run_id=$2)
+         FROM agent_r541_comment_surface_gates
+         WHERE project_id=$1 AND run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(first_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load fail-closed Comment gate after payload retention");
+    assert_eq!(retained_gate, (1, 1, 0));
+    let retained_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/projects/{}/resources/{}/comments",
+                    fixture.project_id, fixture.profile_resource_id
+                ))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .body(Body::empty())
+                .expect("read purged Comment payload"),
+        )
+        .await
+        .expect("read purged Comment response");
+    assert_eq!(retained_read.status(), StatusCode::OK);
+    assert_eq!(json_body(retained_read).await["comments"], json!([]));
+}
+
 fn token(identity_id: Uuid, session_id: Uuid) -> String {
     format!("v1.{identity_id}.{session_id}.{}", "a".repeat(64))
 }
@@ -1371,6 +2085,96 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
         (json!([]), json!([]))
     );
 
+    // Consume more than twenty logical events without waiting for the wall
+    // clock.  Comment is a native Event on the same run timeline and therefore
+    // exercises the real allocator rather than a test-only counter.
+    let mut comment_permission = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin rapid Comment grant");
+    sqlx::query("SET LOCAL row_security=off")
+        .execute(&mut *comment_permission)
+        .await
+        .expect("disable RLS for rapid Comment grant fixture");
+    sqlx::query(
+        "SELECT sprout_private.grant_hierarchical_permission(
+           $1,$2,$3,'edit','full','restricted',$4,$3)",
+    )
+    .bind(fixture.project_id)
+    .bind(fixture.profile_resource_id)
+    .bind(fixture.owner_id)
+    .bind(Uuid::new_v4())
+    .execute(&mut *comment_permission)
+    .await
+    .expect("grant rapid Comment capability");
+    comment_permission
+        .commit()
+        .await
+        .expect("commit rapid Comment grant");
+    let rapid_wall_start = Utc::now();
+    for ordinal in 0_u8..20 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/projects/{}/comments", fixture.project_id))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {}", fixture.owner_token))
+                    .body(Body::from(
+                        json!({
+                            "recipient_id":provisioned.principal_identity_id,
+                            "target_id":fixture.profile_resource_id,
+                            "parent_id":null,
+                            "encrypted_payload":{
+                                "version":1,
+                                "algorithm":"aes-256-gcm",
+                                "key_id":format!("rapid-comment-{ordinal}"),
+                                "nonce_b64":STANDARD.encode([ordinal;12]),
+                                "ciphertext_b64":STANDARD.encode([ordinal,ordinal.wrapping_add(1)])
+                            },
+                            "key_epoch":1,
+                            "idempotency_key":Uuid::new_v4(),
+                            "run_id":run_id
+                        })
+                        .to_string(),
+                    ))
+                    .expect("post rapid canonical Comment"),
+            )
+            .await
+            .expect("post rapid canonical Comment response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            json_body(response).await
+        );
+    }
+    let rapid_wall_end = Utc::now();
+    let rapid_clock =
+        sqlx::query_as::<_, (i64, i64, i64, chrono::DateTime<Utc>, chrono::DateTime<Utc>)>(
+            "SELECT count(*),count(DISTINCT allocation.semantic_tick),
+                max(allocation.semantic_tick)-min(allocation.semantic_tick),
+                min(comment.recorded_at),max(comment.recorded_at)
+         FROM agent_run_semantic_tick_allocations allocation
+         JOIN native_comment_events event
+           ON event.project_id=allocation.project_id AND event.run_id=allocation.run_id
+          AND event.id=allocation.event_key
+         JOIN native_comments comment
+           ON comment.project_id=event.project_id AND comment.id=event.comment_id
+         WHERE allocation.project_id=$1 AND allocation.run_id=$2
+           AND allocation.event_kind='comment_posted'",
+        )
+        .bind(fixture.project_id)
+        .bind(run_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("verify rapid canonical event clock");
+    assert_eq!((rapid_clock.0, rapid_clock.1, rapid_clock.2), (20, 20, 19));
+    assert!(rapid_clock.3 >= rapid_wall_start - ChronoDuration::seconds(1));
+    assert!(rapid_clock.4 <= rapid_wall_end + ChronoDuration::seconds(1));
+
     let claim = app
         .clone()
         .oneshot(
@@ -1504,21 +2308,36 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
         "{}",
         json_body(invoke).await
     );
-    let (acquired_tick, requested_tick, expires_tick) = sqlx::query_as::<_, (i64, i64, i64)>(
-        "SELECT extract(epoch FROM claim.acquired_at)::bigint,
+    let (acquired_tick, requested_tick, expires_tick, requested_at, database_now, deadline_at) =
+        sqlx::query_as::<
+            _,
+            (
+                i64,
+                i64,
+                i64,
+                chrono::DateTime<Utc>,
+                chrono::DateTime<Utc>,
+                chrono::DateTime<Utc>,
+            ),
+        >(
+            "SELECT claim.acquired_semantic_tick,
                     call.requested_tick,
-                    extract(epoch FROM claim.expires_at)::bigint
+                    claim.expires_semantic_tick,
+                    call.requested_at, clock_timestamp(), call.tool_deadline_at
              FROM agent_tool_calls call
              JOIN agent_run_claim_leases claim
                ON claim.project_id=call.project_id AND claim.id=call.work_claim_id
              WHERE call.project_id=$1 AND call.id=$2",
-    )
-    .bind(fixture.project_id)
-    .bind(call_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("load exact requestedAt coordinates");
+        )
+        .bind(fixture.project_id)
+        .bind(call_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("load exact requestedAt coordinates");
     assert!(acquired_tick < requested_tick && requested_tick < expires_tick);
+    assert!(requested_at <= database_now);
+    assert!(database_now - requested_at < ChronoDuration::seconds(5));
+    assert_eq!(deadline_at - requested_at, ChronoDuration::seconds(3));
 
     let replay = app
         .clone()
@@ -2028,12 +2847,93 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
     .expect("load ToolCall after late attempt-one rejection");
     assert_eq!(still_retry, ("pending".into(), 2, retry_claim_id));
 
+    let retry_clock =
+        sqlx::query_as::<_, (i64, i64, chrono::DateTime<Utc>, chrono::DateTime<Utc>, i64)>(
+            "SELECT binding.requested_tick,binding.tool_deadline_tick,
+                binding.requested_at,binding.tool_deadline_at,cursor.allocation_count
+         FROM agent_tool_attempt_clock_bindings binding
+         JOIN agent_run_semantic_tick_cursors cursor
+           ON cursor.project_id=binding.project_id AND cursor.run_id=binding.run_id
+         WHERE binding.project_id=$1 AND binding.call_id=$2 AND binding.attempt=2",
+        )
+        .bind(fixture.project_id)
+        .bind(call_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("load retry semantic and operational deadlines");
+    assert_eq!(retry_clock.1 - retry_clock.0, 3);
+    assert_eq!(retry_clock.3 - retry_clock.2, ChronoDuration::seconds(3));
+
+    // Pressure the same run with far more events than the remaining semantic
+    // budget. Exactly the slots before the deadline may commit; every later
+    // request rolls back its allocation until the trusted timeout worker
+    // consumes the terminal slot.
+    let mut rapid_successes = 0_i64;
+    let mut rapid_conflicts = 0_i64;
+    for ordinal in 20_u8..41 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/projects/{}/comments", fixture.project_id))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {}", fixture.owner_token))
+                    .body(Body::from(
+                        json!({
+                            "recipient_id":provisioned.principal_identity_id,
+                            "target_id":fixture.profile_resource_id,
+                            "parent_id":null,
+                            "encrypted_payload":{
+                                "version":1,
+                                "algorithm":"aes-256-gcm",
+                                "key_id":format!("pending-tool-pressure-{ordinal}"),
+                                "nonce_b64":STANDARD.encode([ordinal;12]),
+                                "ciphertext_b64":STANDARD.encode([ordinal,ordinal.wrapping_add(1)])
+                            },
+                            "key_epoch":1,
+                            "idempotency_key":Uuid::new_v4(),
+                            "run_id":run_id
+                        })
+                        .to_string(),
+                    ))
+                    .expect("pressure pending ToolCall with canonical Comment"),
+            )
+            .await
+            .expect("pending ToolCall pressure response");
+        match response.status() {
+            StatusCode::OK => rapid_successes += 1,
+            StatusCode::CONFLICT => rapid_conflicts += 1,
+            status => panic!("unexpected semantic deadline fence response: {status}"),
+        }
+    }
+    assert_eq!((rapid_successes, rapid_conflicts), (2, 19));
+    let fenced = sqlx::query_as::<_, (String, i64, i64, i64)>(
+        "SELECT call.current_status,cursor.last_tick,binding.tool_deadline_tick,
+                cursor.allocation_count
+         FROM agent_tool_calls call
+         JOIN agent_tool_attempt_clock_bindings binding
+           ON binding.project_id=call.project_id AND binding.call_id=call.id
+          AND binding.attempt=call.current_attempt
+         JOIN agent_run_semantic_tick_cursors cursor
+           ON cursor.project_id=call.project_id AND cursor.run_id=call.run_id
+         WHERE call.project_id=$1 AND call.id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(call_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify pending semantic timeout fence");
+    assert_eq!(fenced.0, "pending");
+    assert_eq!(fenced.1, fenced.2 - 1);
+    assert_eq!(fenced.3, retry_clock.4 + rapid_successes);
+
     // The retry attempt is already pending even though the edge never claims
     // a dispatch. Its ToolCall deadline, not claim recovery, terminalizes the
     // exact attempt and preserves both historical outcomes.
     tokio::time::sleep(Duration::from_secs(4)).await;
     run_agent_completion_once(&fixture, config.clone()).await;
-    let timed_out = sqlx::query_as::<_, (String, i32, String, i32, i64, i64)>(
+    let timed_out = sqlx::query_as::<_, (String, i32, String, i32, i64, i64, i64)>(
         "SELECT call.current_status, call.current_attempt,
                 transition.state_snapshot #>> ARRAY['work_items', call.work_item_id::text, 'status'],
                 (transition.state_snapshot #>> ARRAY['work_items', call.work_item_id::text, 'attempt'])::integer,
@@ -2042,7 +2942,8 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
                     AND history.work_item_id=call.work_item_id),
                 (SELECT count(*) FROM agent_tool_attempt_dispatches dispatch
                   WHERE dispatch.project_id=call.project_id AND dispatch.call_id=call.id
-                    AND dispatch.attempt=2)
+                    AND dispatch.attempt=2),
+                transition.semantic_tick
          FROM agent_tool_calls call
          JOIN agent_run_external_tool_work_outcomes outcome
            ON outcome.project_id=call.project_id AND outcome.run_id=call.run_id
@@ -2056,7 +2957,18 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
     .fetch_one(&fixture.pool)
     .await
     .expect("load exact no-dispatch server timeout");
-    assert_eq!(timed_out, ("timed_out".into(), 2, "failed".into(), 2, 2, 0));
+    assert_eq!(
+        timed_out,
+        (
+            "timed_out".into(),
+            2,
+            "failed".into(),
+            2,
+            2,
+            0,
+            retry_clock.1
+        )
+    );
 
     // Attempt 3 reaches dispatch but no outbound request. Timeout retains the
     // dispatch provenance and does not invent a request witness.
@@ -2225,6 +3137,43 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
     .expect("count exact append-only attempt records");
     assert_eq!(exact_counts, (1, 3, 2, 4));
 
+    let tool_timeline = sqlx::query_as::<_, (i64, i64, i64, i64, bool, i64)>(
+        "SELECT
+           (SELECT count(*) FROM agent_run_transitions
+             WHERE project_id=$1 AND run_id=$2),
+           (SELECT count(DISTINCT semantic_tick) FROM agent_run_transitions
+             WHERE project_id=$1 AND run_id=$2),
+           (SELECT count(*) FROM agent_run_semantic_tick_allocations
+             WHERE project_id=$1 AND run_id=$2),
+           (SELECT count(DISTINCT semantic_tick) FROM agent_run_semantic_tick_allocations
+             WHERE project_id=$1 AND run_id=$2),
+           EXISTS (SELECT 1 FROM agent_run_exact_semantic_timelines
+             WHERE project_id=$1 AND run_id=$2),
+           (SELECT count(*) FROM agent_run_transitions transition
+             WHERE transition.project_id=$1 AND transition.run_id=$2
+               AND transition.transition_kind <> 'initialized'
+               AND NOT EXISTS (
+                 SELECT 1 FROM agent_run_semantic_tick_allocations allocation
+                 WHERE allocation.project_id=transition.project_id
+                   AND allocation.run_id=transition.run_id
+                   AND allocation.semantic_tick=transition.semantic_tick))",
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify canonical tool-run semantic timeline");
+    assert_eq!(tool_timeline.0, tool_timeline.1);
+    assert_eq!(tool_timeline.2, tool_timeline.3);
+    assert!(
+        tool_timeline.4,
+        "cross-family semantic timeline must be exact"
+    );
+    assert_eq!(
+        tool_timeline.5, 0,
+        "every post-init transition is allocated"
+    );
+
     // R5.40 tool-cluster projection: one server-owned run trace, four exact
     // WorkAttempts, pending+terminal ToolEvents per attempt, and four exact
     // WorkOutcomes. The latest certificate stores the same ordered lists that
@@ -2314,6 +3263,64 @@ async fn governed_external_tool_attempts_preserve_historical_terminal_and_retry_
     assert_eq!(
         projected_surface_counts,
         (8, 4, "enabled".into(), "enabled".into())
+    );
+
+    // The 0035 release inventory must independently reconstruct the complete
+    // typed tool cluster before retention removes any operational payload or
+    // provenance.  A non-empty operational ledger with an empty exact view is
+    // not a certificate.
+    let release_exactness =
+        sqlx::query_as::<_, (i64, i64, i64, i64, i64, String, String, i32, i32, bool)>(
+            "SELECT
+           (SELECT count(*) FROM agent_r540_release_events
+             WHERE project_id=$1 AND run_id=$2),
+           (SELECT count(*) FROM agent_r540_typed_exact_release_events
+             WHERE project_id=$1 AND run_id=$2),
+           (SELECT count(*) FROM agent_r540_release_inventory inventory
+             JOIN agent_r541_release_roots root USING (trace_number,project_id)
+             WHERE root.project_id=$1 AND root.run_id=$2),
+           (SELECT count(*) FROM agent_r540_release_certificates certificate
+             JOIN agent_r541_release_roots root USING (trace_number,project_id)
+             WHERE root.project_id=$1 AND root.run_id=$2),
+           (SELECT count(*) FROM agent_r540_exact_release_trace_certificates certificate
+             JOIN agent_r541_release_roots root USING (trace_number,project_id)
+             WHERE root.project_id=$1 AND root.run_id=$2),
+           tool_mode,outcome_mode,
+           jsonb_array_length(tool_records),jsonb_array_length(outcome_records),
+           blocker_mode='disabled_fail_closed'
+             AND causal_mode='enabled'
+             AND evidence_mode='disabled_fail_closed'
+             AND disclosure_mode='disabled_fail_closed'
+             AND model_mode='disabled_fail_closed'
+             AND interrogation_mode='disabled_fail_closed'
+             AND blocker_records='[]'::jsonb
+             AND jsonb_array_length(causal_records)=1
+             AND evidence_records='[]'::jsonb
+             AND disclosure_records='[]'::jsonb
+             AND model_records='[]'::jsonb
+             AND interrogation_records='[]'::jsonb
+         FROM agent_r541_release_trace_surface_gates
+         WHERE project_id=$1 AND run_id=$2",
+        )
+        .bind(fixture.project_id)
+        .bind(run_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("load full typed-exact 0035 tool-cluster inventory before retention");
+    assert_eq!(release_exactness.0, 17);
+    assert_eq!(release_exactness.1, release_exactness.0);
+    assert_eq!(release_exactness.2, release_exactness.0);
+    assert_eq!(release_exactness.3, 17);
+    assert_eq!(release_exactness.4, 1);
+    assert_eq!(
+        (
+            release_exactness.5.as_str(),
+            release_exactness.6.as_str(),
+            release_exactness.7,
+            release_exactness.8,
+            release_exactness.9,
+        ),
+        ("enabled", "enabled", 8, 4, true)
     );
 
     let timeout_shapes = sqlx::query_as::<_, (i64, i64, i64)>(

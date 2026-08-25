@@ -2,6 +2,7 @@ pub(crate) mod agent_runs;
 pub(crate) mod agent_tools;
 mod agents;
 mod assignments;
+mod comments;
 mod dev_auth;
 mod device_keys;
 mod domain;
@@ -190,6 +191,18 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         .route(
             "/v1/projects/{project_id}/agent-runs/{run_id}/blockers/{blocker_id}/resolve",
             post(agent_runs::resolve_blocker),
+        )
+        .route(
+            "/v1/projects/{project_id}/comments",
+            post(comments::post_human),
+        )
+        .route(
+            "/v1/projects/{project_id}/resources/{target_id}/comments",
+            get(comments::list),
+        )
+        .route(
+            "/v1/projects/{project_id}/agent-runs/{run_id}/claims/{claim_id}/comments",
+            post(comments::post_agent),
         )
         .route("/v1/agent-tools/catalog", get(agent_tools::catalog))
         .route(

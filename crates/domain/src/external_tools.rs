@@ -26,6 +26,29 @@ pub const MAIL_SEND_TOOL: &str = "mail.send";
 pub const TELEGRAM_RECEIVE_TOOL: &str = "telegram.receive";
 pub const TELEGRAM_SEND_TOOL: &str = "telegram.send";
 
+/// Formal timeout fence for one pending attempt on the collision-free run
+/// timeline. Operational wall-clock expiry is an independent upper bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingToolSemanticDeadline {
+    pub requested_tick: u64,
+    pub timeout_ticks: u32,
+}
+
+impl PendingToolSemanticDeadline {
+    pub fn deadline(self) -> u64 {
+        self.requested_tick
+            .saturating_add(u64::from(self.timeout_ticks))
+    }
+
+    pub fn allows_competing_event_after(self, current_tick: u64) -> bool {
+        current_tick.saturating_add(1) < self.deadline()
+    }
+
+    pub fn accepts_terminal_tick(self, terminal_tick: u64) -> bool {
+        self.requested_tick <= terminal_tick && terminal_tick <= self.deadline()
+    }
+}
+
 /// Concrete scope of the additive 0034 projection. Lean R5.40 uses one trace
 /// per run; retries are distinct events in this same positive trace.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -1587,5 +1610,22 @@ mod tests {
             }),
             Err(ExternalToolValidationError::AuthorityMismatch)
         );
+    }
+
+    #[test]
+    fn pending_tool_semantic_deadline_fences_dense_unrelated_events() {
+        let deadline = PendingToolSemanticDeadline {
+            requested_tick: 100,
+            timeout_ticks: 3,
+        };
+        assert_eq!(deadline.deadline(), 103);
+        assert!(deadline.allows_competing_event_after(100));
+        assert!(deadline.allows_competing_event_after(101));
+        assert!(!deadline.allows_competing_event_after(102));
+        for attempted in 103..=123 {
+            assert!(!deadline.allows_competing_event_after(attempted - 1));
+        }
+        assert!(deadline.accepts_terminal_tick(103));
+        assert!(!deadline.accepts_terminal_tick(104));
     }
 }

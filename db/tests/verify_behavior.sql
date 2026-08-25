@@ -4709,10 +4709,21 @@ $tool_permission_versions$;
 -- operational 0033 audit row into the formal tool surface.
 DO $tool_trace_legacy_fail_closed$
 BEGIN
-    IF EXISTS (SELECT 1 FROM agent_r540_tool_trace_roots)
-       OR EXISTS (SELECT 1 FROM agent_r540_tool_trace_inventory)
-       OR EXISTS (SELECT 1 FROM agent_r540_tool_trace_certificates)
-       OR EXISTS (SELECT 1 FROM agent_r541_tool_surface_records) THEN
+    IF EXISTS (
+        SELECT 1 FROM agent_r540_tool_trace_roots
+        WHERE project_id = '30000000-0000-0000-0000-000000000001'
+    ) OR EXISTS (
+        SELECT 1 FROM agent_r540_tool_trace_inventory inventory
+        JOIN agent_r540_tool_trace_roots root
+          ON root.trace_number = inventory.trace_number
+        WHERE root.project_id = '30000000-0000-0000-0000-000000000001'
+    ) OR EXISTS (
+        SELECT 1 FROM agent_r540_tool_trace_certificates
+        WHERE project_id = '30000000-0000-0000-0000-000000000001'
+    ) OR EXISTS (
+        SELECT 1 FROM agent_r541_tool_surface_records
+        WHERE project_id = '30000000-0000-0000-0000-000000000001'
+    ) THEN
         RAISE EXCEPTION 'R5.0034 synthesized a trace/certificate for legacy fixtures';
     END IF;
 END;

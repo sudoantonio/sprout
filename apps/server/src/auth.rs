@@ -242,6 +242,19 @@ fn agent_request_allowed(method: &Method, path: &str) -> bool {
             )
             | (
                 &Method::POST,
+                [
+                    "v1",
+                    "projects",
+                    _,
+                    "agent-runs",
+                    _,
+                    "claims",
+                    _,
+                    "comments"
+                ]
+            )
+            | (
+                &Method::POST,
                 ["v1", "projects", _, "agent-runs", _, "evidence"]
             )
             | (

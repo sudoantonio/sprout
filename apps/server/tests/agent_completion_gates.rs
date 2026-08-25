@@ -462,6 +462,70 @@ async fn insert_local_goal(fixture: &Fixture, agent: &AgentFixture, contract: Va
         .iter()
         .map(|spec| spec["id"].clone())
         .collect::<Vec<_>>();
+    let requirements = contract["work_specs"]
+        .as_array()
+        .expect("work specs")
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            json!({
+                "id": u64::try_from(index + 1).expect("requirement id"),
+                "scope": fixture.scope_resource_id,
+                "required_actions": spec["allowed_actions"],
+                "required_tools": [],
+                "required_for_completion": true
+            })
+        })
+        .collect::<Vec<_>>();
+    let bindings = contract["work_specs"]
+        .as_array()
+        .expect("work specs")
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            json!({
+                "requirement_id": u64::try_from(index + 1).expect("requirement id"),
+                "obligation": spec["obligation"],
+                "work_spec_id": spec["id"]
+            })
+        })
+        .collect::<Vec<_>>();
+    let security_policies = contract["work_specs"]
+        .as_array()
+        .expect("work specs")
+        .iter()
+        .map(|spec| {
+            let allowed_operations = spec["allowed_actions"]
+                .as_array()
+                .expect("allowed actions")
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|action| match action {
+                    "create_task"
+                    | "replace_own_task"
+                    | "delete_own_task"
+                    | "append_assigned_note"
+                    | "add_assigned_attachment" => Some("write"),
+                    "assign_own_task" | "unassign_own_task" => Some("delegate_assigned_work"),
+                    "mark_assigned_done" => Some("complete_assigned_task"),
+                    "post_comment" => Some("post_comment"),
+                    "invoke_tool" | "retry_tool" => None,
+                    unsupported => panic!("unsupported fixture action {unsupported}"),
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "work_spec_id": spec["id"],
+                "allowed_operations": allowed_operations,
+                "allowed_tools": []
+            })
+        })
+        .collect::<Vec<_>>();
+    let compiler_output = json!({
+        "contract": contract,
+        "requirements": requirements,
+        "bindings": bindings,
+        "security_policies": security_policies
+    });
     let local = json!({
         "id": local_goal_id,
         "revision": 1,
@@ -479,6 +543,7 @@ async fn insert_local_goal(fixture: &Fixture, agent: &AgentFixture, contract: Va
         "supersedes_revision": null
     });
     let contract_hash = Sha256::digest(local.to_string().as_bytes()).to_vec();
+    let compiler_output_hash = Sha256::digest(compiler_output.to_string().as_bytes()).to_vec();
     let classifier_output_hash = Sha256::digest(
         serde_json::to_vec(&local["clauses"]).expect("serialize fixture classifier output"),
     )
@@ -539,8 +604,8 @@ async fn insert_local_goal(fixture: &Fixture, agent: &AgentFixture, contract: Va
     .bind(draft_id)
     .bind(agent.identity_id)
     .bind(&contract_hash)
-    .bind(&local)
-    .bind(&contract_hash)
+    .bind(&compiler_output)
+    .bind(&compiler_output_hash)
     .bind(idempotency_key)
     .bind(&classifier_output_hash)
     .bind(authorization_id)
@@ -728,7 +793,11 @@ struct ProductTask {
     assignment_id: Uuid,
 }
 
-async fn create_open_task(fixture: &Fixture, assignee: &AgentFixture) -> ProductTask {
+async fn create_open_task(
+    fixture: &Fixture,
+    assignee_identity_id: Uuid,
+    assigned: bool,
+) -> ProductTask {
     let task_list_resource_id = Uuid::new_v4();
     let task_list_id = Uuid::new_v4();
     let task_resource_id = Uuid::new_v4();
@@ -788,23 +857,25 @@ async fn create_open_task(fixture: &Fixture, assignee: &AgentFixture) -> Product
     .execute(&mut *transaction)
     .await
     .expect("insert task");
-    sqlx::query(
-        r#"
-        INSERT INTO task_assignments (
-            id, project_id, task_id, assignee_identity_id,
-            assigned_by_identity_id, encrypted_payload, permission_root_grant_id
-        ) VALUES ($1, $2, $3, $4, $5, decode('03', 'hex'), $6)
-        "#,
-    )
-    .bind(assignment_id)
-    .bind(fixture.project_id)
-    .bind(task_id)
-    .bind(assignee.identity_id)
-    .bind(fixture.owner_id)
-    .bind(Uuid::new_v4())
-    .execute(&mut *transaction)
-    .await
-    .expect("insert task assignment");
+    if assigned {
+        sqlx::query(
+            r#"
+            INSERT INTO task_assignments (
+                id, project_id, task_id, assignee_identity_id,
+                assigned_by_identity_id, encrypted_payload, permission_root_grant_id
+            ) VALUES ($1, $2, $3, $4, $5, decode('03', 'hex'), $6)
+            "#,
+        )
+        .bind(assignment_id)
+        .bind(fixture.project_id)
+        .bind(task_id)
+        .bind(assignee_identity_id)
+        .bind(fixture.owner_id)
+        .bind(Uuid::new_v4())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert task assignment");
+    }
     transaction.commit().await.expect("commit product task");
     ProductTask {
         task_id,
@@ -815,7 +886,7 @@ async fn create_open_task(fixture: &Fixture, assignee: &AgentFixture) -> Product
 
 async fn complete_task_event(
     fixture: &Fixture,
-    assignee: &AgentFixture,
+    assignee_identity_id: Uuid,
     task: &ProductTask,
 ) -> Uuid {
     let completion_id = Uuid::new_v4();
@@ -847,7 +918,7 @@ async fn complete_task_event(
     .bind(fixture.project_id)
     .bind(task.task_id)
     .bind(task.assignment_id)
-    .bind(assignee.identity_id)
+    .bind(assignee_identity_id)
     .bind(Uuid::new_v4())
     .bind(observed_at)
     .execute(&mut *transaction)
@@ -863,7 +934,7 @@ async fn complete_task_event(
     )
     .bind(fixture.project_id)
     .bind(task.task_id)
-    .bind(assignee.identity_id)
+    .bind(assignee_identity_id)
     .bind(observed_at)
     .execute(&mut *transaction)
     .await
@@ -1032,8 +1103,8 @@ async fn assert_global_task_materialization_without_grounding_fails_closed(
 async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
     let fixture = fixture().await;
     let agent = &fixture.agents[0];
-    let bound_task = create_open_task(&fixture, agent).await;
-    let unrelated_task = create_open_task(&fixture, agent).await;
+    let bound_task = create_open_task(&fixture, agent.identity_id, true).await;
+    let unrelated_task = create_open_task(&fixture, agent.identity_id, true).await;
     let obligation = Uuid::new_v4();
     let mut contract = goal_contract(
         fixture.scope_resource_id,
@@ -1081,6 +1152,34 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
 
     let app = app(&fixture, Duration::from_secs(300));
     let (run_id, _) = create_run(&app, &fixture, "local_goal", local_goal_id).await;
+    let trace_number = sqlx::query_scalar::<_, i64>(
+        "SELECT trace_number FROM agent_r541_release_roots
+         WHERE project_id=$1 AND run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load 0035 release trace");
+    let premature_root = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT sprout_private.issue_agent_r541_formal_release($1)",
+    )
+    .bind(trace_number)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("incomplete root fails closed");
+    assert_eq!(premature_root, None);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_r541_formal_release_certificates
+             WHERE trace_number=$1",
+        )
+        .bind(trace_number)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count premature root residue"),
+        0
+    );
     let work_claim = claim(&app, &fixture, run_id, agent).await;
     let claim_id: Uuid = work_claim["id"]
         .as_str()
@@ -1093,7 +1192,8 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
         .parse()
         .expect("work UUID");
 
-    let unrelated_completion = complete_task_event(&fixture, agent, &unrelated_task).await;
+    let unrelated_completion =
+        complete_task_event(&fixture, agent.identity_id, &unrelated_task).await;
     let (status, _) = succeed(
         &app,
         &fixture,
@@ -1301,10 +1401,13 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
 
     let effect_id = Uuid::new_v4();
     let completion_id = Uuid::new_v4();
+    let evidence_id = Uuid::new_v4();
     let idempotency_key = Uuid::new_v4();
     let body = json!({
         "effect_id": effect_id,
         "completion_id": completion_id,
+        "evidence_id": evidence_id,
+        "evidence_rule_id": 1,
         "expected_payload_version": 1,
         "encrypted_completion": {
             "version": 1,
@@ -1336,6 +1439,11 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
     assert_eq!(
         materialized["state"]["work_items"][work_item_id.to_string()]["status"],
         "succeeded"
+    );
+    assert_eq!(
+        materialized["state"]["obligations"][obligation.to_string()]["status"],
+        "discharged",
+        "0035-native task materialization must close mechanical evidence atomically"
     );
     let causal_links = materialized["state"]["causal_links"]
         .as_array()
@@ -1469,21 +1577,71 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
         ),
         &agent.token,
         json!({
-            "id": Uuid::new_v4(),
+            "id": evidence_id,
             "rule_id": 1,
             "work_item_id": work_item_id,
             "source": { "kind": "task_completion", "id": completion_id }
         }),
     )
     .await;
+    assert_eq!(status, StatusCode::CONFLICT, "evidence replay: {evidenced}");
+
+    let evidence_projection = sqlx::query_as::<_, (Value, String, i32, i64, i64, i64, i64)>(
+        "SELECT exact.formal_record, gate.evidence_mode,
+                jsonb_array_length(gate.evidence_records),
+                (SELECT count(*) FROM agent_r540_typed_exact_release_events candidate
+                  WHERE candidate.project_id=$1 AND candidate.run_id=$2),
+                (SELECT count(*) FROM agent_r540_release_inventory inventory
+                  JOIN agent_r541_release_roots root USING (trace_number,project_id)
+                  WHERE root.project_id=$1 AND root.run_id=$2),
+                (SELECT count(*) FROM agent_r540_exact_release_trace_certificates certificate
+                  JOIN agent_r541_release_roots root USING (trace_number,project_id)
+                  WHERE root.project_id=$1 AND root.run_id=$2),
+                (SELECT semantic_tick FROM agent_r540_typed_exact_release_events outcome
+                  WHERE outcome.project_id=$1 AND outcome.run_id=$2
+                    AND outcome.event_kind='work_outcome'
+                    AND outcome.formal_record->>'work'=$4::text
+                    AND outcome.formal_record->>'claim'=$5::text
+                    AND (outcome.formal_record->>'attempt')::integer=1)
+         FROM agent_r540_typed_exact_release_events exact
+         JOIN agent_r541_release_trace_surface_gates gate
+           ON gate.project_id=exact.project_id AND gate.run_id=exact.run_id
+         WHERE exact.project_id=$1 AND exact.run_id=$2
+           AND exact.event_kind='evidence' AND exact.source_record_id=$3",
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .bind(evidence_id)
+    .bind(work_item_id)
+    .bind(claim_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact typed R540 Evidence projection");
+    assert_eq!(evidence_projection.0["work"], work_item_id.to_string());
+    assert_eq!(evidence_projection.0["claim"], claim_id.to_string());
+    assert_eq!(evidence_projection.0["attempt"], 1);
     assert_eq!(
-        status,
-        StatusCode::OK,
-        "accept causal evidence: {evidenced}"
+        evidence_projection.0["evidence"]["id"],
+        evidence_id.to_string()
     );
     assert_eq!(
-        evidenced["state"]["obligations"][obligation.to_string()]["status"],
-        "discharged"
+        evidence_projection.0["evidence"]["subject"],
+        json!({"kind":"task","task":bound_task.resource_id})
+    );
+    assert_eq!(
+        evidence_projection.0["evidence"]["observed_at"],
+        evidence_projection.6
+    );
+    assert!(evidence_projection.6 <= evidence_projection.0["accepted_at"].as_i64().unwrap());
+    assert_eq!(
+        (
+            evidence_projection.1.as_str(),
+            evidence_projection.2,
+            evidence_projection.3,
+            evidence_projection.4,
+            evidence_projection.5,
+        ),
+        ("enabled", 1, 5, 5, 1)
     );
 
     let effect = sqlx::query(
@@ -1548,6 +1706,157 @@ async fn generic_task_effect_binds_exact_work_claim_and_mechanical_evidence() {
                 .try_get::<chrono::DateTime<chrono::Utc>, _>("expires_at")
                 .unwrap(),
         "accepted effect must be strictly before claim expiry"
+    );
+
+    let (status, completed) = request_json(
+        app,
+        Method::POST,
+        format!(
+            "/v1/projects/{}/agent-runs/{run_id}/complete",
+            fixture.project_id
+        ),
+        &fixture.owner_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "complete exact release run: {completed}"
+    );
+    let mut secure_kernel_fields = Vec::new();
+    for (source, statement) in [
+        (
+            "agent_r541_collaborative_kernel_field_sources",
+            "SELECT count(*) FROM agent_r541_collaborative_kernel_field_sources WHERE trace_number=$1",
+        ),
+        (
+            "agent_r541_scheduler_kernel_field_sources",
+            "SELECT count(*) FROM agent_r541_scheduler_kernel_field_sources WHERE trace_number=$1",
+        ),
+        (
+            "progress kernel field projector",
+            "SELECT count(*) FROM sprout_private.reconstruct_agent_r541_progress_kernel_fields($1)",
+        ),
+        (
+            "evidence-discharge field projector",
+            "SELECT count(*) FROM sprout_private.reconstruct_agent_r541_evidence_discharge_fields($1)",
+        ),
+        (
+            "authority-information field projector",
+            "SELECT count(*) FROM sprout_private.reconstruct_agent_r541_authority_information($1)",
+        ),
+    ] {
+        secure_kernel_fields.push(
+            sqlx::query_scalar::<_, i64>(statement)
+                .bind(trace_number)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap_or_else(|error| panic!("reconstruct {source}: {error}")),
+        );
+    }
+    assert_eq!(
+        secure_kernel_fields,
+        vec![22, 4, 6, 3, 32],
+        "secure kernel must expose the complete exact 22+4, 6, 3, and 32 field sets"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_r541_secure_kernel_nested_sources
+             WHERE trace_number=$1",
+        )
+        .bind(trace_number)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count exact secure-kernel nested sources"),
+        41
+    );
+    let exact_root = sqlx::query_as::<_, (Uuid, i64, i64, i64)>(
+        "SELECT certificate.id,
+                (SELECT count(*) FROM agent_r541_exact_formal_release_child_certificates child
+                  WHERE child.trace_number=certificate.trace_number
+                    AND child.release_version=certificate.version),
+                (SELECT count(DISTINCT child.root_field)
+                   FROM agent_r541_exact_formal_release_child_certificates child
+                  WHERE child.trace_number=certificate.trace_number
+                    AND child.release_version=certificate.version),
+                (SELECT count(DISTINCT child.id)
+                   FROM agent_r541_exact_formal_release_child_certificates child
+                  WHERE child.trace_number=certificate.trace_number
+                    AND child.release_version=certificate.version)
+         FROM agent_r541_exact_formal_release_certificates certificate
+         WHERE certificate.trace_number=$1",
+    )
+    .bind(trace_number)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("all 28 field-specific children compose an exact root");
+    assert_eq!((exact_root.1, exact_root.2, exact_root.3), (28, 28, 28));
+    let replayed_root = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT sprout_private.issue_agent_r541_formal_release($1)",
+    )
+    .bind(trace_number)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("replay exact root issuance");
+    assert_eq!(replayed_root, Some(exact_root.0));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_r541_formal_release_certificates
+             WHERE trace_number=$1",
+        )
+        .bind(trace_number)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count root versions after replay"),
+        1,
+        "exact replay must not mint a second root version"
+    );
+
+    let mut missing_source = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin secure-kernel source tamper");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *missing_source)
+        .await
+        .expect("migration-owner adversarial trigger bypass");
+    sqlx::query(
+        "DELETE FROM agent_run_resource_authority_snapshots
+         WHERE project_id=$1 AND run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(run_id)
+    .execute(&mut *missing_source)
+    .await
+    .expect("remove required authority source inside rollback-only adversarial transaction");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_r541_exact_formal_release_certificates
+             WHERE trace_number=$1",
+        )
+        .bind(trace_number)
+        .fetch_one(&mut *missing_source)
+        .await
+        .expect("served root must disappear with a missing secure-kernel source"),
+        0,
+        "a historical root descriptor cannot serve as exact after its typed source disappears"
+    );
+    missing_source
+        .rollback()
+        .await
+        .expect("restore exact authority source after adversarial test");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_r541_exact_formal_release_certificates
+             WHERE trace_number=$1",
+        )
+        .bind(trace_number)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("served root recovers after adversarial rollback"),
+        1
     );
 }
 
@@ -1671,7 +1980,7 @@ async fn semantic_list_security_definer_is_not_public_or_identity_spoofable() {
 #[ignore = "requires a migrated disposable PostgreSQL database"]
 async fn restart_reload_preserves_canonical_projection_and_history() {
     let fixture = fixture().await;
-    let trigger_task = create_open_task(&fixture, &fixture.agents[0]).await;
+    let trigger_task = create_open_task(&fixture, fixture.agents[0].identity_id, true).await;
     let obligation = Uuid::new_v4();
     let contract = goal_contract(
         fixture.scope_resource_id,
@@ -1732,7 +2041,7 @@ async fn restart_reload_preserves_canonical_projection_and_history() {
         .map(|(id, _)| id.clone())
         .expect("continuation materialized while activation holds");
 
-    complete_task_event(&fixture, &fixture.agents[0], &trigger_task).await;
+    complete_task_event(&fixture, fixture.agents[0].identity_id, &trigger_task).await;
     let (status, deactivated) = request_json(
         first_app,
         Method::POST,
@@ -1792,6 +2101,7 @@ async fn restart_reload_preserves_canonical_projection_and_history() {
 #[ignore = "requires a migrated disposable PostgreSQL database"]
 async fn completion_is_atomic_and_goal_is_distinct_from_run() {
     let fixture = fixture().await;
+    let blocker_task = create_open_task(&fixture, fixture.owner_id, false).await;
     let obligation = Uuid::new_v4();
     let mut incomplete_contract = goal_contract(
         fixture.scope_resource_id,
@@ -1810,20 +2120,44 @@ async fn completion_is_atomic_and_goal_is_distinct_from_run() {
         "id": 1,
         "obligation": obligation,
         "target": {
-            "kind": "principal_response",
-            "principal": fixture.owner_id
+            "kind": "task_from_work",
+            "work_spec_id": 1
         }
     }]);
+    let incomplete_goal = incomplete_contract["goal"]
+        .as_str()
+        .expect("goal id")
+        .parse::<Uuid>()
+        .expect("goal UUID");
     let incomplete_local =
         insert_local_goal(&fixture, &fixture.agents[0], incomplete_contract).await;
     let test_app = app(&fixture, Duration::from_secs(300));
     let (incomplete_run, initialized) =
         create_run(&test_app, &fixture, "local_goal", incomplete_local).await;
+    sqlx::query(
+        "INSERT INTO task_assignments (
+           id,project_id,task_id,assignee_identity_id,assigned_by_identity_id,
+           encrypted_payload,permission_root_grant_id
+         ) VALUES ($1,$2,$3,$4,$5,decode('03','hex'),$6)",
+    )
+    .bind(blocker_task.assignment_id)
+    .bind(fixture.project_id)
+    .bind(blocker_task.task_id)
+    .bind(fixture.owner_id)
+    .bind(fixture.owner_id)
+    .bind(Uuid::new_v4())
+    .execute(&fixture.pool)
+    .await
+    .expect("activate exact blocker task assignment");
     let work_id = initialized["state"]["work_items"]
         .as_object()
         .and_then(|items| items.keys().next())
         .cloned()
         .expect("open work");
+    let work_uuid = work_id.parse::<Uuid>().expect("work UUID");
+    let initial_claim = claim(&test_app, &fixture, incomplete_run, &fixture.agents[0]).await;
+    assert_eq!(initial_claim["work"], work_id);
+    assert_eq!(initial_claim["attempt"], 1);
     let (status, blocker) = request_json(
         test_app.clone(),
         Method::POST,
@@ -1836,13 +2170,91 @@ async fn completion_is_atomic_and_goal_is_distinct_from_run() {
             "waiting_rule_ordinal": 1,
             "scope": { "kind": "work", "work": work_id },
             "condition": {
-                "kind": "principal_response",
-                "principal": fixture.owner_id
+                "kind": "human_task_completed",
+                "task": blocker_task.resource_id
             }
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "create waiting blocker: {blocker}");
+    let blocker_id = blocker["blocker_id"]
+        .as_str()
+        .expect("blocker id")
+        .parse::<Uuid>()
+        .expect("blocker UUID");
+    complete_task_event(&fixture, fixture.owner_id, &blocker_task).await;
+    let (status, resolved) = request_json(
+        test_app.clone(),
+        Method::POST,
+        format!(
+            "/v1/projects/{}/agent-runs/{incomplete_run}/blockers/{blocker_id}/resolve",
+            fixture.project_id
+        ),
+        &fixture.agents[0].token,
+        json!({
+            "kind": "human_task_terminal",
+            "observation_id": blocker_task.resource_id
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resolve exact blocker: {resolved}");
+    assert_eq!(resolved["status"], "resolved");
+    let exact_blocker_events = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_r540_typed_exact_release_events
+         WHERE project_id=$1 AND run_id=$2 AND event_kind='blocker_resolution'",
+    )
+    .bind(fixture.project_id)
+    .bind(incomplete_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count exact blocker events");
+    assert_eq!(exact_blocker_events, 1);
+    let causal_grounding = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+           SELECT 1 FROM agent_run_causal_links link
+           WHERE link.project_id=$1 AND link.run_id=$2
+             AND link.goal_id=$3
+             AND link.predecessor=jsonb_build_object('kind','task','task',$4::uuid)
+             AND link.successor=jsonb_build_object('kind','work','work',$5::uuid)
+             AND link.observed_tick <= (
+               SELECT semantic_tick FROM agent_run_transitions
+               WHERE project_id=$1 AND run_id=$2 AND transition_kind='blocker_resolved'
+               ORDER BY state_version DESC LIMIT 1))",
+    )
+    .bind(fixture.project_id)
+    .bind(incomplete_run)
+    .bind(incomplete_goal)
+    .bind(blocker_task.resource_id)
+    .bind(work_uuid)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load canonical Task -> Work grounding");
+    assert!(causal_grounding);
+    let typed_work_attempts = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_r540_typed_exact_release_events
+         WHERE project_id=$1 AND run_id=$2 AND event_kind='work_attempt'",
+    )
+    .bind(fixture.project_id)
+    .bind(incomplete_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count exact WorkAttempt events");
+    assert_eq!(typed_work_attempts, 1);
+    let blocker_gate_exact = sqlx::query_scalar::<_, bool>(
+        "SELECT gate.blocker_mode='enabled'
+             AND jsonb_array_length(gate.blocker_records)=1
+             AND gate.blocker_records=inventory.blocker_inventory
+         FROM agent_r541_release_trace_surface_gates gate
+         JOIN agent_r540_release_inventory_state inventory
+           ON inventory.trace_number=gate.trace_number
+         WHERE gate.project_id=$1 AND gate.run_id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(incomplete_run)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("load exact blocker gate");
+    assert!(blocker_gate_exact);
     let before = sqlx::query(
         "SELECT state_version, state_hash, goal_status, run_status
          FROM agent_collaborative_runs WHERE project_id = $1 AND id = $2",
@@ -2084,7 +2496,7 @@ async fn claim_concurrency_recovery_and_scheduler_bounds_are_persistent() {
 
     let first_obligation = Uuid::new_v4();
     let second_obligation = Uuid::new_v4();
-    let aging_trigger = create_open_task(&fixture, &fixture.agents[0]).await;
+    let aging_trigger = create_open_task(&fixture, fixture.agents[0].identity_id, true).await;
     let task_done = json!({
         "kind": "task_done",
         "task": aging_trigger.resource_id
@@ -2121,7 +2533,7 @@ async fn claim_concurrency_recovery_and_scheduler_bounds_are_persistent() {
     let (scheduler_run, _) =
         create_run(&scheduler_app, &fixture, "local_goal", scheduler_goal).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    complete_task_event(&fixture, &fixture.agents[0], &aging_trigger).await;
+    complete_task_event(&fixture, fixture.agents[0].identity_id, &aging_trigger).await;
     let (status, aged_frontier) = request_json(
         scheduler_app.clone(),
         Method::POST,
@@ -2304,7 +2716,7 @@ async fn global_task_materialization_without_structured_grounding_fails_closed()
     assert_eq!(participant_count, 2);
 
     let first_claim = claim(&test_app, &fixture, run_id, &fixture.agents[0]).await;
-    let first_task = create_open_task(&fixture, &fixture.agents[0]).await;
+    let first_task = create_open_task(&fixture, fixture.agents[0].identity_id, true).await;
     assert_global_task_materialization_without_grounding_fails_closed(
         &test_app,
         &fixture,

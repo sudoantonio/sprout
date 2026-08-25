@@ -279,6 +279,29 @@ deadline rollbackano task completion, effect, transition, outcome ed evidence.
 | retention della trace | **CONCRETELY REFINED per la provenance strutturale; FAIL-CLOSED per output non più disponibile** | Il purge autorizzato elimina ciphertext ed envelope ma conserva byte/logicamente root, eventi, inventario ordinato e catena dei certificate. Poiché le view ricontrollano la provenance operativa anziché servire una cache, la sua rimozione disabilita tool/outcome gate e azzera le surface; un consumer privo dell'envelope viene rifiutato. |
 | trust/deployment | **CONCRETELY REFINED nei writer; PARTIAL nel provisioning production** | Projection, inventory e certificate usano RLS/FORCE, writer `SECURITY DEFINER` con `pg_catalog`, PUBLIC execute revocato e replay/equivocation fencing. DB owner/superuser resta TCB; il provisioning least-privileged production non è codificato. |
 
+## Projection concreta del checkpoint 0035
+
+0035 supersede le classificazioni storiche “comment fail-closed” e “tool-cluster
+only” esclusivamente per run 0035-native che raggiungono tutte le exact view.
+Legacy e run incomplete restano fail-closed senza backfill.
+
+| Cluster formale | Stato concrete del checkpoint | Limite esplicito |
+| --- | --- | --- |
+| timeline R540/R541 | **CONCRETELY REFINED** | Un allocator logico per-run serializzato distingue tutti gli Event, è rollback/replay safe e resta separato dal wall clock operativo. Pending tool deadlines impediscono alla timeline di superare `requestedTick + timeoutTicks` senza terminale. |
+| full `R540ConcreteTraceCertificate` | **CONCRETELY REFINED per run 0035-native** | WorkAttempt, WorkOutcome, blocker, causal, tool, evidence, disclosure, model e interrogation sono ricostruiti da fonti immutabili tipate. Il certificate richiede WorkAttempt nonempty e inventory totale/list-exact. Payload mancanti non sono ricostruiti da hash. |
+| `R540BlockerResolutionEventExact` | **CONCRETELY REFINED** | Blocker e resolution coincidono nello snapshot semantico terminale. `taskFromWork` richiede WorkSpec/obligation esatti, task umano Done e un arco canonico Task→Work già presente al tick della resolution. |
+| sei `R541TraceFeatureGateCertificate` gate | **CONCRETELY REFINED** | Outcome/blocker/causal/tool/evidence/disclosure confrontano le liste complete ordinate con la trace. Enabled/nonempty e disabledFailClosed/empty sono bicondizionali. |
+| native Comment / `R541CommentSurfaceCertificate` | **CONCRETELY REFINED backend/domain/DB** | Comment è `AgentAction.postComment`, non tool. Ledger, semantic-state prefix, payload E2EE tipato, root/reply/depth/freshness, authorization, no-write-down, priority e notification uniqueness sono exact. Dopo purge il descriptor resta ma served gate/records falliscono chiusi. UI fuori scope. |
+| `SecureAssumptionMinimalFullSuccessKernelCertificate` | **CONCRETELY REFINED internamente** | Progress 6/6, evidence-discharge 3/3 e authority-information 32/32 sono child field-specifici sulle history effettive; nessun boolean/stringa dichiarativa funge da prova. Human delegation incompleta richiede lista concretamente vuota. |
+| `ResponsibilityGovernanceKernelCertificate` | **CONCRETELY REFINED per il root servito** | Histories, responsibilities, agents, exceptions, assignments, administrator creations, prompt/local consistency e global revision sono ricostruiti dalle ledger operative. Liste vuote sono accettate soltanto quando le history autoritative sono vuote. |
+| proxy/global/cross-owner/task operational | **CONCRETELY REFINED per record supportati e root exact** | Ogni inventory è tipata, trace-bound e list-exact. Model plan non è authority; confirmation e permission restano correnti. TaskIntent/provenance vuoti non sono hardcoded e nascondere un record rimuove il root. Complete human delegation resta unsupported/fail-closed. |
+| model/interrogation/disclosure surface | **CONCRETELY REFINED al boundary encrypted-payload** | Le exact view ricostruiscono i byte cifrati e tutti i campi formali. Strong interrogation ha delta causale a sette liste vuote. Il backend non prova uguaglianza semantica plaintext. |
+| 28-field `R541FormalReleaseCertificate` | **CONCRETELY REFINED per completed 0035-native run** | Tutti e soli i 28 child canonici, distinti e type-tagged, devono esistere nelle rispettive field-specific exact view con stessa trace/run/goal/start. Issuer NULL prima dell'ultimo child, replay same ID, retention può rendere il served root unavailable conservando il descriptor. |
+| `R541ExternalReleaseAssumptions` | **EXTERNAL ASSUMPTIONS, separate dal root** | completion boundary, prompt/requirements faithfulness, actual model/disclosure/interrogation equality ed external evidence authenticity non sono autocertificate. |
+| `sprout_r5_41_formal_release` / `R541ReleaseGuarantees` | **DERIVED quando root + external assumptions sono forniti** | Eventual completion non deriva dal root solo. Authority/information safety, trace nonempty, prompt/work/action e policy exact, history append-only e no hidden persistent model memory seguono il boundary del theorem, senza overclaim sul provider. |
+| migration/legacy | **CONCRETELY VERIFIED / FAIL-CLOSED legacy** | Fresh 1→35 e populated 0034→0035 passano. Diciannove tabelle 0034 preservano count/hash; synthetic 0035 rows sono zero. |
+| deployment | **PARTIAL / PRODUCTION DEPLOYMENT HARDENING RESIDUAL** | App role `NOSUPERUSER NOBYPASSRLS` è testato contro DML/writer spoofing; dev/CI usa bootstrap/superuser e il provisioning production least-privilege non è nel deployment repository. |
+
 ## Boundary realmente esterne
 
 Queste sole categorie possono restare boundary, senza essere usate per rinviare
