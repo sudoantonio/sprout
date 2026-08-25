@@ -113,10 +113,12 @@ export interface DevVaultSnapshot {
 }
 
 interface VaultPlaintext {
-  version: 1 | 2 | 3 | 4
+  version: 1 | 2 | 3 | 4 | 5
   identityId?: Uuid
   device: SerializedDeviceSecrets
   resourceKeys: Record<string, string>
+  /** Device-local encrypted settings. Never exported in DEV snapshots. */
+  localSettings?: Record<string, string>
 }
 
 export type VaultPersistence = 'locked' | 'session-only' | 'prf-wrapped'
@@ -193,6 +195,7 @@ export class KeyVault {
   #credentialId?: string
   #deviceSecrets?: DeviceSecrets
   #resourceKeys = new Map<string, Uint8Array>()
+  #localSettings = new Map<string, string>()
   #wrappingKey?: CryptoKey
   #salt?: Uint8Array
   #persistence: VaultPersistence = 'locked'
@@ -344,7 +347,8 @@ export class KeyVault {
         decoded.version !== 1 &&
         decoded.version !== 2 &&
         decoded.version !== 3 &&
-        decoded.version !== 4
+        decoded.version !== 4 &&
+        decoded.version !== 5
       ) {
         throw new Error('Unsupported local vault version')
       }
@@ -366,6 +370,7 @@ export class KeyVault {
           base64ToBytes(value),
         ]),
       )
+      this.#localSettings = new Map(Object.entries(decoded.localSettings ?? {}))
       this.#wrappingKey = wrappingKey
       this.#salt = salt.slice()
       this.#persistence = 'prf-wrapped'
@@ -510,6 +515,29 @@ export class KeyVault {
     this.#devMutationListener?.()
   }
 
+  getLocalSetting(key: string): string | undefined {
+    if (!key.startsWith('device:')) {
+      throw new Error('Local setting keys must be device-scoped')
+    }
+    return this.#localSettings.get(key)
+  }
+
+  async putLocalSetting(key: string, value: string): Promise<boolean> {
+    if (!key.startsWith('device:') || value.length > 64 * 1024) {
+      throw new Error('Invalid device-local setting')
+    }
+    this.#localSettings.set(key, value)
+    return this.persist()
+  }
+
+  async deleteLocalSetting(key: string): Promise<boolean> {
+    if (!key.startsWith('device:')) {
+      throw new Error('Local setting keys must be device-scoped')
+    }
+    this.#localSettings.delete(key)
+    return this.persist()
+  }
+
   async persist(): Promise<boolean> {
     if (
       !this.#wrappingKey ||
@@ -521,7 +549,7 @@ export class KeyVault {
       return false
     }
     const value: VaultPlaintext = {
-      version: 4,
+      version: 5,
       identityId: this.#identityId,
       device: serializeDevice(this.#deviceSecrets),
       resourceKeys: Object.fromEntries(
@@ -530,6 +558,7 @@ export class KeyVault {
           bytesToBase64(key),
         ]),
       ),
+      localSettings: Object.fromEntries(this.#localSettings),
     }
     const encoded = encoder.encode(JSON.stringify(value))
     const nonce = crypto.getRandomValues(new Uint8Array(12))
@@ -576,6 +605,7 @@ export class KeyVault {
     }
     zeroBytes(this.#salt)
     this.#resourceKeys.clear()
+    this.#localSettings.clear()
     this.#deviceSecrets = undefined
     this.#wrappingKey = undefined
     this.#salt = undefined

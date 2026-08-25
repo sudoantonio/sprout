@@ -41,7 +41,6 @@ import { AuthScreen } from './components/AuthScreen'
 import {
   DownloadIcon,
   KeyIcon,
-  LockIcon,
   ShieldIcon,
   WifiOffIcon,
 } from './components/icons'
@@ -59,6 +58,7 @@ import {
 } from './components/QuestionnaireScreen'
 import { TasksScreen } from './components/TasksScreen'
 import { WorkspaceUserMenu } from './components/WorkspaceUserMenu'
+import { AiGenerationScreen } from './components/AiGenerationScreen'
 import { useTheme } from './hooks/useTheme'
 import {
   PresetScreen,
@@ -69,16 +69,19 @@ import {
   createEncryptedResourceHeader,
   decodePayloadContainer,
   decryptProject,
+  decryptInfoDocument,
   decryptTask,
   decryptTaskList,
   decryptTopic,
   encodePayloadContainer,
   encryptExistingResource,
+  encryptInfoDocument,
   INITIAL_PAYLOAD_VERSION,
   resolveActiveResourceKey,
 } from './domain/resources'
 import type {
   DecryptedTask,
+  DecryptedInfoDocument,
   EncryptedLocalRecord,
   PresetDocument,
   ProjectDocument,
@@ -91,6 +94,8 @@ import type {
   TaskDocument,
   TaskSelectedValueDocument,
   TaskListDocument,
+  InfoDocumentContent,
+  InfoFileBlock,
   TopicDocument,
 } from './domain/models'
 import { isSameTaskListIcon } from './domain/models'
@@ -200,6 +205,7 @@ const screenTitles: Record<AppScreen, string> = {
   retention: 'Retention',
   conflicts: 'Conflitti',
   security: 'Sicurezza',
+  ai: 'AI / Generazione testo',
 }
 
 const asLockedReason = (error: unknown): string =>
@@ -1144,17 +1150,17 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       )
   }, [api, dispatch, state.session])
 
-  const requireServices = (): Services => {
+  const requireServices = useCallback((): Services => {
     if (!services) throw new Error('Encrypted local storage is still opening')
     return services
-  }
+  }, [services])
 
   const runAuth = async (
     operation: () => Promise<{
       session: SessionResponse
       requiresAuthorizedDevice: boolean
     }>,
-    phase: 'signin' | 'verify' | 'recover' = 'signin',
+    phase: 'signin' | 'signup' | 'verify' | 'recover' = 'signin',
     successNotice?: string,
   ) => {
     dispatch({ type: 'auth-started' })
@@ -2071,6 +2077,267 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
     }
+  }
+
+  const loadTaskListInfoDocuments = async (
+    list: TaskListItem,
+  ): Promise<DecryptedInfoDocument[]> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to load task-list info')
+    }
+    const current = requireServices()
+    const response = await api.listTaskListInfoDocuments(
+      state.selectedProjectId,
+      list.wire.id,
+    )
+    return Promise.all(
+      response.documents.map((document) =>
+        decryptInfoDocument(document, current.auth.vault),
+      ),
+    )
+  }
+
+  const createTaskListInfoDocument = async (
+    list: TaskListItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to create task-list info')
+    }
+    const current = requireServices()
+    const active = await ensureActiveResourceKey(
+      api,
+      current,
+      state.session,
+      state.selectedProjectId,
+      list.wire.resource_node_id,
+      list.wire.key_epoch,
+      'Missing active task-list resource key',
+    )
+    const documentId = crypto.randomUUID()
+    const payload = await encryptInfoDocument(current.auth.vault, {
+      projectId: state.selectedProjectId,
+      documentId,
+      containerResourceId: list.wire.resource_node_id,
+      aggregateVersion: INITIAL_PAYLOAD_VERSION,
+      keyEpoch: active.epoch,
+      kind: 'task-list',
+      document,
+    })
+    const { document: wire } = await api.createTaskListInfoDocument(
+      state.selectedProjectId,
+      list.wire.id,
+      {
+        id: documentId,
+        parent_document_id: parentDocumentId ?? null,
+        resource_node_id: list.wire.resource_node_id,
+        key_epoch: active.epoch,
+        payload,
+        idempotency_key: crypto.randomUUID(),
+      },
+    )
+    return { wire, document }
+  }
+
+  const updateInfoDocument = async (
+    value: DecryptedInfoDocument,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to update task-list info')
+    }
+    const current = requireServices()
+    const active = await ensureActiveResourceKey(
+      api,
+      current,
+      state.session,
+      state.selectedProjectId,
+      value.wire.resource_node_id,
+      value.wire.key_epoch,
+      'Missing active task-list resource key',
+    )
+    const payload = await encryptInfoDocument(current.auth.vault, {
+      projectId: state.selectedProjectId,
+      documentId: value.wire.id,
+      containerResourceId: value.wire.resource_node_id,
+      aggregateVersion: value.wire.payload_version + 1,
+      keyEpoch: active.epoch,
+      kind: value.wire.task_list_id ? 'task-list' : 'topic',
+      document,
+    })
+    const { document: wire } = await api.updateInfoDocument(
+      state.selectedProjectId,
+      value.wire.id,
+      {
+        expected_payload_version: value.wire.payload_version,
+        key_epoch: active.epoch,
+        payload,
+        idempotency_key: crypto.randomUUID(),
+      },
+    )
+    return { wire, document }
+  }
+
+  const uploadInfoDocumentFile = async (
+    document: DecryptedInfoDocument,
+    file: File,
+  ): Promise<InfoFileBlock> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to attach a file')
+    }
+    const current = requireServices()
+    const active = await ensureActiveResourceKey(
+      api,
+      current,
+      state.session,
+      state.selectedProjectId,
+      document.wire.resource_node_id,
+      document.wire.key_epoch,
+      'Missing active task-list resource key',
+    )
+    const resourceKey = current.auth.vault.getResourceKey(
+      document.wire.resource_node_id,
+      active.epoch,
+    )
+    if (!resourceKey) {
+      throw new Error('This device cannot decrypt the task-list info resource')
+    }
+    const blobId = crypto.randomUUID()
+    const blockId = crypto.randomUUID()
+    const context = {
+      projectId: state.selectedProjectId,
+      resourceId: document.wire.resource_node_id,
+      blobId,
+      keyEpoch: active.epoch,
+    }
+    const ciphertext = await encryptAttachment(file, resourceKey, context)
+    try {
+      await writeEncryptedAttachment(blobId, ciphertext)
+      const [ciphertextSha256, encryptedBlobMetadata, encryptedMetadata] =
+        await Promise.all([
+          attachmentCiphertextSha256(ciphertext),
+          encryptExistingResource(current.auth.vault, {
+            projectId: state.selectedProjectId,
+            resourceId: document.wire.resource_node_id,
+            kind: 'attachment',
+            aggregateVersion: 0,
+            keyEpoch: active.epoch,
+            document: {
+              schema: 1,
+              format: 'sprout-attachment-v1',
+              plaintext_size: file.size,
+            },
+          }),
+          encryptExistingResource(current.auth.vault, {
+            projectId: state.selectedProjectId,
+            resourceId: document.wire.resource_node_id,
+            kind: 'attachment',
+            aggregateVersion: 0,
+            keyEpoch: active.epoch,
+            document: {
+              schema: 1,
+              file_name: file.name,
+              content_type: file.type || 'application/octet-stream',
+            } satisfies AttachmentDocument,
+          }),
+        ])
+      const declaration = await api.declareInfoDocumentFile(
+        state.selectedProjectId,
+        document.wire.id,
+        {
+          id: blockId,
+          blob: {
+            blob_id: blobId,
+            resource_node_id: document.wire.resource_node_id,
+            ciphertext_size: ciphertext.size,
+            ciphertext_sha256: ciphertextSha256,
+            key_epoch: active.epoch,
+            encrypted_blob_metadata: encryptedBlobMetadata,
+            encrypted_attachment_metadata: encryptedMetadata,
+          },
+          idempotency_key: crypto.randomUUID(),
+        },
+      )
+      await api.uploadAttachmentCiphertext(
+        state.selectedProjectId,
+        blobId,
+        ciphertext,
+        declaration.upload_url,
+      )
+      await api.finalizeAttachment(state.selectedProjectId, blobId)
+      return {
+        id: blockId,
+        type: 'file',
+        blob_id: blobId,
+        file_name: file.name,
+        content_type: file.type || 'application/octet-stream',
+        plaintext_size: file.size,
+      }
+    } catch (error) {
+      await removeEncryptedAttachment(blobId).catch(() => undefined)
+      throw error
+    }
+  }
+
+  const readInfoDocumentFile = async (
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
+  ): Promise<Blob> => {
+    const current = requireServices()
+    const resourceKey = current.auth.vault.getResourceKey(
+      document.wire.resource_node_id,
+      document.wire.key_epoch,
+    )
+    if (!resourceKey) {
+      throw new Error('This device cannot decrypt the task-list info resource')
+    }
+    const attachment = await api.getAttachment(
+      document.wire.project_id,
+      file.blob_id,
+    )
+    const ciphertext = asAttachmentCiphertext(
+      await api.downloadCiphertext(
+        `/v1/projects/${document.wire.project_id}/files/${file.blob_id}/content`,
+      ),
+    )
+    if (
+      ciphertext.size !== attachment.ciphertext_size ||
+      (await attachmentCiphertextSha256(ciphertext)) !==
+        attachment.ciphertext_sha256
+    ) {
+      throw new Error('Downloaded info file failed ciphertext integrity checks')
+    }
+    let plaintext: Uint8Array | undefined
+    try {
+      plaintext = await decryptAttachment(ciphertext, resourceKey, {
+        projectId: document.wire.project_id,
+        resourceId: document.wire.resource_node_id,
+        blobId: file.blob_id,
+        keyEpoch: document.wire.key_epoch,
+      })
+      return new Blob(
+        [
+          plaintext.buffer.slice(
+            plaintext.byteOffset,
+            plaintext.byteOffset + plaintext.byteLength,
+          ) as ArrayBuffer,
+        ],
+        { type: file.content_type },
+      )
+    } finally {
+      zeroBytes(plaintext)
+    }
+  }
+
+  const downloadInfoDocumentFile = async (
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
+  ): Promise<void> => {
+    await saveWithDownloadFallback(
+      await readInfoDocumentFile(document, file),
+      file.file_name,
+    )
   }
 
   const toggleTopicFavorite = async (topic: TopicItem) => {
@@ -4246,7 +4513,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       attachmentRefreshInFlight.current.set(taskId, refresh)
       return refresh
     },
-    [api, dispatch, state.selectedProjectId],
+    [api, dispatch, requireServices, state.selectedProjectId],
   )
 
   const uploadCompletedAttachment = async (
@@ -5074,38 +5341,22 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     return member?.label ?? `User ${state.session.identity_id.slice(0, 8)}`
   }, [state.boardMembers, state.session])
 
-  const userMenuProps = useMemo(
-    () => ({
-      userLabel,
-      projects: state.projects,
-      selectedProjectId: state.selectedProjectId,
-      currentScreen: state.screen,
-      conflictCount: state.conflicts.length,
-      projectName,
-      onProjectNameChange: setProjectName,
-      onSelectProject: (projectId: string) =>
-        dispatch({ type: 'select-project', projectId }),
-      onCreateProject: (event: FormEvent) => void createProject(event),
-      onNavigate: (screen: AppScreen) =>
-        dispatch({ type: 'set-screen', screen }),
-      onLogout: logout,
-      appearance,
-      onAppearanceChange: setAppearance,
-    }),
-    [
-      userLabel,
-      state.projects,
-      state.selectedProjectId,
-      state.screen,
-      state.conflicts.length,
-      projectName,
-      dispatch,
-      logout,
-      createProject,
-      appearance,
-      setAppearance,
-    ],
-  )
+  const userMenuProps = {
+    userLabel,
+    projects: state.projects,
+    selectedProjectId: state.selectedProjectId,
+    currentScreen: state.screen,
+    conflictCount: state.conflicts.length,
+    projectName,
+    onProjectNameChange: setProjectName,
+    onSelectProject: (projectId: string) =>
+      dispatch({ type: 'select-project', projectId }),
+    onCreateProject: (event: FormEvent) => void createProject(event),
+    onNavigate: (screen: AppScreen) => dispatch({ type: 'set-screen', screen }),
+    onLogout: logout,
+    appearance,
+    onAppearanceChange: setAppearance,
+  }
 
   if (!state.session) {
     return (
@@ -5294,6 +5545,12 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             onDeleteTopic={deleteTopic}
             onCreateList={createTaskList}
             onUpdateTaskList={updateTaskList}
+            onLoadTaskListInfo={loadTaskListInfoDocuments}
+            onCreateTaskListInfoDocument={createTaskListInfoDocument}
+            onUpdateInfoDocument={updateInfoDocument}
+            onUploadInfoDocumentFile={uploadInfoDocumentFile}
+            onReadInfoDocumentFile={readInfoDocumentFile}
+            onDownloadInfoDocumentFile={downloadInfoDocumentFile}
             onCreateTask={createTask}
             onUpdateTask={updateTask}
             onAssignTask={assignTask}
@@ -5431,6 +5688,9 @@ const App = ({ apiClient, initialSession }: AppProps) => {
                     })
                   }
                 />
+              )}
+              {state.screen === 'ai' && services && (
+                <AiGenerationScreen vault={services.auth.vault} />
               )}
               {state.screen === 'conflicts' && (
                 <ConflictScreen

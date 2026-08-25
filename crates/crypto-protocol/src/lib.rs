@@ -21,6 +21,7 @@ use aes_gcm::{
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -150,6 +151,73 @@ pub enum ProtocolError {
     /// Strict JSON parsing failed.
     #[error("invalid JSON: {0}")]
     Json(String),
+}
+
+/// Canonical JSON used for governance attestations.
+///
+/// This is the integer-only Sprout profile of RFC 8785: object member names
+/// are ordered by their UTF-16 code units, strings use the JSON escaping
+/// rules, arrays retain their order, and integers use their shortest decimal
+/// representation. Floating-point numbers are deliberately rejected because
+/// no signed governance schema contains them. The explicit profile avoids
+/// making Rust struct declaration order part of the signature contract.
+pub fn canonical_governance_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
+    let value =
+        serde_json::to_value(value).map_err(|error| ProtocolError::Json(error.to_string()))?;
+    let mut output = Vec::new();
+    write_canonical_governance_value(&value, &mut output)?;
+    Ok(output)
+}
+
+fn write_canonical_governance_value(
+    value: &Value,
+    output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+    match value {
+        Value::Null => output.extend_from_slice(b"null"),
+        Value::Bool(true) => output.extend_from_slice(b"true"),
+        Value::Bool(false) => output.extend_from_slice(b"false"),
+        Value::Number(number) => {
+            if !(number.is_i64() || number.is_u64()) {
+                return Err(ProtocolError::InvalidFormat(
+                    "floating-point governance value",
+                ));
+            }
+            output.extend_from_slice(number.to_string().as_bytes());
+        }
+        Value::String(text) => {
+            let encoded = serde_json::to_string(text)
+                .map_err(|error| ProtocolError::Json(error.to_string()))?;
+            output.extend_from_slice(encoded.as_bytes());
+        }
+        Value::Array(items) => {
+            output.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_canonical_governance_value(item, output)?;
+            }
+            output.push(b']');
+        }
+        Value::Object(object) => {
+            let mut fields: Vec<_> = object.iter().collect();
+            fields.sort_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
+            output.push(b'{');
+            for (index, (name, field)) in fields.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                let encoded_name = serde_json::to_string(name)
+                    .map_err(|error| ProtocolError::Json(error.to_string()))?;
+                output.extend_from_slice(encoded_name.as_bytes());
+                output.push(b':');
+                write_canonical_governance_value(field, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
 }
 
 /// Implemented protocol versions.
@@ -3060,6 +3128,86 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn governance_canonical_json_has_stable_golden_vector() {
+        let left: Value =
+            serde_json::from_str(r#"{"z":1,"a":[3,{"y":true,"x":"line\n"}]}"#).unwrap();
+        let right: Value =
+            serde_json::from_str(r#"{"a":[3,{"x":"line\n","y":true}],"z":1}"#).unwrap();
+        let expected = br#"{"a":[3,{"x":"line\n","y":true}],"z":1}"#;
+        let left_bytes = canonical_governance_json(&left).unwrap();
+        let right_bytes = canonical_governance_json(&right).unwrap();
+        assert_eq!(left_bytes, expected);
+        assert_eq!(right_bytes, expected);
+        assert_eq!(
+            Sha256::digest(expected).as_slice(),
+            [
+                119, 116, 220, 130, 100, 203, 22, 100, 102, 15, 87, 122, 121, 154, 12, 236, 191,
+                115, 167, 176, 177, 64, 128, 221, 120, 168, 184, 147, 242, 230, 162, 241,
+            ]
+        );
+    }
+
+    #[test]
+    fn governance_canonical_json_complex_golden_vector_is_byte_exact() {
+        let value = serde_json::json!({
+            "😀": ["雪", {"k": "v"}],
+            "é": "café",
+            "z": {
+                "β": "unicode",
+                "a": [0, -1, i64::MIN, i64::MAX, u64::MAX]
+            },
+            "A": "quote:\" slash:\\ newline:\n control:\u{001f}"
+        });
+        let expected = r#"{"A":"quote:\" slash:\\ newline:\n control:\u001f","z":{"a":[0,-1,-9223372036854775808,9223372036854775807,18446744073709551615],"β":"unicode"},"é":"café","😀":["雪",{"k":"v"}]}"#
+            .as_bytes();
+        let actual = canonical_governance_json(&value).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            Sha256::digest(expected).as_slice(),
+            [
+                138, 19, 141, 72, 56, 226, 61, 84, 213, 16, 233, 108, 113, 91, 163, 19, 176, 172,
+                92, 131, 115, 188, 139, 7, 242, 148, 75, 114, 25, 160, 172, 221,
+            ]
+        );
+    }
+
+    #[test]
+    fn governance_canonical_json_ignores_rust_field_declaration_order() {
+        #[derive(Serialize)]
+        struct ZThenA {
+            z: u64,
+            a: String,
+        }
+        #[derive(Serialize)]
+        struct AThenZ {
+            a: String,
+            z: u64,
+        }
+        let left = canonical_governance_json(&ZThenA {
+            z: 1,
+            a: "x".to_owned(),
+        })
+        .unwrap();
+        let right = canonical_governance_json(&AThenZ {
+            a: "x".to_owned(),
+            z: 1,
+        })
+        .unwrap();
+        assert_eq!(left, br#"{"a":"x","z":1}"#);
+        assert_eq!(right, br#"{"a":"x","z":1}"#);
+    }
+
+    #[test]
+    fn governance_canonical_json_rejects_floating_point_values() {
+        assert_eq!(
+            canonical_governance_json(&serde_json::json!({"value": 1.5})),
+            Err(ProtocolError::InvalidFormat(
+                "floating-point governance value"
+            ))
+        );
+    }
 
     fn header(context: &[u8]) -> CanonicalHeader {
         CanonicalHeader::new(

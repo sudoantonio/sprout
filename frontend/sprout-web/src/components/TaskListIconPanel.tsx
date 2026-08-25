@@ -17,7 +17,8 @@ import {
   type TaskListEmojiEntry,
   type TaskListEmojiGroup,
 } from './task-list-emoji-data'
-import { filterTaskListGlyphs, TaskListGlyphIcon } from './task-list-glyphs'
+import { TaskListGlyphIcon } from './TaskListGlyphIcon'
+import { filterTaskListGlyphs } from './task-list-glyphs'
 
 type PickerTab = 'glyph' | 'emoji' | 'letter'
 

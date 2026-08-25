@@ -93,6 +93,7 @@ pub async fn assign(
         RETURNING
             id, project_id, task_id, assignee_identity_id,
             assigned_by_identity_id, permission_root_grant_id,
+            permission_managed_by_assignment,
             assigned_at, revoked_at
         "#,
     )
@@ -154,6 +155,7 @@ pub async fn list(
         SELECT
             id, project_id, task_id, assignee_identity_id,
             assigned_by_identity_id, permission_root_grant_id,
+            permission_managed_by_assignment,
             assigned_at, revoked_at
         FROM task_assignments
         WHERE project_id = $1 AND task_id = $2
@@ -204,6 +206,7 @@ pub async fn revoke(
         SELECT
             id, project_id, task_id, assignee_identity_id,
             assigned_by_identity_id, permission_root_grant_id,
+            permission_managed_by_assignment,
             assigned_at, revoked_at
         FROM task_assignments
         WHERE project_id = $1
@@ -219,27 +222,33 @@ pub async fn revoke(
     .fetch_optional(&mut *transaction)
     .await?
     .ok_or(AppError::NotFound)?;
-    let affected = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        SELECT resource_node_id
-        FROM sprout_private.permission_lineage_resources($1, $2, $3)
-        ORDER BY resource_node_id
-        "#,
-    )
-    .bind(project_id)
-    .bind(row.permission_root_grant_id)
-    .bind(row.assignee_identity_id)
-    .fetch_all(&mut *transaction)
-    .await?;
-    rotate_resource_keys(
-        &mut transaction,
-        actor,
-        project_id,
-        row.permission_root_grant_id,
-        &affected,
-        &request.rotations,
-    )
-    .await?;
+    if row.permission_managed_by_assignment {
+        let affected = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT resource_node_id
+            FROM sprout_private.permission_lineage_resources($1, $2, $3)
+            ORDER BY resource_node_id
+            "#,
+        )
+        .bind(project_id)
+        .bind(row.permission_root_grant_id)
+        .bind(row.assignee_identity_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        rotate_resource_keys(
+            &mut transaction,
+            actor,
+            project_id,
+            row.permission_root_grant_id,
+            &affected,
+            &request.rotations,
+        )
+        .await?;
+    } else if !request.rotations.is_empty() {
+        return Err(AppError::BadRequest(
+            "cross-owner assignment revocation does not rotate unrelated permission keys",
+        ));
+    }
     let revoked_at = sqlx::query_scalar::<_, DateTime<Utc>>(
         r#"
         UPDATE task_assignments
@@ -252,13 +261,15 @@ pub async fn revoke(
     .bind(assignment_id)
     .fetch_one(&mut *transaction)
     .await?;
-    sqlx::query("SELECT sprout_private.revoke_hierarchical_permission($1, $2, $3, $4, NULL)")
-        .bind(project_id)
-        .bind(row.permission_root_grant_id)
-        .bind(row.assignee_identity_id)
-        .bind(actor.identity_id)
-        .execute(&mut *transaction)
-        .await?;
+    if row.permission_managed_by_assignment {
+        sqlx::query("SELECT sprout_private.revoke_hierarchical_permission($1, $2, $3, $4, NULL)")
+            .bind(project_id)
+            .bind(row.permission_root_grant_id)
+            .bind(row.assignee_identity_id)
+            .bind(actor.identity_id)
+            .execute(&mut *transaction)
+            .await?;
+    }
     transaction.commit().await?;
     row.revoked_at = Some(revoked_at);
     Ok(Json(AssignmentResponse {
@@ -375,6 +386,7 @@ struct AssignmentRow {
     assignee_identity_id: Uuid,
     assigned_by_identity_id: Uuid,
     permission_root_grant_id: Uuid,
+    permission_managed_by_assignment: bool,
     assigned_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
 }
@@ -394,7 +406,7 @@ impl From<AssignmentRow> for AssignmentDto {
     }
 }
 
-fn decode(value: &str) -> Result<Vec<u8>, AppError> {
+pub(crate) fn decode(value: &str) -> Result<Vec<u8>, AppError> {
     base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|_| AppError::BadRequest("invalid base64 encrypted payload"))

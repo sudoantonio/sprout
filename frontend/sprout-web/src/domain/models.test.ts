@@ -54,7 +54,7 @@ describe('resolveTaskListDisplayColor', () => {
     expect(
       resolveTaskListDisplayColor({
         wire: { id: 'list-id' },
-        document: { schema: 1, name: 'Lista', color: 'column-rose' },
+        document: { color: 'column-rose' },
       }),
     ).toBe('column-rose')
   })
@@ -63,7 +63,7 @@ describe('resolveTaskListDisplayColor', () => {
     expect(
       resolveTaskListDisplayColor({
         wire: { id: 'list-id' },
-        document: { schema: 1, name: 'Lista' },
+        document: {},
       }),
     ).toBe(defaultTaskListColumnColor('list-id'))
   })
@@ -72,7 +72,7 @@ describe('resolveTaskListDisplayColor', () => {
     expect(
       resolveTaskListDisplayColor({
         wire: { id: 'list-id' },
-        document: { schema: 1, name: 'Lista', color: 'column-white' },
+        document: { color: 'column-white' },
       }),
     ).toBe(defaultTaskListColumnColor('list-id'))
   })

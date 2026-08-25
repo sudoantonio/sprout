@@ -250,6 +250,44 @@ export interface ListTaskListsResponse {
   task_lists: TaskListDto[]
 }
 
+export interface InfoDocumentDto {
+  id: Uuid
+  project_id: Uuid
+  topic_id: Uuid | null
+  task_list_id: Uuid | null
+  parent_document_id: Uuid | null
+  resource_node_id: Uuid
+  payload: EncryptedPayloadDto
+  key_epoch: number
+  payload_version: number
+  created_at: IsoDateTime
+  updated_at: IsoDateTime
+}
+
+export interface CreateInfoDocumentRequest {
+  id: Uuid
+  parent_document_id: Uuid | null
+  resource_node_id: Uuid
+  key_epoch: number
+  payload: EncryptedPayloadDto
+  idempotency_key: Uuid
+}
+
+export interface UpdateInfoDocumentRequest {
+  expected_payload_version: number
+  key_epoch: number
+  payload: EncryptedPayloadDto
+  idempotency_key: Uuid
+}
+
+export interface InfoDocumentResponse {
+  document: InfoDocumentDto
+}
+
+export interface ListInfoDocumentsResponse {
+  documents: InfoDocumentDto[]
+}
+
 export interface ListTasksResponse {
   tasks: TaskDto[]
 }
@@ -489,7 +527,11 @@ export interface AttachmentDto {
   id: Uuid
   project_id: Uuid
   resource_node_id: Uuid
-  attachment_kind: 'pretask_template' | 'task_required' | 'task_completed'
+  attachment_kind:
+    | 'pretask_template'
+    | 'task_required'
+    | 'task_completed'
+    | 'info_document'
   blob_id: Uuid
   task_id: Uuid | null
   pretask_id: Uuid | null
@@ -509,7 +551,11 @@ export interface AttachmentCollectionItemDto {
   project_id: Uuid
   resource_node_id: Uuid
   key_epoch: number
-  attachment_kind: 'pretask_template' | 'task_required' | 'task_completed'
+  attachment_kind:
+    | 'pretask_template'
+    | 'task_required'
+    | 'task_completed'
+    | 'info_document'
   blob_id: Uuid
   task_id: Uuid | null
   pretask_id: Uuid | null
@@ -552,6 +598,12 @@ export interface CreateTaskCompletedAttachmentRequest {
   id: Uuid
   assignment_id: Uuid
   required_attachment_id: Uuid | null
+  blob: EncryptedBlobDeclarationDto
+  idempotency_key: Uuid
+}
+
+export interface CreateInfoDocumentFileRequest {
+  id: Uuid
   blob: EncryptedBlobDeclarationDto
   idempotency_key: Uuid
 }

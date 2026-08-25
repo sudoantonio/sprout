@@ -38,7 +38,8 @@ INSERT INTO device_keys (
     '90000000-0000-0000-0000-000000000001',
     '92000000-0000-0000-0000-000000000001', 1,
     decode('01', 'hex'), decode('02', 'hex'),
-    decode(repeat('00', 32), 'hex'), decode(repeat('01', 32), 'hex'),
+    decode(repeat('00', 32), 'hex'),
+    digest('92000000-0000-0000-0000-000000000001', 'sha256'),
     decode('01', 'hex'), decode('02', 'hex')
 );
 INSERT INTO projects (id, owner_identity_id, encrypted_metadata)

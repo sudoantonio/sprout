@@ -2050,6 +2050,116 @@ async fn insert_task_assignment_and_permission(
     Ok(())
 }
 
+/// Materializes the exact R4 task used by a certified governance review.
+/// The human controller supplies only E2EE ciphertext/key envelopes; the
+/// trusted governance route fixes creator, assignee and causal identity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn materialize_governance_review_task(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: AuthSession,
+    project_id: Uuid,
+    creator_agent_identity_id: Uuid,
+    administrator_identity_id: Uuid,
+    request: &CreateTaskRequest,
+    assignment_id: Uuid,
+    permission_grant_id: Uuid,
+    encrypted_assignment: &EncryptedPayloadDto,
+) -> Result<(), AppError> {
+    validate_task_kind_shape(
+        request.task_kind,
+        request.recurrence_series_id,
+        request.occurrence_number,
+    )?;
+    if request.recurrence_series_id.is_some()
+        || request.occurrence_number.is_some()
+        || request.questionnaire_version_id.is_some()
+    {
+        return Err(AppError::BadRequest(
+            "governance review task must be a standalone task",
+        ));
+    }
+    let list_resource_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT resource_node_id FROM task_lists
+         WHERE project_id=$1 AND id=$2 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(project_id)
+    .bind(request.list_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let payload = opaque_payload(&request.payload)?;
+    let selected = opaque_payload(&request.selected_value_snapshot)?;
+    let encrypted_assignment = opaque_payload(encrypted_assignment)?;
+    let header = request.header.as_ref().map(opaque_payload).transpose()?;
+    if request.epoch.header_key_commitment_b64.is_some() != header.is_some() {
+        return Err(AppError::BadRequest(
+            "encrypted header and header key commitment must be supplied together",
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO resource_nodes (
+            id,project_id,parent_id,node_kind,encrypted_metadata,created_by_identity_id
+         ) VALUES ($1,$2,$3,'task',$4,$5)",
+    )
+    .bind(request.resource_node_id)
+    .bind(project_id)
+    .bind(list_resource_id)
+    .bind(&payload)
+    .bind(creator_agent_identity_id)
+    .execute(&mut **transaction)
+    .await?;
+    insert_initial_resource_epoch(
+        transaction,
+        actor,
+        project_id,
+        request.resource_node_id,
+        administrator_identity_id,
+        &request.epoch,
+        &request.envelopes,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO tasks (
+            id,project_id,task_list_id,resource_node_id,task_kind,
+            encrypted_payload,encrypted_value_snapshot,created_by_identity_id,
+            encrypted_header
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(request.id)
+    .bind(project_id)
+    .bind(request.list_id)
+    .bind(request.resource_node_id)
+    .bind(task_kind_str(request.task_kind))
+    .bind(&payload)
+    .bind(&selected)
+    .bind(creator_agent_identity_id)
+    .bind(header)
+    .execute(&mut **transaction)
+    .await?;
+    insert_task_assignment_and_permission(
+        transaction,
+        actor,
+        project_id,
+        request.id,
+        request.resource_node_id,
+        assignment_id,
+        permission_grant_id,
+        administrator_identity_id,
+        &encrypted_assignment,
+    )
+    .await?;
+    insert_outbox(
+        transaction,
+        project_id,
+        "task",
+        request.id,
+        "created",
+        request.idempotency_key,
+        &payload,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn insert_task_row(
     transaction: &mut Transaction<'_, Postgres>,
@@ -2103,7 +2213,7 @@ async fn insert_task_row(
         .await?)
 }
 
-async fn insert_outbox(
+pub(crate) async fn insert_outbox(
     transaction: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     aggregate_kind: &str,
@@ -2579,7 +2689,7 @@ fn parse_task_kind(kind: &str) -> Result<TaskKindDto, AppError> {
     }
 }
 
-fn opaque_payload(payload: &EncryptedPayloadDto) -> Result<Vec<u8>, AppError> {
+pub(crate) fn opaque_payload(payload: &EncryptedPayloadDto) -> Result<Vec<u8>, AppError> {
     if payload.version == 0
         || payload.algorithm.trim().is_empty()
         || payload.key_id.trim().is_empty()

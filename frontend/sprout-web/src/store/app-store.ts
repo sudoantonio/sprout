@@ -28,6 +28,7 @@ export type AppScreen =
   | 'recovery'
   | 'retention'
   | 'security'
+  | 'ai'
   | 'conflicts'
 
 export interface ProjectItem {

@@ -6,6 +6,91 @@
   text-transform: uppercase;
 }
 
+.ai-generation-settings {
+  width: 100%;
+  max-width: 52rem;
+  margin: 0 auto;
+  padding: 0.35rem 1.25rem 2rem;
+}
+
+.ai-mode-grid,
+.ai-settings-form {
+  display: grid;
+  gap: 0.8rem;
+  padding: 1rem 1.1rem;
+}
+
+.ai-mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  color: var(--text-primary);
+  font-size: 0.875rem;
+}
+
+.ai-settings-form label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.ai-settings-form input,
+.ai-settings-form select {
+  width: 100%;
+  min-height: 2.4rem;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-control);
+  background: var(--surface-main);
+  color: var(--text-primary);
+  padding: 0.5rem 0.65rem;
+  font: inherit;
+  font-weight: 450;
+}
+
+.ai-boundary-note {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-control);
+  background: var(--surface-sidebar);
+  color: var(--text-muted);
+  padding: 0.8rem;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.ai-boundary-note p {
+  margin: 0;
+}
+
+.ai-settings-status {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+.ai-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.ai-local-install-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.ai-local-install-actions p {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
 .primary-button,
 .secondary-button,
 .text-button {
@@ -5725,6 +5810,484 @@ span.task-create-pill-btn {
 
 .tasklist-history-heading h2 {
   margin: 0;
+}
+
+.tasklist-overview-tabs {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 0.25rem;
+  border-radius: var(--radius-pill);
+  background: var(--surface-hover);
+  padding: 0.2rem;
+}
+
+.tasklist-overview-tabs button {
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  padding: 0.42rem 0.85rem;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.tasklist-overview-tabs button.active {
+  background: var(--surface-card);
+  box-shadow: var(--shadow-soft);
+  color: var(--text-board);
+}
+
+.tasklist-info-panel {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  gap: 0.9rem;
+  overflow-y: auto;
+  padding: 0.25rem 0 1rem;
+}
+
+.tasklist-info-panel > h1 {
+  margin: 0.4rem 0 0;
+  color: var(--text-board);
+  font-size: clamp(1.35rem, 2.6vw, 2rem);
+}
+
+.tasklist-info-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.tasklist-info-toolbar button,
+.tasklist-info-document-form button,
+.tasklist-info-editor-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-button);
+  background: var(--surface-card);
+  padding: 0.45rem 0.65rem;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tasklist-info-toolbar button:hover,
+.tasklist-info-document-form button:hover,
+.tasklist-info-editor-actions button:hover {
+  background: var(--surface-hover);
+  color: var(--text-board);
+}
+
+.tasklist-info-toolbar button:disabled,
+.tasklist-info-document-form button:disabled,
+.tasklist-info-editor-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.tasklist-info-toolbar svg,
+.tasklist-info-file svg,
+.tasklist-info-documents svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.tasklist-info-editor {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.tasklist-info-editor textarea {
+  width: 100%;
+  min-height: 12rem;
+  resize: vertical;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-card);
+  outline: none;
+  background: color-mix(in srgb, var(--surface-card) 82%, transparent);
+  padding: 1rem;
+  color: var(--text-board);
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1.6;
+}
+
+.tasklist-info-editor textarea:focus {
+  border-color: var(--accent-action);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-action) 16%, transparent);
+}
+
+.tasklist-info-editor-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.tasklist-info-editor-actions button:first-child {
+  border-color: var(--accent-action);
+  background: var(--accent-action);
+  color: var(--on-accent);
+}
+
+.tasklist-info-preview {
+  min-height: 10rem;
+  border-radius: var(--radius-card);
+  padding: 0.6rem 0.2rem;
+}
+
+.tasklist-info-placeholder {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.9375rem;
+}
+
+.tasklist-info-markdown {
+  color: var(--text-board);
+  font-size: 0.975rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.tasklist-info-markdown h1,
+.tasklist-info-markdown h2,
+.tasklist-info-markdown h3 {
+  scroll-margin-top: 1rem;
+  line-height: 1.25;
+}
+
+.tasklist-info-markdown h1 {
+  font-size: 1.8rem;
+}
+
+.tasklist-info-markdown h2 {
+  font-size: 1.4rem;
+}
+
+.tasklist-info-markdown h3 {
+  font-size: 1.15rem;
+}
+
+.tasklist-info-markdown > :first-child {
+  margin-top: 0;
+}
+
+.tasklist-info-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.tasklist-info-markdown p,
+.tasklist-info-markdown ul,
+.tasklist-info-markdown ol,
+.tasklist-info-markdown blockquote,
+.tasklist-info-markdown pre,
+.tasklist-info-table-scroll {
+  margin-block: 0.8rem;
+}
+
+.tasklist-info-markdown a {
+  color: var(--accent-action);
+  text-decoration-thickness: 0.08em;
+  text-underline-offset: 0.14em;
+}
+
+.tasklist-info-markdown a:hover {
+  color: var(--accent-action-hover);
+}
+
+.tasklist-info-markdown ul,
+.tasklist-info-markdown ol {
+  padding-left: 1.65rem;
+}
+
+.tasklist-info-markdown li + li {
+  margin-top: 0.25rem;
+}
+
+.tasklist-info-markdown li > ul,
+.tasklist-info-markdown li > ol {
+  margin-block: 0.3rem;
+}
+
+.tasklist-info-markdown li > p {
+  margin-block: 0.3rem;
+}
+
+.tasklist-info-markdown input[type='checkbox'] {
+  margin: 0 0.45rem 0 0;
+  accent-color: var(--accent-action);
+}
+
+.tasklist-info-markdown blockquote {
+  border-left: 0.22rem solid var(--border-subtle-medium);
+  padding-left: 0.9rem;
+  color: var(--text-secondary);
+}
+
+.tasklist-info-markdown blockquote blockquote {
+  border-left-color: var(--accent-focus);
+}
+
+.tasklist-info-markdown code {
+  border-radius: 0.3rem;
+  background: var(--surface-hover);
+  padding: 0.12rem 0.32rem;
+  color: var(--text-board);
+  font-family: var(--mono);
+  font-size: 0.88em;
+}
+
+.tasklist-info-markdown pre {
+  overflow: auto;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--surface-hover) 72%, var(--surface-card));
+  padding: 0.9rem 1rem;
+  tab-size: 2;
+}
+
+.tasklist-info-markdown pre code {
+  display: block;
+  min-width: max-content;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  font-size: 0.84rem;
+  line-height: 1.55;
+}
+
+.tasklist-info-markdown .hljs-comment,
+.tasklist-info-markdown .hljs-quote {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.tasklist-info-markdown .hljs-keyword,
+.tasklist-info-markdown .hljs-selector-tag,
+.tasklist-info-markdown .hljs-subst {
+  color: var(--danger);
+}
+
+.tasklist-info-markdown .hljs-string,
+.tasklist-info-markdown .hljs-doctag,
+.tasklist-info-markdown .hljs-regexp,
+.tasklist-info-markdown .hljs-addition {
+  color: var(--sprout);
+}
+
+.tasklist-info-markdown .hljs-title,
+.tasklist-info-markdown .hljs-section,
+.tasklist-info-markdown .hljs-name,
+.tasklist-info-markdown .hljs-type,
+.tasklist-info-markdown .hljs-built_in {
+  color: var(--accent-action);
+}
+
+.tasklist-info-markdown .hljs-number,
+.tasklist-info-markdown .hljs-literal,
+.tasklist-info-markdown .hljs-symbol,
+.tasklist-info-markdown .hljs-bullet {
+  color: var(--warning);
+}
+
+.tasklist-info-markdown .hljs-attr,
+.tasklist-info-markdown .hljs-variable,
+.tasklist-info-markdown .hljs-template-variable {
+  color: color-mix(in srgb, var(--accent-action) 68%, var(--warning));
+}
+
+.tasklist-info-markdown .hljs-deletion {
+  color: var(--danger);
+  text-decoration: line-through;
+}
+
+.tasklist-info-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-card);
+}
+
+.tasklist-info-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface-card);
+  font-size: 0.9rem;
+}
+
+.tasklist-info-markdown th,
+.tasklist-info-markdown td {
+  border-bottom: 1px solid var(--border-neutral);
+  padding: 0.55rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.tasklist-info-markdown th {
+  background: var(--surface-hover);
+  font-weight: 700;
+}
+
+.tasklist-info-markdown tr:last-child td {
+  border-bottom: 0;
+}
+
+.tasklist-info-markdown img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin-block: 0.8rem;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-card);
+  background: var(--surface-hover);
+}
+
+.tasklist-info-remote-image-fallback {
+  display: grid;
+  min-height: 5rem;
+  place-items: center;
+  margin-block: 0.8rem;
+  border: 1px dashed var(--border-subtle-medium);
+  border-radius: var(--radius-card);
+  background: var(--surface-hover);
+  padding: 1rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.tasklist-info-files,
+.tasklist-info-documents {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+  gap: 0.55rem;
+}
+
+.tasklist-info-file,
+.tasklist-info-documents button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--border-neutral));
+  border-radius: var(--radius-button);
+  background: color-mix(in srgb, var(--warning-soft) 70%, var(--surface-card));
+  padding: 0.7rem 0.75rem;
+  color: var(--text-board);
+  text-align: left;
+  cursor: pointer;
+}
+
+.tasklist-info-file span,
+.tasklist-info-documents span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tasklist-info-file small {
+  color: var(--warning);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.tasklist-info-image {
+  display: grid;
+  gap: 0.45rem;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--border-neutral));
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--warning-soft) 55%, var(--surface-card));
+  padding: 0;
+  color: var(--text-board);
+  text-align: left;
+  cursor: pointer;
+}
+
+.tasklist-info-image img,
+.tasklist-info-image-placeholder {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: var(--surface-hover);
+}
+
+.tasklist-info-image-placeholder {
+  display: grid;
+  place-items: center;
+  color: var(--warning);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+
+.tasklist-info-image > span:last-child {
+  overflow: hidden;
+  padding: 0 0.7rem 0.65rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tasklist-info-documents button {
+  grid-template-columns: auto minmax(0, 1fr);
+  border-color: var(--border-neutral);
+  background: var(--surface-card);
+}
+
+.tasklist-info-breadcrumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.tasklist-info-breadcrumbs button {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--accent-action);
+  font: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+.tasklist-info-breadcrumbs button + button::before {
+  content: '/';
+  margin-right: 0.3rem;
+  color: var(--text-muted);
+}
+
+.tasklist-info-breadcrumbs button:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.tasklist-info-document-form {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.tasklist-info-document-form input {
+  min-width: 0;
+  flex: 1 1 14rem;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-button);
+  background: var(--surface-card);
+  padding: 0.5rem 0.65rem;
+  color: var(--text-board);
+  font: inherit;
+}
+
+.tasklist-info-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.8125rem;
 }
 
 .tasklist-history-empty {

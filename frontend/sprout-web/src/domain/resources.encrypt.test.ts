@@ -113,4 +113,63 @@ describe('createEncryptedResource key lifetime', () => {
       true,
     )
   })
+
+  it('binds info ciphertext to its document id while reusing the container key', async () => {
+    let captured:
+      | {
+          resourceId: string
+          kind: string
+          resourceKey: Uint8Array
+        }
+      | undefined
+    vi.doMock('../security/wasm', async () => {
+      const actual =
+        await vi.importActual<typeof import('../security/wasm')>(
+          '../security/wasm',
+        )
+      return {
+        ...actual,
+        encryptDocument: async (
+          _document: unknown,
+          options: {
+            resourceId: string
+            kind: string
+            resourceKey: Uint8Array
+          },
+        ) => {
+          captured = options
+          return {
+            version: 1,
+            key_id: 'k',
+            algorithm: 'test',
+            nonce_b64: 'n',
+            ciphertext_b64: 'c',
+          }
+        },
+      }
+    })
+
+    const { encryptInfoDocument } = await import('./resources')
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const containerResourceId = crypto.randomUUID()
+    const documentId = crypto.randomUUID()
+    const key = crypto.getRandomValues(new Uint8Array(32))
+    vault.setSessionSecrets(crypto.randomUUID(), secrets(), crypto.randomUUID())
+    await vault.putResourceKey(containerResourceId, key)
+
+    await encryptInfoDocument(vault, {
+      projectId: crypto.randomUUID(),
+      documentId,
+      containerResourceId,
+      aggregateVersion: 1,
+      keyEpoch: 1,
+      kind: 'task-list',
+      document: { schema: 1, blocks: [] },
+    })
+
+    expect(captured?.resourceId).toBe(documentId)
+    expect(captured?.kind).toBe('task-list')
+    expect(captured?.resourceKey).toEqual(key)
+  })
 })

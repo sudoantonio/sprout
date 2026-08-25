@@ -111,14 +111,16 @@ async fn hlt_08_complete_virtual_clock_retention_lifecycle() {
                  encryption_public_key, signing_public_key,
                  previous_package_hash, package_hash,
                  x25519_public_key, ed25519_public_key
-             ) VALUES ($1, $2, 1, $3, $4, $5, $6, $3, $4)",
+             ) VALUES (
+                 $1, $2, 1, $3, $4, $5,
+                 digest($2::text, 'sha256'), $3, $4
+             )",
         )
         .bind(identity_id)
         .bind(device_id)
         .bind(public_key.as_slice())
         .bind(vec![marker; 32])
         .bind(vec![0_u8; 32])
-        .bind(vec![marker; 32])
         .execute(&mut *transaction)
         .await
         .expect("insert retention device key");

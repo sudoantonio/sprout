@@ -23,10 +23,14 @@ import {
   type DecryptedTask,
   type TaskListColumnColor,
   type TaskListIcon,
+  type DecryptedInfoDocument,
+  type InfoDocumentContent,
+  type InfoFileBlock,
 } from '../domain/models'
 import type { BoardMember, TaskListItem } from '../store/app-store'
 import { CheckIcon, PencilIcon, XIcon } from './icons'
 import { TaskListAvatarContent } from './TaskListAvatarContent'
+import { TaskListInfoPanel } from './TaskListInfoPanel'
 
 const HIDE_TOOLTIP_DELAY_MS = 120
 
@@ -191,7 +195,9 @@ const TaskHistoryDot = ({
   const triggerRef = useRef<HTMLButtonElement>(null)
   const tooltipId = useId()
   const [open, setOpen] = useState(false)
-  const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>()
+  const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  )
   const status = getTaskStatusIndicator(task)
   const assignee = boardMembers.find(
     (member) => member.identityId === task.wire.active_assignee_identity_id,
@@ -272,6 +278,12 @@ export const TaskListHistoryPanel = ({
   onCancelEdit,
   onCommitEdit,
   onToggleIconPicker,
+  onLoadInfo,
+  onCreateInfoDocument,
+  onUpdateInfoDocument,
+  onUploadInfoFile,
+  onReadInfoFile,
+  onDownloadInfoFile,
   onSelectTask,
   onClose,
 }: {
@@ -290,10 +302,33 @@ export const TaskListHistoryPanel = ({
   onCancelEdit(): void
   onCommitEdit(): void
   onToggleIconPicker(): void
+  onLoadInfo(list: TaskListItem): Promise<DecryptedInfoDocument[]>
+  onCreateInfoDocument(
+    list: TaskListItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onUpdateInfoDocument(
+    document: DecryptedInfoDocument,
+    content: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onUploadInfoFile(
+    document: DecryptedInfoDocument,
+    file: File,
+  ): Promise<InfoFileBlock>
+  onReadInfoFile(
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
+  ): Promise<Blob>
+  onDownloadInfoFile(
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
+  ): Promise<void>
   onSelectTask(id: Uuid): void
   onClose(): void
 }) => {
   const renameInputRef = useRef<HTMLInputElement>(null)
+  const [mode, setMode] = useState<'history' | 'info'>('history')
   const listTasks = useMemo(
     () => tasks.filter((task) => task.wire.list_id === list.wire.id),
     [list.wire.id, tasks],
@@ -334,7 +369,7 @@ export const TaskListHistoryPanel = ({
         .filter(Boolean)
         .join(' ')}
       role="region"
-      aria-label={`Storico ${listName}`}
+      aria-label={`${mode === 'history' ? 'Storico' : 'Info'} ${listName}`}
     >
       <div className="tasklist-history-panel-inner">
         <header className="board-detail-header tasklist-history-header">
@@ -427,7 +462,38 @@ export const TaskListHistoryPanel = ({
           </div>
         </header>
 
-        {dayGroups.length === 0 ? (
+        <div className="tasklist-overview-tabs" role="tablist" aria-label="Vista task list">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === 'history'}
+            className={mode === 'history' ? 'active' : undefined}
+            onClick={() => setMode('history')}
+          >
+            Storico
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === 'info'}
+            className={mode === 'info' ? 'active' : undefined}
+            onClick={() => setMode('info')}
+          >
+            Info
+          </button>
+        </div>
+
+        {mode === 'info' ? (
+          <TaskListInfoPanel
+            list={list}
+            onLoad={onLoadInfo}
+            onCreateDocument={onCreateInfoDocument}
+            onUpdateDocument={onUpdateInfoDocument}
+            onUploadFile={onUploadInfoFile}
+            onReadFile={onReadInfoFile}
+            onDownloadFile={onDownloadInfoFile}
+          />
+        ) : dayGroups.length === 0 ? (
           <p className="tasklist-history-empty">
             Non ci sono ancora task assegnati a questa tasklist.
           </p>

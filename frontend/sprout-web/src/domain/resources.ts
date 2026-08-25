@@ -1,5 +1,6 @@
 import type {
   EncryptedPayloadDto,
+  InfoDocumentDto,
   ProjectView,
   TaskDto,
   TaskListDto,
@@ -16,6 +17,8 @@ import {
 } from '../security/wasm'
 import type {
   DecryptedTask,
+  DecryptedInfoDocument,
+  InfoDocumentContent,
   ProjectDocument,
   ResourceKind,
   TaskDocument,
@@ -238,6 +241,54 @@ export const decryptTask = async (
     keyEpoch: task.key_epoch,
   }),
 })
+
+export const decryptInfoDocument = async (
+  document: InfoDocumentDto,
+  vault: KeyVault,
+): Promise<DecryptedInfoDocument> => {
+  const resourceKey = requireKey(
+    vault,
+    document.resource_node_id,
+    document.key_epoch,
+  )
+  return {
+    wire: document,
+    document: await decryptDocument<InfoDocumentContent>(document.payload, {
+      projectId: document.project_id,
+      resourceId: document.id,
+      kind: document.task_list_id ? 'task-list' : 'topic',
+      aggregateVersion: document.payload_version,
+      keyEpoch: document.key_epoch,
+      resourceKey,
+    }),
+  }
+}
+
+export const encryptInfoDocument = (
+  vault: KeyVault,
+  input: {
+    projectId: Uuid
+    documentId: Uuid
+    containerResourceId: Uuid
+    aggregateVersion: number
+    keyEpoch: number
+    kind: 'task-list' | 'topic'
+    document: InfoDocumentContent
+  },
+): Promise<EncryptedPayloadDto> =>
+  encryptDocument(input.document, {
+    projectId: input.projectId,
+    resourceId: input.documentId,
+    keyId: crypto.randomUUID(),
+    kind: input.kind,
+    aggregateVersion: input.aggregateVersion,
+    keyEpoch: input.keyEpoch,
+    resourceKey: requireKey(
+      vault,
+      input.containerResourceId,
+      input.keyEpoch,
+    ),
+  })
 
 export const createEncryptedResource = async <T>(
   vault: KeyVault,

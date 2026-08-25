@@ -6,12 +6,7 @@ use uuid::Uuid;
 
 use super::email::{normalize_email, normalize_handle};
 use super::webauthn::{DeviceSessionRequest, SessionResponse, create_device_session};
-use crate::{
-    AppState,
-    auth::set_database_context,
-    config::DeploymentEnvironment,
-    error::AppError,
-};
+use crate::{AppState, auth::set_database_context, config::DeploymentEnvironment, error::AppError};
 
 #[derive(Deserialize)]
 pub struct DevLoginRequest {
@@ -62,13 +57,8 @@ pub async fn login(
     .bind(identity_id)
     .execute(&mut *transaction)
     .await?;
-    let session = create_device_session(
-        &mut transaction,
-        &state.config,
-        identity_id,
-        request.device,
-    )
-    .await?;
+    let session =
+        create_device_session(&mut transaction, &state.config, identity_id, request.device).await?;
     transaction.commit().await?;
     Ok(Json(session))
 }
@@ -78,9 +68,7 @@ async fn resolve_identity_id(
     request: &DevLoginRequest,
 ) -> Result<Uuid, AppError> {
     if request.email.is_none() && request.identity_handle.is_none() {
-        return Err(AppError::BadRequest(
-            "email or identity_handle is required",
-        ));
+        return Err(AppError::BadRequest("email or identity_handle is required"));
     }
     if let Some(email) = &request.email {
         let normalized_email = normalize_email(email)?;

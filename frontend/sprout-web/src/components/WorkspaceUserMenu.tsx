@@ -44,6 +44,7 @@ const menuItems: Array<{ id: AppScreen; label: string; icon: MenuIcon }> = [
   { id: 'retention', label: 'Retention', icon: ClockIcon },
   { id: 'conflicts', label: 'Conflitti', icon: AlertTriangleIcon },
   { id: 'security', label: 'Sicurezza', icon: LockIcon },
+  { id: 'ai', label: 'AI / Generazione testo', icon: SlidersIcon },
 ]
 
 const USER_ID_LABEL = /^User\s+[a-f0-9]{6,}$/i

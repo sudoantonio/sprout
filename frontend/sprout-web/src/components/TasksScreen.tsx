@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useId,
   useLayoutEffect,
@@ -7,6 +8,7 @@ import {
   useState,
   type CSSProperties,
   type FormEvent,
+  type ReactElement,
 } from 'react'
 import { createPortal } from 'react-dom'
 import type {
@@ -20,7 +22,6 @@ import {
   formatDueDate,
   formatTaskCardDueDate,
   getTaskStatusIndicator,
-  isRecurringTaskOverdue,
   isTaskOverdue,
   sortItemsByTaskUrgency,
   sortTaskListsByUrgency,
@@ -42,6 +43,9 @@ import {
   resolveTaskListIconColorFromStored,
   TASK_LIST_ICON_COLORS,
   type DecryptedTask,
+  type DecryptedInfoDocument,
+  type InfoDocumentContent,
+  type InfoFileBlock,
   type TaskCreationInput,
   type TaskDocument,
   type TaskFilter,
@@ -76,7 +80,6 @@ import {
   SidebarHomeIcon,
   FolderIcon,
   PaperclipIcon,
-  PencilIcon,
   PlusIcon,
   RepeatIcon,
   UsersIcon,
@@ -128,6 +131,28 @@ export interface TasksScreenProps {
       color?: TaskListColumnColor
       icon?: TaskListIcon
     },
+  ): Promise<void>
+  onLoadTaskListInfo(list: TaskListItem): Promise<DecryptedInfoDocument[]>
+  onCreateTaskListInfoDocument(
+    list: TaskListItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onUpdateInfoDocument(
+    document: DecryptedInfoDocument,
+    content: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onUploadInfoDocumentFile(
+    document: DecryptedInfoDocument,
+    file: File,
+  ): Promise<InfoFileBlock>
+  onReadInfoDocumentFile(
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
+  ): Promise<Blob>
+  onDownloadInfoDocumentFile(
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
   ): Promise<void>
   onCreateTask(input: TaskCreationInput, listId: Uuid): Promise<void>
   onUpdateTask(
@@ -882,7 +907,7 @@ type TaskKind = 'priority' | 'deadline' | 'recurring'
 type TaskKindOption = readonly [
   TaskKind,
   string,
-  (props: React.SVGProps<SVGSVGElement>) => JSX.Element,
+  (props: React.SVGProps<SVGSVGElement>) => ReactElement,
 ]
 
 const TASK_KIND_OPTIONS = [
@@ -2424,7 +2449,7 @@ const TaskDetailPanel = ({
 
 const CreateTaskPanel = ({
   list,
-  anchorRect,
+  anchorRect: _anchorRect,
   boardMembers,
   publishedQuestionnaireVersions,
   onCreateTask,
@@ -2710,7 +2735,7 @@ export const TasksScreen = ({
   boardViewMode,
   selectedTopicId,
   selectedTaskId,
-  currentUserLabel,
+  currentUserLabel: _currentUserLabel,
   publishedQuestionnaireVersions,
   filter,
   loading,
@@ -2725,6 +2750,12 @@ export const TasksScreen = ({
   onDeleteTopic,
   onCreateList,
   onUpdateTaskList,
+  onLoadTaskListInfo,
+  onCreateTaskListInfoDocument,
+  onUpdateInfoDocument,
+  onUploadInfoDocumentFile,
+  onReadInfoDocumentFile,
+  onDownloadInfoDocumentFile,
   onCreateTask,
   onUpdateTask,
   onAssignTask,
@@ -2913,18 +2944,7 @@ export const TasksScreen = ({
     mobileSearchInputRef.current?.focus()
   }, [mobileSearchOpen, mobileSearchOverlayVisible])
 
-  useEffect(() => {
-    if (!mobileSearchOpen) return
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        closeMobileSearch(false)
-      }
-    }
-    document.addEventListener('keydown', onKeyDown)
-    return () => document.removeEventListener('keydown', onKeyDown)
-  }, [mobileSearchOpen])
-
-  const rememberRecentSearch = (query: string) => {
+  const rememberRecentSearch = useCallback((query: string) => {
     const trimmed = query.trim()
     if (!trimmed) return
     setRecentSearches((previous) => {
@@ -2935,13 +2955,27 @@ export const TasksScreen = ({
       persistRecentSearches(next)
       return next
     })
-  }
+  }, [])
 
-  const closeMobileSearch = (rememberQuery = true) => {
-    if (rememberQuery) rememberRecentSearch(searchQuery)
-    setMobileSearchOpen(false)
-    setSearchQuery('')
-  }
+  const closeMobileSearch = useCallback(
+    (rememberQuery = true) => {
+      if (rememberQuery) rememberRecentSearch(searchQuery)
+      setMobileSearchOpen(false)
+      setSearchQuery('')
+    },
+    [rememberRecentSearch, searchQuery],
+  )
+
+  useEffect(() => {
+    if (!mobileSearchOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeMobileSearch(false)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [closeMobileSearch, mobileSearchOpen])
 
   const isMemberBoard = isMemberBoardFocus(boardFocus)
 
@@ -3352,6 +3386,16 @@ export const TasksScreen = ({
             ? 'Il progetto selezionato non è stato caricato. Attendi qualche secondo e ricarica la pagina se il problema persiste.'
             : 'Create or select an encrypted project to load its resources.'}
         </p>
+        {!hasSelectedProject && (
+          <BoardProjectSwitcher
+            projects={userMenu.projects}
+            selectedProjectId={userMenu.selectedProjectId}
+            projectName={userMenu.projectName}
+            onProjectNameChange={userMenu.onProjectNameChange}
+            onSelectProject={userMenu.onSelectProject}
+            onCreateProject={userMenu.onCreateProject}
+          />
+        )}
       </section>
     )
   }
@@ -3489,7 +3533,7 @@ export const TasksScreen = ({
               type="button"
               className="board-mobile-search-close"
               aria-label="Chiudi ricerca"
-              onClick={closeMobileSearch}
+              onClick={() => closeMobileSearch()}
             >
               <XIcon aria-hidden />
             </button>
@@ -3940,6 +3984,12 @@ export const TasksScreen = ({
                 return next
               })
             }}
+            onLoadInfo={onLoadTaskListInfo}
+            onCreateInfoDocument={onCreateTaskListInfoDocument}
+            onUpdateInfoDocument={onUpdateInfoDocument}
+            onUploadInfoFile={onUploadInfoDocumentFile}
+            onReadInfoFile={onReadInfoDocumentFile}
+            onDownloadInfoFile={onDownloadInfoDocumentFile}
             onSelectTask={(id) => {
               closeListHistory()
               onSelectTask(id)
