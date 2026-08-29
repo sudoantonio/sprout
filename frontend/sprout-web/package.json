@@ -24,6 +24,7 @@
     "chrono-node": "^2.10.1",
     "emojibase": "^17.0.0",
     "emojibase-data": "^17.0.0",
+    "geist": "^1.7.2",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-markdown": "10.1.0",

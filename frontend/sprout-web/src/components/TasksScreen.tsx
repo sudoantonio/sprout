@@ -8,17 +8,20 @@ import {
   useState,
   type CSSProperties,
   type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactElement,
 } from 'react'
 import { createPortal } from 'react-dom'
 import type {
+  AgentDirectoryItemDto,
   AttachmentCollectionItemDto,
+  ProvisionAgentResponse,
   TaskDto,
   Uuid,
 } from '../api/contracts'
 import {
   filterBoardSearch,
-  filterTasks,
   formatDueDate,
   formatTaskCardDueDate,
   getTaskStatusIndicator,
@@ -57,7 +60,11 @@ import { TaskListIconPanel } from './TaskListIconPanel'
 import { TaskListAvatarContent } from './TaskListAvatarContent'
 import { BoardTimelineView } from './BoardTimelineView'
 import { BoardProjectSwitcher } from './BoardProjectSwitcher'
-import { TaskListHistoryPanel } from './TaskListHistoryPanel'
+import {
+  TaskHistoryRows,
+  TaskListHistoryPanel,
+} from './TaskListHistoryPanel'
+import { InfoDocumentPanel } from './TaskListInfoPanel'
 import type {
   BoardFocus,
   BoardMember,
@@ -70,23 +77,26 @@ import {
   AgentIcon,
   CalendarIcon,
   CheckIcon,
-  CircleIcon,
+  ChevronIcon,
   ChevronDownIcon,
+  CircleIcon,
   ClockIcon,
   ExpandDetailIcon,
+  FilterIcon,
   FlagIcon,
   LayoutGridIcon,
   LockIcon,
   SidebarHomeIcon,
+  SidebarUserIcon,
   FolderIcon,
   PaperclipIcon,
   PlusIcon,
   RepeatIcon,
   UsersIcon,
   SearchIcon,
-  SidebarCollapseIcon,
-  SidebarExpandIcon,
+  SidebarAgentIcon,
   StarIcon,
+  TimeHistoryIcon,
   XIcon,
 } from './icons'
 import {
@@ -94,6 +104,16 @@ import {
   type WorkspaceUserMenuProps,
 } from './WorkspaceUserMenu'
 import { NaturalLanguageDateField } from './NaturalLanguageDateField'
+import { AgentManagementPanel } from './AgentManagementPanel'
+
+type AgentActivityFilter = 'all' | 'working' | 'done' | 'rest'
+
+const AGENT_FILTER_OPTIONS: Array<[AgentActivityFilter, string]> = [
+  ['all', 'Tutti gli agenti'],
+  ['working', 'Working'],
+  ['done', 'Done'],
+  ['rest', 'Rest'],
+]
 
 export interface TasksScreenProps {
   project?: ProjectItem
@@ -102,6 +122,7 @@ export interface TasksScreenProps {
   tasks: DecryptedTask[]
   lockedTasks: TaskDto[]
   boardMembers: BoardMember[]
+  agents: AgentDirectoryItemDto[]
   boardFocus: BoardFocus
   boardViewMode: BoardViewMode
   selectedTopicId?: Uuid
@@ -132,6 +153,18 @@ export interface TasksScreenProps {
       icon?: TaskListIcon
     },
   ): Promise<void>
+  onLoadProjectInfo(project: ProjectItem): Promise<DecryptedInfoDocument[]>
+  onCreateProjectInfoDocument(
+    project: ProjectItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onLoadTopicInfo(topic: TopicItem): Promise<DecryptedInfoDocument[]>
+  onCreateTopicInfoDocument(
+    topic: TopicItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
   onLoadTaskListInfo(list: TaskListItem): Promise<DecryptedInfoDocument[]>
   onCreateTaskListInfoDocument(
     list: TaskListItem,
@@ -167,6 +200,7 @@ export interface TasksScreenProps {
     name: string
     role?: 'admin' | 'member' | 'guest'
   }): Promise<void>
+  onProvisionAgent(envelope: unknown): Promise<ProvisionAgentResponse>
   taskAttachments: AttachmentCollectionItemDto[]
   taskAttachmentLabels: Record<string, string>
   onRefreshTaskAttachments(taskId: Uuid): Promise<void>
@@ -197,6 +231,11 @@ const isMemberBoardFocus = (
   focus: BoardFocus,
 ): focus is { type: 'members' } | { type: 'member'; identityId: Uuid } =>
   focus.type === 'members' || focus.type === 'member'
+
+const isAgentBoardFocus = (
+  focus: BoardFocus,
+): focus is { type: 'agents' } | { type: 'agent'; agentId: Uuid } =>
+  focus.type === 'agents' || focus.type === 'agent'
 
 const BoardTaskCard = ({
   task,
@@ -312,6 +351,98 @@ const memberAvatarClassName = (identityId: Uuid, extra = ''): string =>
   ['board-avatar', 'member', memberAvatarColorClass(identityId), extra]
     .filter(Boolean)
     .join(' ')
+
+const MembersOverviewPanel = ({
+  members,
+  onInviteMember,
+}: {
+  members: BoardMember[]
+  onInviteMember(input: {
+    email: string
+    name: string
+    role?: 'admin' | 'member' | 'guest'
+  }): Promise<void>
+}) => {
+  const [createOpen, setCreateOpen] = useState(false)
+  const [email, setEmail] = useState('')
+  const [name, setName] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setSubmitting(true)
+    try {
+      await onInviteMember({ email: email.trim(), name: name.trim(), role: 'member' })
+      setEmail('')
+      setName('')
+      setCreateOpen(false)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <section className="agent-management member-management" aria-label="Panoramica membri">
+      <article className="agent-stage-panel">
+        <div className="agent-stage member-stage">
+          <section className="agent-stage-group" aria-labelledby="members-overview-title">
+            <header>
+              <div>
+                <h2 id="members-overview-title">Membri</h2>
+              </div>
+            </header>
+            <div className="agent-stage-row">
+              <button
+                type="button"
+                className="agent-stage-create"
+                onClick={() => setCreateOpen(true)}
+                aria-label="Invita nuovo membro"
+              >
+                <span aria-hidden>
+                  <PlusIcon />
+                </span>
+                <strong>New</strong>
+              </button>
+              {members.map((member) => (
+                <div
+                  className="agent-stage-tile agent-stage-tile--demo member-stage-tile"
+                  key={member.identityId}
+                >
+                  <span className={`agent-stage-avatar member-stage-avatar ${memberAvatarClassName(member.identityId)}`} aria-hidden>
+                    {initialsFor(member.label)}
+                  </span>
+                  <strong>{member.label}</strong>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+        {createOpen && (
+          <form className="member-overview-invite" onSubmit={(event) => void submit(event)}>
+            <input
+              required
+              autoFocus
+              type="email"
+              placeholder="Email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              aria-label="Email membro"
+            />
+            <input
+              required
+              placeholder="Nome"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              aria-label="Nome membro"
+            />
+            <button type="button" onClick={() => setCreateOpen(false)}>Annulla</button>
+            <button type="submit" disabled={submitting}>Invita</button>
+          </form>
+        )}
+      </article>
+    </section>
+  )
+}
 
 const topicAvatarClass = (index: number): string => {
   const color = TOPIC_ICON_COLORS[index % TOPIC_ICON_COLORS.length]
@@ -493,18 +624,9 @@ const BoardColumnHeader = ({
 
 const MemberColumnHeader = ({
   member,
-  addMenuOpen,
-  taskLists,
-  onToggleAddMenu,
-  onSelectList,
 }: {
   member: BoardMember
-  addMenuOpen: boolean
-  taskLists: TaskListItem[]
-  onToggleAddMenu(): void
-  onSelectList(listId: Uuid): void
 }) => {
-  const availableLists = taskLists.filter((list) => list.document)
   return (
     <header className="board-column-header board-column-header--member">
       <div className="board-column-identity">
@@ -518,48 +640,403 @@ const MemberColumnHeader = ({
           <h3>{member.label}</h3>
         </div>
       </div>
-      <div className="board-column-actions board-column-actions--member">
-        <div className="board-member-add-wrap">
-          <button
-            type="button"
-            className="board-add-task"
-            aria-expanded={addMenuOpen}
-            aria-haspopup="menu"
-            disabled={availableLists.length === 0}
-            onClick={onToggleAddMenu}
-          >
-            <PlusIcon />
-            Aggiungi
-            <ChevronDownIcon className="board-add-task-chevron" />
-          </button>
-          {addMenuOpen && availableLists.length > 0 && (
-            <ul className="board-member-add-menu" role="menu">
-              {availableLists.map((list) => (
-                <li key={list.wire.id} role="none">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className="board-member-add-menu-item"
-                    onClick={() => onSelectList(list.wire.id)}
-                  >
-                    {list.document?.name ?? 'Locked list'}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </div>
     </header>
   )
 }
 
-const BOARD_FILTER_OPTIONS = [
-  ['open', 'Aperti'],
-  ['today', 'Oggi'],
-  ['upcoming', 'Prossimi'],
-  ['completed', 'Completati'],
-] as const satisfies ReadonlyArray<[TaskFilter, string]>
+const AgentColumnHeader = ({
+  agent,
+  onAddTask,
+}: {
+  agent: AgentDirectoryItemDto
+  onAddTask(): void
+}) => (
+  <header className="board-column-header board-column-header--member">
+    <div className="board-column-identity">
+      <span
+        className={`board-avatar column member ${memberAvatarColorClass(agent.principal_identity_id)}`}
+        aria-hidden
+      >
+        {initialsFor(agent.identity_handle)}
+      </span>
+      <div className="board-column-title-row">
+        <h3>{agent.identity_handle}</h3>
+      </div>
+    </div>
+    <div className="board-column-actions">
+      <button type="button" className="board-add-task" onClick={onAddTask}>
+        <PlusIcon />
+        Aggiungi
+      </button>
+    </div>
+  </header>
+)
+
+const AgentTaskListHeader = ({ onAddTask }: { onAddTask(): void }) => (
+  <header className="board-column-header board-column-header--member">
+    <div className="board-column-identity">
+      <span className="board-avatar column member column-sky" aria-hidden>
+        A
+      </span>
+      <div className="board-column-title-row">
+        <h3>Tasklist agenti</h3>
+      </div>
+    </div>
+    <div className="board-column-actions">
+      <button type="button" className="board-add-task" onClick={onAddTask}>
+        <PlusIcon />
+        Aggiungi
+      </button>
+    </div>
+  </header>
+)
+
+type TaskTypeFilter = 'priority' | 'deadline' | 'recurring'
+type TaskStateFilter = 'open' | 'completed'
+type TaskDateFilter = 'overdue' | 'today' | 'upcoming' | 'none'
+
+interface AdvancedTaskFilters {
+  listIds: Uuid[]
+  types: TaskTypeFilter[]
+  memberIds: Uuid[]
+  states: TaskStateFilter[]
+  dates: TaskDateFilter[]
+}
+
+type TaskFilterGroup = keyof AdvancedTaskFilters
+
+const taskTypeFor = (task: DecryptedTask): TaskTypeFilter =>
+  task.document.recurrence
+    ? 'recurring'
+    : task.document.due_at
+      ? 'deadline'
+      : 'priority'
+
+const boardTaskGroupMeta = (
+  task: DecryptedTask,
+  group: TaskFilterGroup,
+  members: BoardMember[],
+  now = new Date(),
+): { key: string; label: string; tone: string; rank: number; member?: BoardMember } => {
+  if (group === 'types') {
+    const type = taskTypeFor(task)
+    if (type === 'priority') {
+      const priority = task.document.priority ?? 'normal'
+      return priority === 'high'
+        ? { key: 'priority-high', label: 'Priorità alta', tone: 'danger', rank: 0 }
+        : priority === 'low'
+          ? { key: 'priority-low', label: 'Priorità bassa', tone: 'info', rank: 2 }
+          : { key: 'priority-normal', label: 'Priorità media', tone: 'warning', rank: 1 }
+    }
+    if (type === 'deadline') {
+      const due = new Date(task.document.due_at as string)
+      const todayStart = new Date(now)
+      todayStart.setHours(0, 0, 0, 0)
+      const todayEnd = new Date(now)
+      todayEnd.setHours(23, 59, 59, 999)
+      return due.getTime() < todayStart.getTime()
+        ? { key: 'deadline-overdue', label: 'Scadenza · Scadute', tone: 'danger', rank: 3 }
+        : due.getTime() <= todayEnd.getTime()
+          ? { key: 'deadline-today', label: 'Scadenza · Oggi', tone: 'orange', rank: 4 }
+          : { key: 'deadline-upcoming', label: 'Scadenza · Prossime', tone: 'orange', rank: 5 }
+    }
+
+    const recurrence = task.document.recurrence
+    const frequency = recurrence?.frequency ?? 'daily'
+    const interval = recurrence?.interval ?? 1
+    const singularLabels: Record<typeof frequency, string> = {
+      minutes: 'Minuti',
+      daily: 'Giornaliera',
+      weekly: 'Settimanale',
+      monthly: 'Mensile',
+    }
+    const pluralLabels: Record<typeof frequency, string> = {
+      minutes: 'minuti',
+      daily: 'giorni',
+      weekly: 'settimane',
+      monthly: 'mesi',
+    }
+    return {
+      key: `recurring-${frequency}-${interval}`,
+      label:
+        interval === 1
+          ? `Ricorsività · ${singularLabels[frequency]}`
+          : `Ricorsività · Ogni ${interval} ${pluralLabels[frequency]}`,
+      tone: 'violet',
+      rank: 10 + ['minutes', 'daily', 'weekly', 'monthly'].indexOf(frequency),
+    }
+  }
+
+  if (group === 'memberIds') {
+    const identityId = task.wire.active_assignee_identity_id
+    const member = members.find((item) => item.identityId === identityId)
+    return member
+      ? { key: member.identityId, label: member.label, tone: 'member', rank: 0, member }
+      : { key: 'unassigned', label: 'Non assegnato', tone: 'neutral', rank: 1 }
+  }
+
+  if (group === 'states') {
+    const completed = task.wire.state.state === 'completed'
+    return completed
+      ? { key: 'completed', label: 'Completati', tone: 'success', rank: 1 }
+      : { key: 'open', label: 'Da completare', tone: 'info', rank: 0 }
+  }
+
+  const dueAt = task.document.due_at
+  if (!dueAt) return { key: 'none', label: 'Senza data', tone: 'neutral', rank: 3 }
+  const due = new Date(dueAt)
+  const todayStart = new Date(now)
+  todayStart.setHours(0, 0, 0, 0)
+  const todayEnd = new Date(now)
+  todayEnd.setHours(23, 59, 59, 999)
+  if (due.getTime() < todayStart.getTime()) {
+    return { key: 'overdue', label: 'Scaduti', tone: 'danger', rank: 0 }
+  }
+  if (due.getTime() <= todayEnd.getTime()) {
+    return { key: 'today', label: 'Oggi', tone: 'mauve', rank: 1 }
+  }
+  return { key: 'upcoming', label: 'Prossimi', tone: 'orange', rank: 2 }
+}
+
+const BoardGroupedTaskCards = ({
+  tasks,
+  groups,
+  members,
+  selectedTaskId,
+  boardMemberById,
+  onSelectTask,
+  onCompleteTask,
+  level = 0,
+}: {
+  tasks: DecryptedTask[]
+  groups: TaskFilterGroup[]
+  members: BoardMember[]
+  selectedTaskId: Uuid | null | undefined
+  boardMemberById: Map<Uuid, BoardMember>
+  onSelectTask(taskId: Uuid): void
+  onCompleteTask(task: DecryptedTask): void
+  level?: number
+}) => {
+  if (groups.length === 0) {
+    return (
+      <ul className={`board-cards${level > 0 ? ' board-cards--grouped' : ''}`}>
+        {tasks.map((task) => (
+          <li key={task.wire.id}>
+            <BoardTaskCard
+              task={task}
+              selected={selectedTaskId === task.wire.id}
+              boardMemberById={boardMemberById}
+              onSelect={() => onSelectTask(task.wire.id)}
+              onComplete={() => onCompleteTask(task)}
+            />
+          </li>
+        ))}
+      </ul>
+    )
+  }
+
+  const [group, ...remainingGroups] = groups
+  const buckets = new Map<
+    string,
+    { meta: ReturnType<typeof boardTaskGroupMeta>; tasks: DecryptedTask[] }
+  >()
+  tasks.forEach((task) => {
+    const meta = boardTaskGroupMeta(task, group, members)
+    const bucket = buckets.get(meta.key)
+    if (bucket) bucket.tasks.push(task)
+    else buckets.set(meta.key, { meta, tasks: [task] })
+  })
+
+  return (
+    <div className={`board-card-groups board-card-groups--level-${level}`}>
+      {[...buckets.values()]
+        .sort((left, right) => left.meta.rank - right.meta.rank)
+        .map(({ meta, tasks: groupedTasks }) => (
+        <section className="board-card-group" key={`${group}-${meta.key}`}>
+          <div className="board-card-group-heading">
+            {meta.member ? (
+              <>
+                <span
+                  className={`board-avatar member ${memberAvatarColorClass(meta.member.identityId)}`}
+                  aria-hidden
+                >
+                  {initialFor(meta.member.label)}
+                </span>
+                <span className="board-card-group-member-name">{meta.member.label}</span>
+              </>
+            ) : (
+              <span className={`tasklist-history-day-label tasklist-history-day-label--${meta.tone}`}>
+                {meta.label}
+              </span>
+            )}
+          </div>
+          <BoardGroupedTaskCards
+            tasks={groupedTasks}
+            groups={remainingGroups}
+            members={members}
+            selectedTaskId={selectedTaskId}
+            boardMemberById={boardMemberById}
+            onSelectTask={onSelectTask}
+            onCompleteTask={onCompleteTask}
+            level={level + 1}
+          />
+        </section>
+      ))}
+    </div>
+  )
+}
+
+const BoardColumnFilterBadges = ({
+  filters,
+  members,
+  onRemove,
+}: {
+  filters: AdvancedTaskFilters
+  members: BoardMember[]
+  onRemove(key: keyof AdvancedTaskFilters, value: string): void
+}) => {
+  const hasBadges =
+    filters.types.length > 0 ||
+    filters.memberIds.length > 0 ||
+    filters.states.length > 0 ||
+    filters.dates.length > 0
+
+  if (!hasBadges) return null
+
+  const typeMeta: Record<TaskTypeFilter, { label: string; tone: string }> = {
+    priority: { label: 'Priorità', tone: 'warning' },
+    deadline: { label: 'Scadenza', tone: 'orange' },
+    recurring: { label: 'Ricorsività', tone: 'violet' },
+  }
+  const stateMeta: Record<TaskStateFilter, { label: string; tone: string }> = {
+    open: { label: 'Da completare', tone: 'info' },
+    completed: { label: 'Completati', tone: 'success' },
+  }
+  const dateMeta: Record<TaskDateFilter, { label: string; tone: string }> = {
+    overdue: { label: 'Scaduti', tone: 'danger' },
+    today: { label: 'Oggi', tone: 'mauve' },
+    upcoming: { label: 'Prossimi', tone: 'orange' },
+    none: { label: 'Senza data', tone: 'neutral' },
+  }
+
+  return (
+    <div className="board-column-filter-badges" aria-label="Filtri attivi nella tasklist">
+      {filters.types.map((value) => {
+        const meta = typeMeta[value]
+        return (
+          <button
+            type="button"
+            key={`type-${value}`}
+            className={`tasklist-history-day-label tasklist-history-day-label--${meta.tone} board-column-filter-badge`}
+            title={`Rimuovi filtro ${meta.label}`}
+            onClick={() => onRemove('types', value)}
+          >
+            {meta.label}
+          </button>
+        )
+      })}
+      {filters.memberIds.map((identityId) => {
+        const member = members.find((item) => item.identityId === identityId)
+        if (!member) return null
+        return (
+          <button
+            type="button"
+            key={`member-${identityId}`}
+            className={`board-avatar member ${memberAvatarColorClass(identityId)} board-column-filter-member`}
+            title={`Rimuovi filtro ${member.label}`}
+            aria-label={`Rimuovi filtro ${member.label}`}
+            onClick={() => onRemove('memberIds', identityId)}
+          >
+            {initialFor(member.label)}
+          </button>
+        )
+      })}
+      {filters.states.map((value) => {
+        const meta = stateMeta[value]
+        return (
+          <button
+            type="button"
+            key={`state-${value}`}
+            className={`tasklist-history-day-label tasklist-history-day-label--${meta.tone} board-column-filter-badge`}
+            title={`Rimuovi filtro ${meta.label}`}
+            onClick={() => onRemove('states', value)}
+          >
+            {meta.label}
+          </button>
+        )
+      })}
+      {filters.dates.map((value) => {
+        const meta = dateMeta[value]
+        return (
+          <button
+            type="button"
+            key={`date-${value}`}
+            className={`tasklist-history-day-label tasklist-history-day-label--${meta.tone} board-column-filter-badge`}
+            title={`Rimuovi filtro ${meta.label}`}
+            onClick={() => onRemove('dates', value)}
+          >
+            {meta.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+const initialAdvancedTaskFilters = (filter: TaskFilter): AdvancedTaskFilters => ({
+  listIds: [],
+  types: [],
+  memberIds: [],
+  states: filter === 'completed' ? ['completed'] : ['open'],
+  dates:
+    filter === 'today'
+      ? ['today']
+      : filter === 'upcoming'
+        ? ['upcoming']
+        : [],
+})
+
+const applyAdvancedTaskFilters = (
+  tasks: DecryptedTask[],
+  filters: AdvancedTaskFilters,
+  now = new Date(),
+): DecryptedTask[] => {
+  const todayStart = new Date(now)
+  todayStart.setHours(0, 0, 0, 0)
+  const todayEnd = new Date(now)
+  todayEnd.setHours(23, 59, 59, 999)
+
+  return tasks.filter((task) => {
+    if (filters.listIds.length > 0 && !filters.listIds.includes(task.wire.list_id)) return false
+
+    const taskType = taskTypeFor(task)
+    if (filters.types.length > 0 && !filters.types.includes(taskType)) return false
+
+    const assigneeId = task.wire.active_assignee_identity_id
+    if (filters.memberIds.length > 0 && (!assigneeId || !filters.memberIds.includes(assigneeId))) {
+      return false
+    }
+
+    const state: TaskStateFilter = task.wire.state.state === 'completed' ? 'completed' : 'open'
+    if (filters.states.length > 0 && !filters.states.includes(state)) return false
+
+    if (filters.dates.length > 0) {
+      const dueAt = task.document.due_at
+      const matchesDate = filters.dates.some((dateFilter) => {
+        if (dateFilter === 'none') return !dueAt
+        if (!dueAt) return false
+        const due = new Date(dueAt).getTime()
+        if (!Number.isFinite(due)) return false
+        if (dateFilter === 'overdue') return due < todayStart.getTime()
+        if (dateFilter === 'today') return due >= todayStart.getTime() && due <= todayEnd.getTime()
+        return due > todayEnd.getTime()
+      })
+      if (!matchesDate) return false
+    }
+
+    return true
+  })
+}
 
 const sortTopicsForSidebar = (topics: TopicItem[]): TopicItem[] =>
   [...topics].sort((left, right) => {
@@ -949,9 +1426,6 @@ const RECURRENCE_FREQUENCY_OPTIONS = [
   ['monthly', 'Mese'],
 ] as const satisfies ReadonlyArray<[RecurrenceFrequency, string]>
 
-const boardFilterLabel = (filter: TaskFilter): string =>
-  BOARD_FILTER_OPTIONS.find(([value]) => value === filter)?.[1] ?? 'Aperti'
-
 const urgencyBadgeLabel = (badge: TopicUrgencyBadge): string => {
   if (badge.count === 1) {
     return badge.hasOverdue
@@ -1016,44 +1490,405 @@ const BoardMobileStoryRing = ({
   )
 }
 
+type EditableBoardViewMode = 'board' | 'timeline' | 'history'
+
+const BOARD_HIDDEN_VIEW_MODES_KEY = 'sprout.board.hidden-view-modes'
+const EDITABLE_BOARD_VIEWS: ReadonlyArray<
+  readonly [EditableBoardViewMode, string]
+> = [
+  ['board', 'Board'],
+  ['timeline', 'Timeline'],
+  ['history', 'History'],
+]
+
 const BoardViewModeSwitch = ({
   mode,
   onChange,
+  scopeKey,
+  compact = false,
 }: {
   mode: BoardViewMode
   onChange(mode: BoardViewMode): void
+  scopeKey: string
+  compact?: boolean
+}) => {
+  const [editing, setEditing] = useState(false)
+  const [addMenuOpen, setAddMenuOpen] = useState(false)
+  const [hiddenModes, setHiddenModes] = useState<EditableBoardViewMode[]>(() => {
+    try {
+      const stored = JSON.parse(
+        localStorage.getItem(`${BOARD_HIDDEN_VIEW_MODES_KEY}:${scopeKey}`) ?? '[]',
+      ) as unknown
+      if (!Array.isArray(stored)) return []
+      return stored.filter(
+        (value): value is EditableBoardViewMode =>
+          value === 'board' || value === 'timeline' || value === 'history',
+      )
+    } catch {
+      return []
+    }
+  })
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        `${BOARD_HIDDEN_VIEW_MODES_KEY}:${scopeKey}`,
+        JSON.stringify(hiddenModes),
+      )
+    } catch {
+      // Ignore unavailable storage.
+    }
+  }, [hiddenModes, scopeKey])
+
+  const availableViews = EDITABLE_BOARD_VIEWS.filter(
+    ([viewMode]) => !compact || viewMode === 'board',
+  )
+  const visibleViews = availableViews.filter(
+    ([viewMode]) => !hiddenModes.includes(viewMode),
+  )
+  const hiddenViews = availableViews.filter(([viewMode]) =>
+    hiddenModes.includes(viewMode),
+  )
+
+  const hideView = (viewMode: EditableBoardViewMode) => {
+    const nextHidden = [...hiddenModes, viewMode]
+    setHiddenModes(nextHidden)
+    setAddMenuOpen(false)
+    if (mode !== viewMode) return
+    const fallback = availableViews.find(
+      ([candidate]) => candidate !== viewMode && !nextHidden.includes(candidate),
+    )?.[0]
+    if (fallback) onChange(fallback)
+    else onChange('overview')
+  }
+
+  const restoreView = (viewMode: EditableBoardViewMode) => {
+    setHiddenModes((current) => current.filter((item) => item !== viewMode))
+    setAddMenuOpen(false)
+  }
+
+  return (
+    <div
+      className={`board-view-mode-switch${editing ? ' is-editing' : ''}`}
+      role="group"
+      aria-label="Vista board"
+    >
+      <button
+        type="button"
+        className="board-view-mode-option active board-view-more-option"
+        aria-label={editing ? 'Termina modifica tab' : 'Modifica tab'}
+        title={editing ? 'Termina modifica' : 'Modifica tab'}
+        onClick={() => {
+          setEditing((value) => !value)
+          setAddMenuOpen(false)
+        }}
+      >
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden>
+          <circle cx="3" cy="8" r="1.25" />
+          <circle cx="8" cy="8" r="1.25" />
+          <circle cx="13" cy="8" r="1.25" />
+        </svg>
+      </button>
+
+      <button
+        type="button"
+        className={
+          mode === 'overview'
+            ? 'board-view-mode-option active'
+            : 'board-view-mode-option'
+        }
+        aria-pressed={mode === 'overview'}
+        onClick={() => onChange('overview')}
+      >
+        Overview
+      </button>
+
+      {visibleViews.map(([viewMode, label]) => (
+        <button
+          type="button"
+          key={viewMode}
+          className={
+            mode === viewMode
+              ? 'board-view-mode-option board-view-editable-option active'
+              : 'board-view-mode-option board-view-editable-option'
+          }
+          aria-pressed={mode === viewMode}
+          onClick={() => onChange(viewMode)}
+        >
+          <span>{label}</span>
+          {editing && (
+            <span
+              className="board-view-mode-remove"
+              role="button"
+              tabIndex={0}
+              aria-label={`Nascondi ${label}`}
+              onClick={(event) => {
+                event.stopPropagation()
+                hideView(viewMode)
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return
+                event.preventDefault()
+                event.stopPropagation()
+                hideView(viewMode)
+              }}
+            >
+              <XIcon aria-hidden />
+            </span>
+          )}
+        </button>
+      ))}
+
+      {editing && hiddenViews.length > 0 && (
+        <div className="board-view-add-wrap">
+          <button
+            type="button"
+            className="board-view-mode-option board-view-add-option"
+            aria-label="Aggiungi tab"
+            aria-expanded={addMenuOpen}
+            onClick={() => setAddMenuOpen((value) => !value)}
+          >
+            <PlusIcon aria-hidden />
+          </button>
+          {addMenuOpen && (
+            <div className="board-view-add-menu" role="menu">
+              {hiddenViews.map(([viewMode, label]) => (
+                <button
+                  type="button"
+                  key={viewMode}
+                  role="menuitem"
+                  onClick={() => restoreView(viewMode)}
+                >
+                  <PlusIcon aria-hidden />
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+const BoardViewNavigation = ({
+  mode,
+  onChange,
+  scopeKey,
+  compact = false,
+}: {
+  mode: BoardViewMode
+  onChange(mode: BoardViewMode): void
+  scopeKey: string
+  compact?: boolean
 }) => (
-  <div
-    className="board-view-mode-switch"
-    role="group"
-    aria-label="Vista board"
-  >
-    <button
-      type="button"
-      className={
-        mode === 'board'
-          ? 'board-view-mode-option active'
-          : 'board-view-mode-option'
-      }
-      aria-pressed={mode === 'board'}
-      onClick={() => onChange('board')}
-    >
-      <LayoutGridIcon aria-hidden />
-      Board
-    </button>
-    <button
-      type="button"
-      className={
-        mode === 'timeline'
-          ? 'board-view-mode-option active'
-          : 'board-view-mode-option'
-      }
-      aria-pressed={mode === 'timeline'}
-      onClick={() => onChange('timeline')}
-    >
-      <CalendarIcon aria-hidden />
-      Timeline
-    </button>
+  <div className="board-view-navigation">
+    <BoardViewModeSwitch
+      key={scopeKey}
+      mode={mode}
+      onChange={onChange}
+      scopeKey={scopeKey}
+      compact={compact}
+    />
+  </div>
+)
+
+const BoardAiBadge = ({ onClose }: { onClose(): void }) => {
+  const [draft, setDraft] = useState('')
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    inputRef.current?.focus()
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [onClose])
+
+  return createPortal(
+    <section className="board-ai-badge" role="dialog" aria-label="New chat">
+      <header className="board-ai-badge-header">
+        <div className="board-ai-badge-title">
+          <button
+            type="button"
+            className="board-ai-badge-history"
+            onClick={() => setHistoryOpen((open) => !open)}
+            aria-label="Mostra chat passate"
+            aria-expanded={historyOpen}
+            title="Chat passate"
+          >
+            <TimeHistoryIcon aria-hidden />
+          </button>
+          <span>New chat</span>
+        </div>
+        <button type="button" onClick={onClose} aria-label="Chiudi New chat">
+          <XIcon aria-hidden />
+        </button>
+      </header>
+      {historyOpen && (
+        <div className="board-ai-badge-history-menu" role="status">
+          Nessuna chat precedente
+        </div>
+      )}
+      <div className="board-ai-badge-body">
+        {!historyOpen && (
+          <img
+            className="board-ai-badge-empty-logo"
+            src="/sprout-ai-logo.png"
+            alt=""
+          />
+        )}
+        <label className="agent-chat-composer board-ai-badge-composer">
+          <textarea
+            ref={inputRef}
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder="Ask everything"
+            aria-label="Messaggio per Ask to AI"
+            rows={1}
+          />
+          <button
+            type="button"
+            className="agent-chat-attach"
+            aria-label="Aggiungi contesto"
+            title="Aggiungi contesto"
+          >
+            <PlusIcon aria-hidden />
+          </button>
+          <button
+            type="button"
+            className="agent-chat-model"
+            aria-label="Seleziona modello: Sprout 1"
+            title="Seleziona modello"
+          >
+            Sprout 1
+            <ChevronDownIcon aria-hidden />
+          </button>
+          <button
+            type="button"
+            className="agent-chat-send"
+            disabled={!draft.trim()}
+            aria-label="Invia messaggio"
+            title="Disponibile prossimamente"
+          >
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden>
+              <path d="M12 19V5m0 0-6 6m6-6 6 6" />
+            </svg>
+          </button>
+        </label>
+      </div>
+    </section>,
+    document.body,
+  )
+}
+
+const BoardPathBadge = ({
+  topics,
+  onSelectFocus,
+  onClose,
+}: {
+  topics: TopicItem[]
+  onSelectFocus(focus: BoardFocus): void
+  onClose(): void
+}) => {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [onClose])
+
+  const select = (focus: BoardFocus) => {
+    onSelectFocus(focus)
+    onClose()
+  }
+
+  return createPortal(
+    <section className="board-path-badge" role="dialog" aria-label="Percorso file">
+      <header className="board-path-badge-header">
+        <span className="sr-only">Navigazione workspace</span>
+        <button type="button" onClick={onClose} aria-label="Chiudi percorso file">
+          <XIcon aria-hidden />
+        </button>
+      </header>
+      <nav className="board-path-badge-nav" aria-label="Navigazione workspace">
+        <button type="button" onClick={() => select({ type: 'members' })}>
+          <SidebarUserIcon aria-hidden />
+          Membri
+        </button>
+        <button type="button" onClick={() => select({ type: 'agents' })}>
+          <SidebarAgentIcon aria-hidden />
+          Agenti
+        </button>
+        <p>Spazio</p>
+        <button type="button" onClick={() => select({ type: 'generali' })}>
+          <SidebarHomeIcon aria-hidden />
+          Generali
+        </button>
+        {topics.map((topic) => (
+          <button
+            key={topic.wire.id}
+            type="button"
+            onClick={() => select({ type: 'topic', topicId: topic.wire.id })}
+          >
+            {topic.document ? <SidebarHomeIcon aria-hidden /> : <LockIcon aria-hidden />}
+            {topic.document?.name ?? 'Locked topic'}
+          </button>
+        ))}
+      </nav>
+    </section>,
+    document.body,
+  )
+}
+
+const AgentViewNavigation = ({
+  workspace,
+  onBack,
+}: {
+  workspace?: { name: string; avatar: string }
+  onBack(): void
+}) => (
+  <div className="board-view-navigation" aria-label="Viste agenti">
+    <div className="board-view-mode-switch">
+      {workspace ? (
+        <button
+          type="button"
+          className="board-view-mode-option active agent-view-back"
+          onClick={onBack}
+          aria-label="Torna alla panoramica agenti"
+        >
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden>
+            <path d="M19 12H5m6-6-6 6 6 6" />
+          </svg>
+          Back
+        </button>
+      ) : (
+        <span className="board-view-mode-option active" aria-current="page">
+          Overview
+        </span>
+      )}
+    </div>
+  </div>
+)
+
+const TaskListDetailViewNavigation = ({ onBack }: { onBack(): void }) => (
+  <div className="board-view-navigation" aria-label="Vista tasklist">
+    <div className="board-view-mode-switch">
+      <button
+        type="button"
+        className="board-view-mode-option active agent-view-back"
+        onClick={onBack}
+        aria-label="Torna alla board"
+      >
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden>
+          <path d="M19 12H5m6-6-6 6 6 6" />
+        </svg>
+        Back
+      </button>
+    </div>
   </div>
 )
 
@@ -1065,6 +1900,19 @@ const BoardMobileIslandViewModes = ({
   onChange(mode: BoardViewMode): void
 }) => (
   <>
+    <button
+      type="button"
+      className={
+        mode === 'overview'
+          ? 'board-mobile-island-toggle active'
+          : 'board-mobile-island-toggle'
+      }
+      aria-label="Overview"
+      aria-current={mode === 'overview' ? 'page' : undefined}
+      onClick={() => onChange('overview')}
+    >
+      <FolderIcon aria-hidden />
+    </button>
     <button
       type="button"
       className={
@@ -1091,10 +1939,148 @@ const BoardMobileIslandViewModes = ({
     >
       <CalendarIcon aria-hidden />
     </button>
+    <button
+      type="button"
+      className={
+        mode === 'history'
+          ? 'board-mobile-island-toggle active'
+          : 'board-mobile-island-toggle'
+      }
+      aria-label="History"
+      aria-current={mode === 'history' ? 'page' : undefined}
+      onClick={() => onChange('history')}
+    >
+      <ClockIcon aria-hidden />
+    </button>
   </>
 )
 
+const BoardOverviewView = ({
+  project,
+  topic,
+  onLoadProjectInfo,
+  onCreateProjectInfoDocument,
+  onLoadTopicInfo,
+  onCreateTopicInfoDocument,
+  onUpdateInfoDocument,
+  onUploadInfoDocumentFile,
+  onReadInfoDocumentFile,
+  onDownloadInfoDocumentFile,
+}: {
+  project?: ProjectItem
+  topic?: TopicItem
+  onLoadProjectInfo(project: ProjectItem): Promise<DecryptedInfoDocument[]>
+  onCreateProjectInfoDocument(
+    project: ProjectItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onLoadTopicInfo(topic: TopicItem): Promise<DecryptedInfoDocument[]>
+  onCreateTopicInfoDocument(
+    topic: TopicItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onUpdateInfoDocument(
+    document: DecryptedInfoDocument,
+    content: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument>
+  onUploadInfoDocumentFile(
+    document: DecryptedInfoDocument,
+    file: File,
+  ): Promise<InfoFileBlock>
+  onReadInfoDocumentFile(
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
+  ): Promise<Blob>
+  onDownloadInfoDocumentFile(
+    document: DecryptedInfoDocument,
+    file: InfoFileBlock,
+  ): Promise<void>
+}) => {
+  const scopeName = topic
+    ? (topic.document?.name ?? 'Categoria protetta')
+    : (project?.document?.name ?? 'Generali')
+  return (
+    <section className="board-overview" aria-label={`Overview ${scopeName}`}>
+      <div className="board-overview-document">
+        <div className="board-overview-scroll">
+        {topic ? (
+          <InfoDocumentPanel
+            container={topic}
+            presentation="overview"
+            overviewTitle={scopeName}
+            onLoad={onLoadTopicInfo}
+            onCreateDocument={onCreateTopicInfoDocument}
+            onUpdateDocument={onUpdateInfoDocument}
+            onUploadFile={onUploadInfoDocumentFile}
+            onReadFile={onReadInfoDocumentFile}
+            onDownloadFile={onDownloadInfoDocumentFile}
+          />
+        ) : project ? (
+          <InfoDocumentPanel
+            container={project}
+            presentation="overview"
+            overviewTitle={scopeName}
+            onLoad={onLoadProjectInfo}
+            onCreateDocument={onCreateProjectInfoDocument}
+            onUpdateDocument={onUpdateInfoDocument}
+            onUploadFile={onUploadInfoDocumentFile}
+            onReadFile={onReadInfoDocumentFile}
+            onDownloadFile={onDownloadInfoDocumentFile}
+          />
+        ) : null}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+const BoardHistoryView = ({
+  tasks,
+  boardMembers,
+  taskLists,
+  groupModes,
+  selectedTaskId,
+  scopeName,
+  onSelectTask,
+}: {
+  tasks: DecryptedTask[]
+  boardMembers: BoardMember[]
+  taskLists: TaskListItem[]
+  groupModes: Array<'tasklist' | 'type' | 'member' | 'state' | 'date'>
+  selectedTaskId?: Uuid
+  scopeName: string
+  onSelectTask(id: Uuid): void
+}) => {
+  return (
+    <section className="board-history" aria-label={`History ${scopeName}`}>
+      <div
+        className={
+          tasks.length === 0
+            ? 'board-history-scroll board-history-scroll--empty'
+            : 'board-history-scroll'
+        }
+      >
+        <TaskHistoryRows
+          tasks={tasks}
+          boardMembers={boardMembers}
+          taskLists={taskLists}
+          groupModes={groupModes}
+          selectedTaskId={selectedTaskId}
+          emptyMessage="Non ci sono ancora task nello storico."
+          onSelectTask={onSelectTask}
+        />
+      </div>
+    </section>
+  )
+}
+
 const SIDEBAR_COLLAPSED_KEY = 'sprout-board-sidebar-collapsed'
+const SIDEBAR_WIDTH_KEY = 'sprout-board-sidebar-width'
+const SIDEBAR_DEFAULT_WIDTH = 268
+const SIDEBAR_MIN_WIDTH = 220
+const SIDEBAR_MAX_WIDTH = 420
 const RECENT_SEARCHES_KEY = 'sprout-board-recent-searches'
 const MAX_RECENT_SEARCHES = 4
 
@@ -1153,6 +2139,7 @@ const BoardMobileRecentSearches = ({
 
 const readSidebarCollapsed = (): boolean => {
   try {
+    if (window.matchMedia('(max-width: 850px)').matches) return true
     return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true'
   } catch {
     return false
@@ -1167,17 +2154,68 @@ const persistSidebarCollapsed = (collapsed: boolean): void => {
   }
 }
 
+const readSidebarWidth = (): number => {
+  try {
+    const storedValue = localStorage.getItem(SIDEBAR_WIDTH_KEY)
+    if (!storedValue) return SIDEBAR_DEFAULT_WIDTH
+    const storedWidth = Number(storedValue)
+    if (!Number.isFinite(storedWidth)) return SIDEBAR_DEFAULT_WIDTH
+    return Math.min(
+      SIDEBAR_MAX_WIDTH,
+      Math.max(SIDEBAR_MIN_WIDTH, storedWidth),
+    )
+  } catch {
+    return SIDEBAR_DEFAULT_WIDTH
+  }
+}
+
+const persistSidebarWidth = (width: number): void => {
+  try {
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(width)))
+  } catch {
+    // ignore storage failures
+  }
+}
+
 const BoardFilterDropdown = ({
-  filter,
-  onFilter,
+  filters,
+  groupBy,
+  taskLists,
+  members,
+  onChange,
+  onGroupBy,
+  onReset,
 }: {
-  filter: TaskFilter
-  onFilter(filter: TaskFilter): void
+  filters: AdvancedTaskFilters
+  groupBy: TaskFilterGroup[]
+  taskLists: TaskListItem[]
+  members: BoardMember[]
+  onChange(filters: AdvancedTaskFilters): void
+  onGroupBy(group: TaskFilterGroup): void
+  onReset(): void
 }) => {
   const [open, setOpen] = useState(false)
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false)
+  const [activeSection, setActiveSection] =
+    useState<keyof AdvancedTaskFilters | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
   const menuId = useId()
-  const filterLabel = boardFilterLabel(filter)
+  const detailedFilterCount = Object.values(filters).reduce(
+    (count, values) => count + values.length,
+    0,
+  )
+  const groupingCount =
+    groupBy.length === 1 && groupBy[0] === 'dates' ? 0 : groupBy.length
+  const activeCount = detailedFilterCount + groupingCount
+  const requestReset = () => {
+    setOpen(false)
+    setActiveSection(null)
+    setResetConfirmOpen(true)
+  }
+  const confirmReset = () => {
+    onReset()
+    setResetConfirmOpen(false)
+  }
 
   useEffect(() => {
     if (!open) return
@@ -1197,10 +2235,312 @@ const BoardFilterDropdown = ({
     }
   }, [open])
 
-  const select = (value: TaskFilter) => {
-    onFilter(value)
-    setOpen(false)
+  useEffect(() => {
+    if (!resetConfirmOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setResetConfirmOpen(false)
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [resetConfirmOpen])
+
+  const toggle = (key: keyof AdvancedTaskFilters, value: string) => {
+    const current = filters[key] as string[]
+    const adding = !current.includes(value)
+    if (adding && !groupBy.includes(key)) onGroupBy(key)
+    onChange({
+      ...filters,
+      [key]: current.includes(value)
+        ? current.filter((item) => item !== value)
+        : [...current, value],
+    } as AdvancedTaskFilters)
   }
+
+  const sections: Array<{
+    title: string
+    key: keyof AdvancedTaskFilters
+    options: ReadonlyArray<readonly [string, string]>
+  }> = [
+    {
+      title: 'Board',
+      key: 'listIds',
+      options: taskLists
+        .filter((list) => list.document)
+        .map((list) => [list.wire.id, list.document?.name ?? 'Tasklist'] as const),
+    },
+    {
+      title: 'Tipologia',
+      key: 'types',
+      options: [
+        ['priority', 'Priorità'],
+        ['deadline', 'Scadenza'],
+        ['recurring', 'Ricorsività'],
+      ],
+    },
+    {
+      title: 'Membro',
+      key: 'memberIds',
+      options: members.map((member) => [member.identityId, member.label] as const),
+    },
+    {
+      title: 'Stato',
+      key: 'states',
+      options: [
+        ['open', 'Da completare'],
+        ['completed', 'Completati'],
+      ],
+    },
+    {
+      title: 'Data',
+      key: 'dates',
+      options: [
+        ['overdue', 'Scaduti'],
+        ['today', 'Oggi'],
+        ['upcoming', 'Prossimi'],
+        ['none', 'Senza data'],
+      ],
+    },
+  ]
+
+  return (
+    <>
+      <div className="board-filter-dropdown" ref={rootRef}>
+      <button
+        type="button"
+        className={`board-filter-trigger${activeCount > 0 ? ' has-active-filters' : ''}`}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-controls={menuId}
+        aria-label={`Filtra task${activeCount > 0 ? `: ${activeCount} filtri attivi` : ''}`}
+        onClick={() => setOpen((value) => !value)}
+      >
+        {activeCount > 0 && (
+          <span
+            className="board-filter-active-count"
+            role="button"
+            tabIndex={0}
+            aria-label="Azzera filtri"
+            onClick={(event) => {
+              event.stopPropagation()
+              requestReset()
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter' && event.key !== ' ') return
+              event.preventDefault()
+              event.stopPropagation()
+              requestReset()
+            }}
+          >
+            <span className="board-filter-active-count-value">{activeCount}</span>
+            <span className="board-filter-active-count-reset" aria-hidden>×</span>
+          </span>
+        )}
+        <FilterIcon />
+      </button>
+      {open && (
+        <div
+          id={menuId}
+          className="board-filter-menu"
+          role="menu"
+          aria-label="Filtra task"
+        >
+          {sections.map((section) => {
+            const sectionCount = filters[section.key].length
+            const expanded = activeSection === section.key
+            return (
+              <div
+                key={section.key}
+                className="board-filter-category-wrap"
+              >
+                <div className={groupBy.includes(section.key) ? 'board-filter-category active' : 'board-filter-category'}>
+                  <button
+                    type="button"
+                    className="board-filter-category-select"
+                    aria-pressed={groupBy.includes(section.key)}
+                    onClick={() => onGroupBy(section.key)}
+                  >
+                    <span
+                      className={`board-filter-selection-circle${groupBy.includes(section.key) ? ' selected' : ''}`}
+                      aria-hidden
+                    >
+                      {groupBy.includes(section.key) && <CheckIcon />}
+                    </span>
+                    <span
+                      className={`board-filter-category-label board-filter-category-label--${section.key.toLowerCase()}`}
+                    >
+                      {section.title}
+                    </span>
+                  </button>
+                  <span className="board-filter-category-meta">
+                    {sectionCount > 0 && <span className="board-filter-count">{sectionCount}</span>}
+                    <button
+                      type="button"
+                      className="board-filter-category-expand"
+                      aria-label={`Apri filtri ${section.title}`}
+                      aria-expanded={expanded}
+                      onClick={() => setActiveSection(expanded ? null : section.key)}
+                    >
+                      <span className="board-filter-category-arrow" aria-hidden>›</span>
+                    </button>
+                  </span>
+                </div>
+                {expanded && (
+                  <div className="board-filter-submenu" role="menu" aria-label={section.title}>
+                    {section.options.length > 0 ? (
+                      section.options.map(([value, label]) => {
+                        const selected = (filters[section.key] as string[]).includes(value)
+                        const member =
+                          section.key === 'memberIds'
+                            ? members.find((item) => item.identityId === value)
+                            : undefined
+                        const list =
+                          section.key === 'listIds'
+                            ? taskLists.find((item) => item.wire.id === value)
+                            : undefined
+                        const listColor = list
+                          ? resolveTaskListIconColorFromStored(
+                              list.document?.color,
+                              list.wire.id,
+                            )
+                          : undefined
+                        const optionTone =
+                          section.key === 'types'
+                            ? value === 'priority'
+                              ? 'warning'
+                              : value === 'deadline'
+                                ? 'orange'
+                                : 'violet'
+                            : section.key === 'states'
+                              ? value === 'completed'
+                                ? 'success'
+                                : 'info'
+                              : section.key === 'dates'
+                                ? 'mauve'
+                                : 'neutral'
+                        return (
+                          <button
+                            type="button"
+                            key={value}
+                            role="menuitemcheckbox"
+                            aria-checked={selected}
+                            className={selected ? 'board-filter-option active' : 'board-filter-option'}
+                            onClick={() => toggle(section.key, value)}
+                          >
+                            <span
+                              className={`board-filter-selection-circle${selected ? ' selected' : ''}`}
+                              aria-hidden
+                            >
+                              {selected && <CheckIcon />}
+                            </span>
+                            {member ? (
+                              <>
+                                <span
+                                  className={`board-avatar member ${memberAvatarColorClass(member.identityId)}`}
+                                  aria-hidden
+                                >
+                                  {initialFor(member.label)}
+                                </span>
+                                <span>{member.label}</span>
+                              </>
+                            ) : (
+                              <span
+                                className={`tasklist-history-day-label tasklist-history-day-label--${optionTone}${listColor ? ` tasklist-history-day-label--${listColor}` : ''}`}
+                              >
+                                {label}
+                              </span>
+                            )}
+                          </button>
+                        )
+                      })
+                    ) : (
+                      <p className="board-filter-empty">Nessuna opzione</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+          {activeCount > 0 && (
+            <button
+              type="button"
+              className="board-filter-reset"
+              onClick={requestReset}
+            >
+              Azzera filtri
+            </button>
+          )}
+        </div>
+      )}
+      </div>
+      {resetConfirmOpen &&
+        createPortal(
+          <div
+            className="task-create-overlay filter-reset-confirm-overlay"
+            onClick={() => setResetConfirmOpen(false)}
+          >
+            <div className="task-create-backdrop" aria-hidden="true" />
+            <section
+              className="filter-reset-confirm-dialog"
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="filter-reset-confirm-title"
+              aria-describedby="filter-reset-confirm-description"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 id="filter-reset-confirm-title">Azzera filtri?</h2>
+              <p id="filter-reset-confirm-description">
+                Sei sicuro di voler azzerare i filtri?
+              </p>
+              <div className="filter-reset-confirm-actions">
+                <button
+                  type="button"
+                  className="filter-reset-confirm-cancel"
+                  onClick={() => setResetConfirmOpen(false)}
+                >
+                  Annulla
+                </button>
+                <button
+                  type="button"
+                  className="filter-reset-confirm-submit"
+                  onClick={confirmReset}
+                >
+                  Conferma
+                </button>
+              </div>
+            </section>
+          </div>,
+          document.body,
+        )}
+    </>
+  )
+}
+
+const AgentFilterDropdown = ({
+  filter,
+  onFilter,
+}: {
+  filter: AgentActivityFilter
+  onFilter(filter: AgentActivityFilter): void
+}) => {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const menuId = useId()
+
+  useEffect(() => {
+    if (!open) return
+    const onPointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open])
 
   return (
     <div className="board-filter-dropdown" ref={rootRef}>
@@ -1210,21 +2550,19 @@ const BoardFilterDropdown = ({
         aria-expanded={open}
         aria-haspopup="menu"
         aria-controls={menuId}
-        aria-label={`Filtra task: ${filterLabel}`}
+        aria-label="Filtra agenti"
         onClick={() => setOpen((value) => !value)}
       >
-        <CalendarIcon />
-        <span>{filterLabel}</span>
-        <ChevronDownIcon className="board-filter-chevron" />
+        <FilterIcon />
       </button>
       {open && (
         <div
           id={menuId}
           className="board-filter-menu"
           role="menu"
-          aria-label="Filtra task"
+          aria-label="Filtra agenti"
         >
-          {BOARD_FILTER_OPTIONS.map(([value, label]) => (
+          {AGENT_FILTER_OPTIONS.map(([value, label]) => (
             <button
               type="button"
               key={value}
@@ -1235,7 +2573,10 @@ const BoardFilterDropdown = ({
                   ? 'board-filter-option active'
                   : 'board-filter-option'
               }
-              onClick={() => select(value)}
+              onClick={() => {
+                onFilter(value)
+                setOpen(false)
+              }}
             >
               {label}
             </button>
@@ -2731,6 +4072,7 @@ export const TasksScreen = ({
   tasks,
   lockedTasks,
   boardMembers,
+  agents,
   boardFocus,
   boardViewMode,
   selectedTopicId,
@@ -2743,13 +4085,17 @@ export const TasksScreen = ({
   onBoardViewModeChange,
   onSelectList,
   onSelectTask,
-  onFilter,
+  onFilter: _onFilter,
   onCreateTopic,
   onRenameTopic,
   onToggleTopicFavorite,
   onDeleteTopic,
   onCreateList,
   onUpdateTaskList,
+  onLoadProjectInfo,
+  onCreateProjectInfoDocument,
+  onLoadTopicInfo,
+  onCreateTopicInfoDocument,
   onLoadTaskListInfo,
   onCreateTaskListInfoDocument,
   onUpdateInfoDocument,
@@ -2762,6 +4108,7 @@ export const TasksScreen = ({
   onCompleteTask,
   onCopyTask,
   onInviteMember,
+  onProvisionAgent,
   taskAttachments,
   taskAttachmentLabels,
   onRefreshTaskAttachments,
@@ -2774,12 +4121,58 @@ export const TasksScreen = ({
   const [listTopicId, setListTopicId] = useState('')
   const [showNewList, setShowNewList] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [agentActivityFilter, setAgentActivityFilter] =
+    useState<AgentActivityFilter>('all')
+  const [advancedTaskFilters, setAdvancedTaskFilters] =
+    useState<AdvancedTaskFilters>(() => initialAdvancedTaskFilters(filter))
+  const [taskFilterGroups, setTaskFilterGroups] =
+    useState<TaskFilterGroup[]>(['dates'])
+
+  const selectTaskFilterGroup = (group: TaskFilterGroup) => {
+    setTaskFilterGroups((current) => {
+      if (current.includes(group)) {
+        const next = current.filter((item) => item !== group)
+        return next.length > 0 ? next : ['dates']
+      }
+      if (current.length === 1 && current[0] === 'dates' && group !== 'dates') {
+        return [group]
+      }
+      return [...current, group]
+    })
+  }
+  const resetTaskFilters = () => {
+    setAdvancedTaskFilters({
+      listIds: [],
+      types: [],
+      memberIds: [],
+      states: [],
+      dates: [],
+    })
+    setTaskFilterGroups(['dates'])
+  }
+  const removeTaskFilter = (
+    key: keyof AdvancedTaskFilters,
+    value: string,
+  ) => {
+    setAdvancedTaskFilters((current) => ({
+      ...current,
+      [key]: (current[key] as string[]).filter((item) => item !== value),
+    }) as AdvancedTaskFilters)
+  }
+  const [agentWorkspace, setAgentWorkspace] = useState<
+    { name: string; avatar: string } | undefined
+  >()
+  const [agentDirectoryResetKey, setAgentDirectoryResetKey] = useState(0)
   const [listHistoryId, setListHistoryId] = useState<Uuid | undefined>()
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false)
+  const [mobileToolbarSearchOpen, setMobileToolbarSearchOpen] = useState(false)
+  const [mobilePathPanelOpen, setMobilePathPanelOpen] = useState(false)
+  const [aiBadgeOpen, setAiBadgeOpen] = useState(false)
   const [mobileSearchOverlayVisible, setMobileSearchOverlayVisible] =
     useState(false)
   const [recentSearches, setRecentSearches] = useState(readRecentSearches)
   const mobileSearchInputRef = useRef<HTMLInputElement>(null)
+  const mobileToolbarSearchInputRef = useRef<HTMLInputElement>(null)
   const [creatingInListId, setCreatingInListId] = useState<Uuid | undefined>()
   const [createAnchorColumnKey, setCreateAnchorColumnKey] = useState<
     Uuid | undefined
@@ -2790,20 +4183,22 @@ export const TasksScreen = ({
     'priority' | 'deadline' | 'recurring'
   >('priority')
   const [createInitialDueAt, setCreateInitialDueAt] = useState('')
-  const [memberAddMenuId, setMemberAddMenuId] = useState<Uuid | undefined>()
-  const [showNewMember, setShowNewMember] = useState(false)
-  const [memberEmail, setMemberEmail] = useState('')
-  const [memberName, setMemberName] = useState('')
-  const [membersOverflowOpen, setMembersOverflowOpen] = useState(false)
-  const membersOverflowRef = useRef<HTMLDivElement>(null)
   const columnRefs = useRef(new Map<Uuid, HTMLElement>())
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed)
+  const [sidebarPreviewOpen, setSidebarPreviewOpen] = useState(false)
+  const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth)
+  const [sidebarResizing, setSidebarResizing] = useState(false)
+  const sidebarResizeRef = useRef<{
+    pointerId: number
+    startX: number
+    startWidth: number
+    currentWidth: number
+    scale: number
+  } | null>(null)
   const [timelineWeekAnchor, setTimelineWeekAnchor] = useState(() =>
     startOfWeek(new Date()),
   )
   const [timelineScale, setTimelineScale] = useState(TIMELINE_SCALE_DEFAULT)
-  const [timelineScrollToFocusRequest, setTimelineScrollToFocusRequest] =
-    useState(0)
   const [topicOverview, setTopicOverview] = useState<
     TopicOverviewAnchor | undefined
   >()
@@ -2878,9 +4273,13 @@ export const TasksScreen = ({
     setListIconPickerAnchorRect(null)
   }
 
-  const commitListEdit = (list: TaskListItem, listIndex: number) => {
+  const commitListEdit = (
+    list: TaskListItem,
+    listIndex: number,
+    closeEditor = true,
+  ) => {
     if (!list.document) {
-      cancelListEdit()
+      if (closeEditor) cancelListEdit()
       return
     }
     const trimmed = listEditName.trim()
@@ -2889,7 +4288,7 @@ export const TasksScreen = ({
     const previousIcon = list.document.icon
     const nextColor = listEditColor
     const nextIcon = listEditIcon
-    cancelListEdit()
+    if (closeEditor) cancelListEdit()
     if (!trimmed) return
     if (
       trimmed === previousName &&
@@ -2906,11 +4305,87 @@ export const TasksScreen = ({
   }
 
   const toggleSidebarCollapsed = () => {
+    setMobilePathPanelOpen(false)
+    setSidebarPreviewOpen(false)
     setSidebarCollapsed((value) => {
       const next = !value
       persistSidebarCollapsed(next)
       return next
     })
+  }
+
+  const openMobilePathPanel = () => {
+    if (!window.matchMedia('(max-width: 850px)').matches) return false
+    setMobilePathPanelOpen(true)
+    return true
+  }
+
+  const startSidebarResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (sidebarCollapsed || event.button !== 0) return
+    event.preventDefault()
+    const rootZoom = Number(
+      getComputedStyle(document.querySelector('#root') ?? document.body).zoom,
+    )
+    const remScale =
+      Number.parseFloat(getComputedStyle(document.documentElement).fontSize) / 16
+    const interfaceScale =
+      (Number.isFinite(rootZoom) && rootZoom > 0 ? rootZoom : 1) *
+      (Number.isFinite(remScale) && remScale > 0 ? remScale : 1)
+    sidebarResizeRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth: sidebarWidth,
+      currentWidth: sidebarWidth,
+      scale: interfaceScale,
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    setSidebarResizing(true)
+  }
+
+  const resizeSidebar = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const resize = sidebarResizeRef.current
+    if (!resize || resize.pointerId !== event.pointerId) return
+    const nextWidth = Math.min(
+      SIDEBAR_MAX_WIDTH,
+      Math.max(
+        SIDEBAR_MIN_WIDTH,
+        resize.startWidth + (event.clientX - resize.startX) / resize.scale,
+      ),
+    )
+    resize.currentWidth = nextWidth
+    setSidebarWidth(nextWidth)
+  }
+
+  const finishSidebarResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const resize = sidebarResizeRef.current
+    if (!resize || resize.pointerId !== event.pointerId) return
+    persistSidebarWidth(resize.currentWidth)
+    sidebarResizeRef.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+    setSidebarResizing(false)
+  }
+
+  const resizeSidebarWithKeyboard = (
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+    event.preventDefault()
+    setSidebarWidth((currentWidth) => {
+      const direction = event.key === 'ArrowRight' ? 1 : -1
+      const nextWidth = Math.min(
+        SIDEBAR_MAX_WIDTH,
+        Math.max(SIDEBAR_MIN_WIDTH, currentWidth + direction * 12),
+      )
+      persistSidebarWidth(nextWidth)
+      return nextWidth
+    })
+  }
+
+  const resetSidebarWidth = () => {
+    setSidebarWidth(SIDEBAR_DEFAULT_WIDTH)
+    persistSidebarWidth(SIDEBAR_DEFAULT_WIDTH)
   }
 
   const openNewTopic = () => {
@@ -2943,6 +4418,11 @@ export const TasksScreen = ({
     if (!mobileSearchOpen || !mobileSearchOverlayVisible) return
     mobileSearchInputRef.current?.focus()
   }, [mobileSearchOpen, mobileSearchOverlayVisible])
+
+  useEffect(() => {
+    if (!mobileToolbarSearchOpen) return
+    mobileToolbarSearchInputRef.current?.focus()
+  }, [mobileToolbarSearchOpen])
 
   const rememberRecentSearch = useCallback((query: string) => {
     const trimmed = query.trim()
@@ -2978,6 +4458,26 @@ export const TasksScreen = ({
   }, [closeMobileSearch, mobileSearchOpen])
 
   const isMemberBoard = isMemberBoardFocus(boardFocus)
+  const isAgentBoard = isAgentBoardFocus(boardFocus)
+  const boardFocusScopeId =
+    boardFocus.type === 'topic'
+      ? boardFocus.topicId
+      : boardFocus.type === 'member'
+        ? boardFocus.identityId
+        : boardFocus.type === 'agent'
+          ? boardFocus.agentId
+          : 'all'
+  const boardViewTabScopeKey = `${project?.wire.id ?? 'no-project'}:${boardFocus.type}:${boardFocusScopeId}`
+
+  useEffect(() => {
+    if (
+      isAgentBoard &&
+      boardViewMode !== 'overview' &&
+      boardViewMode !== 'board'
+    ) {
+      onBoardViewModeChange('overview')
+    }
+  }, [boardViewMode, isAgentBoard, onBoardViewModeChange])
 
   const focusLists = useMemo(() => {
     if (boardFocus.type === 'topic') {
@@ -2987,7 +4487,7 @@ export const TasksScreen = ({
       return []
     }
     return taskLists
-  }, [boardFocus, isMemberBoard, taskLists])
+  }, [boardFocus, isAgentBoard, isMemberBoard, taskLists])
 
   const focusMemberColumns = useMemo(() => {
     if (boardFocus.type === 'member') {
@@ -3068,12 +4568,14 @@ export const TasksScreen = ({
 
   const createInitialAssigneeId = useMemo(() => {
     if (!createAnchorColumnKey) return undefined
-    return boardMembers.some(
+    const isMember = boardMembers.some(
       (member) => member.identityId === createAnchorColumnKey,
     )
-      ? createAnchorColumnKey
-      : undefined
-  }, [boardMembers, createAnchorColumnKey])
+    const isAgent = agents.some(
+      (agent) => agent.principal_identity_id === createAnchorColumnKey,
+    )
+    return isMember || isAgent ? createAnchorColumnKey : undefined
+  }, [agents, boardMembers, createAnchorColumnKey])
 
   const editingList = useMemo(
     () =>
@@ -3149,44 +4651,8 @@ export const TasksScreen = ({
     }
   }, [createAnchorColumnKey, searched.lists, searchedMemberColumns, creatingInListId])
 
-  useEffect(() => {
-    if (!memberAddMenuId) return
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target
-      if (!(target instanceof Element)) return
-      if (target.closest('.board-member-add-wrap')) return
-      setMemberAddMenuId(undefined)
-    }
-    document.addEventListener('pointerdown', onPointerDown)
-    return () => document.removeEventListener('pointerdown', onPointerDown)
-  }, [memberAddMenuId])
-
-  useEffect(() => {
-    if (!membersOverflowOpen) return
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target
-      if (!(target instanceof Element)) return
-      if (membersOverflowRef.current?.contains(target)) return
-      setMembersOverflowOpen(false)
-    }
-    document.addEventListener('pointerdown', onPointerDown)
-    return () => document.removeEventListener('pointerdown', onPointerDown)
-  }, [membersOverflowOpen])
-
   const visibleSidebarMembers = boardMembers.slice(0, SIDEBAR_MEMBER_VISIBLE_MAX)
   const overflowSidebarMembers = boardMembers.slice(SIDEBAR_MEMBER_VISIBLE_MAX)
-
-  const createMemberInvite = async (event: FormEvent) => {
-    event.preventDefault()
-    await onInviteMember({
-      email: memberEmail.trim(),
-      name: memberName.trim(),
-      role: 'member',
-    })
-    setMemberEmail('')
-    setMemberName('')
-    setShowNewMember(false)
-  }
 
   const closeCreateTask = () => {
     setCreatingInListId(undefined)
@@ -3199,7 +4665,6 @@ export const TasksScreen = ({
 
   const openCreateTaskInList = (listId: Uuid, columnKey: Uuid) => {
     onSelectList(listId)
-    setMemberAddMenuId(undefined)
     setCreatingInListId(listId)
     createAnchorElRef.current = null
     setCreateInitialTaskKind('priority')
@@ -3213,7 +4678,6 @@ export const TasksScreen = ({
     anchorEl: HTMLElement,
   ) => {
     onSelectList(listId)
-    setMemberAddMenuId(undefined)
     setCreatingInListId(listId)
     createAnchorElRef.current = anchorEl
     setCreateInitialTaskKind('deadline')
@@ -3223,13 +4687,13 @@ export const TasksScreen = ({
   }
 
   const visibleTasks = useMemo(
-    () => filterTasks(searched.tasks, filter),
-    [filter, searched.tasks],
+    () => applyAdvancedTaskFilters(searched.tasks, advancedTaskFilters),
+    [advancedTaskFilters, searched.tasks],
   )
 
   const mobileSearchTasks = useMemo(
-    () => filterTasks(mobileSearchData.tasks, filter),
-    [filter, mobileSearchData.tasks],
+    () => applyAdvancedTaskFilters(mobileSearchData.tasks, advancedTaskFilters),
+    [advancedTaskFilters, mobileSearchData.tasks],
   )
 
   const mobileSearchLists = useMemo(
@@ -3284,6 +4748,19 @@ export const TasksScreen = ({
     )
   }, [isMemberBoard, searchedMemberColumns, visibleTasks])
 
+  const orderedAgentColumns = useMemo(() => {
+    if (!isAgentBoard) return []
+    const query = searchQuery.trim().toLocaleLowerCase()
+    return agents.filter((agent) => {
+      if (!query) return true
+      if (agent.identity_handle.toLocaleLowerCase().includes(query)) return true
+      return visibleTasks.some(
+        (task) =>
+          task.wire.active_assignee_identity_id === agent.principal_identity_id,
+      )
+    })
+  }, [agents, isAgentBoard, searchQuery, visibleTasks])
+
   const timelineTasks = useMemo(
     () => filterTimelineTasks(visibleTasks),
     [visibleTasks],
@@ -3300,7 +4777,26 @@ export const TasksScreen = ({
     return sortTaskListsByUrgency(searched.lists, timelineTasks)
   }, [isMemberBoard, searched.lists, taskLists, timelineTasks])
 
+  const isOverviewView = boardViewMode === 'overview'
   const isTimelineView = boardViewMode === 'timeline'
+  const isHistoryView = boardViewMode === 'history'
+  const focusedTopic = useMemo(
+    () =>
+      boardFocus.type === 'topic'
+        ? topics.find((topic) => topic.wire.id === boardFocus.topicId)
+        : undefined,
+    [boardFocus, topics],
+  )
+
+  const boardScopeName = focusedTopic
+    ? (focusedTopic.document?.name ?? 'Categoria protetta')
+    : ((boardFocus.type === 'member'
+        ? boardMembers.find(
+            (member) => member.identityId === boardFocus.identityId,
+          )?.label
+        : undefined) ??
+      (boardFocus.type === 'members' ? 'Membri' : 'Generali'))
+  const boardFooterPath = isAgentBoard ? 'Agenti' : boardScopeName
 
   const boardMemberById = useMemo(() => {
     const map = new Map<Uuid, BoardMember>()
@@ -3340,7 +4836,9 @@ export const TasksScreen = ({
     setListHistoryId(listId)
   }
 
-  const closeListHistory = () => setListHistoryId(undefined)
+  const closeListHistory = () => {
+    setListHistoryId(undefined)
+  }
 
   const handleIslandViewModeChange = (mode: BoardViewMode) => {
     closeListHistory()
@@ -3350,6 +4848,11 @@ export const TasksScreen = ({
   const handleIslandMembers = () => {
     closeListHistory()
     onSelectFocus({ type: 'members' })
+  }
+
+  const handleIslandAgents = () => {
+    closeListHistory()
+    onSelectFocus({ type: 'agents' })
   }
 
   const createTopic = async (event: FormEvent) => {
@@ -3402,15 +4905,24 @@ export const TasksScreen = ({
 
   const boardLayoutClass = [
     'board-layout',
-    sidebarCollapsed ? 'board-layout--sidebar-collapsed' : '',
+    sidebarCollapsed && !sidebarPreviewOpen
+      ? 'board-layout--sidebar-collapsed'
+      : '',
+    sidebarResizing ? 'board-layout--sidebar-resizing' : '',
+    isAgentBoard ? 'board-layout--agents' : '',
     historyList ? 'board-layout--list-history' : '',
     mobileSearchOpen ? 'board-layout--mobile-search' : '',
+    mobileToolbarSearchOpen ? 'board-layout--toolbar-search' : '',
   ]
     .filter(Boolean)
     .join(' ')
 
+  const boardLayoutStyle = {
+    '--board-sidebar-width': `${sidebarWidth / 16}rem`,
+  } as CSSProperties
+
   return (
-    <div className={boardLayoutClass}>
+    <div className={boardLayoutClass} style={boardLayoutStyle}>
       <header className="board-mobile-top">
         <div className="board-mobile-top-row">
           <nav className="board-mobile-stories" aria-label="Categorie">
@@ -3514,7 +5026,15 @@ export const TasksScreen = ({
               .join(' ')}
             role="search"
           >
-            <BoardFilterDropdown filter={filter} onFilter={onFilter} />
+            <BoardFilterDropdown
+              filters={advancedTaskFilters}
+              groupBy={taskFilterGroups}
+              taskLists={taskLists}
+              members={boardMembers}
+              onChange={setAdvancedTaskFilters}
+              onGroupBy={selectTaskFilterGroup}
+              onReset={resetTaskFilters}
+            />
             <label className="board-search board-mobile-search-field">
               <SearchIcon />
               <input
@@ -3575,17 +5095,19 @@ export const TasksScreen = ({
           <div className="board-sidebar-top-row">
             <button
               type="button"
-              className="board-sidebar-toggle board-sidebar-toggle--in-sidebar"
+              className={
+                sidebarCollapsed && !sidebarPreviewOpen
+                  ? 'board-sidebar-toggle board-sidebar-toggle--in-sidebar'
+                  : 'board-sidebar-toggle board-sidebar-toggle--in-sidebar is-expanded'
+              }
               onClick={toggleSidebarCollapsed}
               aria-label={
-                sidebarCollapsed ? 'Espandi sidebar' : 'Riduci sidebar'
+                sidebarCollapsed && !sidebarPreviewOpen
+                  ? 'Espandi sidebar'
+                  : 'Riduci sidebar'
               }
             >
-              {sidebarCollapsed ? (
-                <SidebarExpandIcon />
-              ) : (
-                <SidebarCollapseIcon />
-              )}
+              <ChevronIcon aria-hidden />
             </button>
             <BoardProjectSwitcher
               projects={userMenu.projects}
@@ -3596,192 +5118,193 @@ export const TasksScreen = ({
               onSelectProject={userMenu.onSelectProject}
               onCreateProject={userMenu.onCreateProject}
             />
-            {sidebarCollapsed && (
-              <>
-                <BoardViewModeSwitch
-                  mode={boardViewMode}
-                  onChange={onBoardViewModeChange}
-                />
-              </>
-            )}
           </div>
         </div>
         <div className="board-toolbar-main">
-          {!sidebarCollapsed && (
-            <div className="board-toolbar-start">
-              <BoardViewModeSwitch
+          <div className="board-toolbar-start">
+            {historyList ? (
+              <TaskListDetailViewNavigation onBack={closeListHistory} />
+            ) : isAgentBoard && agentWorkspace ? (
+              <AgentViewNavigation
+                workspace={agentWorkspace}
+                onBack={() => {
+                  setAgentWorkspace(undefined)
+                  setAgentDirectoryResetKey((value) => value + 1)
+                  onSelectFocus({ type: 'agents' })
+                }}
+              />
+            ) : (
+              <BoardViewNavigation
                 mode={boardViewMode}
                 onChange={onBoardViewModeChange}
+                scopeKey={boardViewTabScopeKey}
+                compact={isAgentBoard}
               />
-            </div>
-          )}
+            )}
+          </div>
           <div className="board-toolbar-end">
-            <BoardFilterDropdown filter={filter} onFilter={onFilter} />
-            <label className="board-search">
+            {isAgentBoard && isOverviewView ? (
+              <AgentFilterDropdown
+                filter={agentActivityFilter}
+                onFilter={setAgentActivityFilter}
+              />
+            ) : (
+              <BoardFilterDropdown
+                filters={advancedTaskFilters}
+                groupBy={taskFilterGroups}
+                taskLists={taskLists}
+                members={boardMembers}
+                onChange={setAdvancedTaskFilters}
+                onGroupBy={selectTaskFilterGroup}
+                onReset={resetTaskFilters}
+              />
+            )}
+            <label
+              className={`board-search${mobileToolbarSearchOpen ? ' is-expanded' : ''}`}
+              onClick={() => {
+                if (window.matchMedia('(max-width: 850px)').matches) {
+                  setMobileToolbarSearchOpen(true)
+                }
+              }}
+            >
               <SearchIcon />
               <input
+                ref={mobileToolbarSearchInputRef}
                 type="search"
-                placeholder="Cerca task e tasklist"
+                placeholder={
+                  isAgentBoard && isOverviewView
+                    ? 'Cerca agenti'
+                    : 'Cerca task e tasklist'
+                }
                 value={searchQuery}
                 onChange={(event) => setSearchQuery(event.target.value)}
-                aria-label="Cerca task e tasklist"
+                aria-label={
+                  isAgentBoard && isOverviewView
+                    ? 'Cerca agenti'
+                    : 'Cerca task e tasklist'
+                }
               />
             </label>
           </div>
         </div>
       </header>
 
+      {sidebarCollapsed && !sidebarPreviewOpen && (
+        <div
+          className="board-sidebar-edge-trigger"
+          aria-hidden
+          onPointerEnter={() => setSidebarPreviewOpen(true)}
+        />
+      )}
+
       <aside
         className={
-          sidebarCollapsed
+          sidebarCollapsed && !sidebarPreviewOpen
             ? 'board-sidebar board-sidebar--collapsed'
             : 'board-sidebar'
         }
         aria-label="Board navigation"
-        aria-expanded={!sidebarCollapsed}
+        aria-expanded={!sidebarCollapsed || sidebarPreviewOpen}
+        onPointerLeave={() => {
+          if (sidebarPreviewOpen) setSidebarPreviewOpen(false)
+        }}
       >
-        {!sidebarCollapsed &&
-          (showNewTopic ? (
-            <form
-              className="board-new-topic-form"
-              onSubmit={(event) => void createTopic(event)}
-            >
-              <input
-                required
-                autoFocus
-                placeholder="Nome categoria"
-                value={topicName}
-                onChange={(event) => setTopicName(event.target.value)}
-                aria-label="Topic name"
-              />
-              <div className="board-create-actions">
-                <button type="submit" className="primary-button">
-                  Crea
-                </button>
-                <button
-                  type="button"
-                  className="text-button"
-                  onClick={() => {
-                    setShowNewTopic(false)
-                    setTopicName('')
-                  }}
-                >
-                  Annulla
-                </button>
-              </div>
-            </form>
-          ) : (
-            <button
-              type="button"
-              className="board-new-category"
-              onClick={openNewTopic}
-              aria-label="Nuova categoria"
-            >
-              <PlusIcon aria-hidden />
-              <span className="board-new-category-label">Nuova categoria</span>
-            </button>
-          ))}
+        {!sidebarCollapsed && (
+          <div
+            className="board-sidebar-resize-handle"
+            role="separator"
+            aria-label="Ridimensiona sidebar"
+            aria-orientation="vertical"
+            aria-valuemin={SIDEBAR_MIN_WIDTH}
+            aria-valuemax={SIDEBAR_MAX_WIDTH}
+            aria-valuenow={Math.round(sidebarWidth)}
+            tabIndex={0}
+            onPointerDown={startSidebarResize}
+            onPointerMove={resizeSidebar}
+            onPointerUp={finishSidebarResize}
+            onPointerCancel={finishSidebarResize}
+            onLostPointerCapture={finishSidebarResize}
+            onKeyDown={resizeSidebarWithKeyboard}
+            onDoubleClick={resetSidebarWidth}
+          />
+        )}
         <nav className="board-nav">
-          <div className="board-nav-section board-nav-section--members">
-            <button
-              type="button"
-              className={
-                boardFocus.type === 'members'
-                  ? 'board-nav-heading board-nav-heading--button active'
-                  : 'board-nav-heading board-nav-heading--button'
-              }
-              onClick={() => onSelectFocus({ type: 'members' })}
-            >
-              Membri
-            </button>
-            <div className="board-members-avatars">
-              {visibleSidebarMembers.map((member) => {
-                const isActive =
-                  boardFocus.type === 'member' &&
-                  boardFocus.identityId === member.identityId
-                return (
-                  <button
-                    key={member.identityId}
-                    type="button"
-                    className={
-                      isActive
-                        ? 'board-members-avatar-btn active'
-                        : 'board-members-avatar-btn'
-                    }
-                    aria-label={member.label}
-                    title={member.label}
-                    onClick={() =>
-                      onSelectFocus({
-                        type: 'member',
-                        identityId: member.identityId,
-                      })
-                    }
-                  >
-                    <span
-                      className={memberAvatarClassName(member.identityId)}
-                      aria-hidden
-                    >
-                      {initialsFor(member.label)}
-                    </span>
-                  </button>
-                )
-              })}
-              {overflowSidebarMembers.length > 0 && (
-                <div
-                  className="board-members-overflow"
-                  ref={membersOverflowRef}
-                >
+          <div className="board-sidebar-primary-nav">
+            <div className="board-nav-section board-nav-section--views">
+              <ul className="board-nav-list">
+                <li>
                   <button
                     type="button"
                     className={
-                      membersOverflowOpen
-                        ? 'board-members-avatar-btn board-members-overflow-btn active'
-                        : 'board-members-avatar-btn board-members-overflow-btn'
+                      boardFocus.type === 'members' || boardFocus.type === 'member'
+                        ? 'board-nav-item board-nav-item--view active'
+                        : 'board-nav-item board-nav-item--view'
                     }
-                    aria-label={`Altri ${overflowSidebarMembers.length} membri`}
-                    aria-expanded={membersOverflowOpen}
-                    aria-haspopup="menu"
-                    onClick={() => setMembersOverflowOpen((open) => !open)}
+                    aria-label="Membri"
+                    onClick={() => onSelectFocus({ type: 'members' })}
                   >
-                    <span className="board-avatar member board-avatar--more" aria-hidden>
-                      +
-                    </span>
+                    <SidebarUserIcon className="board-nav-view-icon" aria-hidden />
+                    <span className="board-nav-label">Membri</span>
                   </button>
-                  {membersOverflowOpen && (
-                    <ul className="board-members-overflow-menu" role="menu">
-                      {overflowSidebarMembers.map((member) => (
-                        <li key={member.identityId} role="none">
-                          <button
-                            type="button"
-                            role="menuitem"
-                            className="board-members-overflow-item"
-                            onClick={() => {
-                              setMembersOverflowOpen(false)
-                              onSelectFocus({
-                                type: 'member',
-                                identityId: member.identityId,
-                              })
-                            }}
-                          >
-                            <span
-                              className={memberAvatarClassName(member.identityId)}
-                              aria-hidden
-                            >
-                              {initialsFor(member.label)}
-                            </span>
-                            <span>{member.label}</span>
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
+                  {visibleSidebarMembers.map((member) => (
+                    <button
+                      key={`member-shortcut-${member.identityId}`}
+                      type="button"
+                      className="visually-hidden"
+                      aria-label={member.label}
+                      onClick={() =>
+                        onSelectFocus({
+                          type: 'member',
+                          identityId: member.identityId,
+                        })
+                      }
+                    />
+                  ))}
+                  {overflowSidebarMembers.length > 0 && (
+                    <button
+                      type="button"
+                      className="visually-hidden"
+                      aria-label={`Altri ${overflowSidebarMembers.length} membri`}
+                      onClick={() => onSelectFocus({ type: 'members' })}
+                    />
                   )}
-                </div>
-              )}
+                </li>
+                <li>
+                  <button
+                    type="button"
+                    className={
+                      isAgentBoard
+                        ? 'board-nav-item board-nav-item--view active'
+                        : 'board-nav-item board-nav-item--view'
+                    }
+                    onClick={() => onSelectFocus({ type: 'agents' })}
+                    aria-current={isAgentBoard ? 'page' : undefined}
+                  >
+                    <SidebarAgentIcon
+                      className="board-nav-view-icon board-nav-view-icon--agent"
+                      aria-hidden
+                    />
+                    <span className="board-nav-label">Agenti</span>
+                  </button>
+                </li>
+              </ul>
             </div>
           </div>
 
           <div className="board-nav-section board-nav-section--space">
-            <p className="board-nav-heading">Spazio</p>
+            <div className="board-space-heading">
+              <p className="board-nav-heading">Spazio</p>
+              {!sidebarCollapsed && !showNewTopic && (
+                <button
+                  type="button"
+                  className="board-space-add"
+                  onClick={openNewTopic}
+                  aria-label="Nuova categoria"
+                >
+                  <PlusIcon aria-hidden />
+                </button>
+              )}
+            </div>
             <ul className="board-nav-list">
               <li>
                 <button
@@ -3791,21 +5314,22 @@ export const TasksScreen = ({
                       ? 'board-nav-item active'
                       : 'board-nav-item'
                   }
+                  aria-current={
+                    boardFocus.type === 'generali' ? 'page' : undefined
+                  }
                   onClick={() => onSelectFocus({ type: 'generali' })}
                 >
-                  <span
-                    className="board-avatar generali board-avatar--glyph"
+                  <SidebarHomeIcon
+                    className="board-nav-category-file-icon"
                     aria-hidden
-                  >
-                    <SidebarHomeIcon />
-                  </span>
+                  />
                   <span className="board-nav-label">Generali</span>
                   <BoardNavUrgencyBadge badge={urgencyBadges.generali} />
                 </button>
               </li>
             </ul>
             <ul className="board-nav-list board-nav-list-nested board-nav-list--categories">
-              {sortedTopics.map((topic, topicIndex) => {
+              {sortedTopics.map((topic) => {
                 const isActive =
                   boardFocus.type === 'topic' &&
                   boardFocus.topicId === topic.wire.id
@@ -3822,12 +5346,10 @@ export const TasksScreen = ({
                         className={`${rowClass} board-nav-item--editing`}
                         onContextMenu={(event) => event.preventDefault()}
                       >
-                        <span
-                          className={`board-avatar ${topicAvatarClass(topicIndex)}`}
+                        <SidebarHomeIcon
+                          className="board-nav-category-file-icon"
                           aria-hidden
-                        >
-                          {initialFor(renameDraft || topic.document.name)}
-                        </span>
+                        />
                         <input
                           ref={renameInputRef}
                           className="board-nav-rename-input"
@@ -3851,7 +5373,7 @@ export const TasksScreen = ({
                         <BoardNavUrgencyBadge badge={topicBadge} />
                         {topic.document.favorite && (
                           <StarIcon
-                            className="board-nav-favorite"
+                            className="board-nav-category-favorite"
                             aria-label="Preferita"
                           />
                         )}
@@ -3865,6 +5387,7 @@ export const TasksScreen = ({
                     <button
                       type="button"
                       className={rowClass}
+                      aria-current={isActive ? 'page' : undefined}
                       onClick={() =>
                         onSelectFocus({
                           type: 'topic',
@@ -3882,28 +5405,27 @@ export const TasksScreen = ({
                     >
                       {topic.document ? (
                         <>
-                          <span
-                            className={`board-avatar ${topicAvatarClass(topicIndex)}`}
+                          <SidebarHomeIcon
+                            className="board-nav-category-file-icon"
                             aria-hidden
-                          >
-                            {initialFor(topic.document.name)}
-                          </span>
+                          />
                           <span className="board-nav-label">
                             {topic.document.name}
                           </span>
                           <BoardNavUrgencyBadge badge={topicBadge} />
                           {topic.document.favorite && (
                             <StarIcon
-                              className="board-nav-favorite"
+                              className="board-nav-category-favorite"
                               aria-label="Preferita"
                             />
                           )}
                         </>
                       ) : (
                         <>
-                          <span className="board-avatar locked" aria-hidden>
-                            <LockIcon />
-                          </span>
+                          <LockIcon
+                            className="board-nav-category-file-icon"
+                            aria-hidden
+                          />
                           <span className="board-nav-label">Locked topic</span>
                         </>
                       )}
@@ -3911,8 +5433,45 @@ export const TasksScreen = ({
                   </li>
                 )
               })}
+              {!sidebarCollapsed && showNewTopic && (
+                <li className="board-new-topic-inline-item">
+                  <form
+                    className="board-new-topic-inline"
+                    onSubmit={(event) => void createTopic(event)}
+                  >
+                    <SidebarHomeIcon
+                      className="board-nav-category-file-icon"
+                      aria-hidden
+                    />
+                    <input
+                      required
+                      autoFocus
+                      className="board-new-topic-inline-input"
+                      placeholder="Nome categoria"
+                      value={topicName}
+                      onChange={(event) => setTopicName(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key !== 'Escape') return
+                        event.preventDefault()
+                        setShowNewTopic(false)
+                        setTopicName('')
+                      }}
+                      aria-label="Topic name"
+                    />
+                    <button
+                      type="submit"
+                      className="board-new-topic-confirm"
+                      aria-label="Conferma categoria"
+                      title="Conferma categoria"
+                      disabled={!topicName.trim()}
+                    >
+                      <CheckIcon aria-hidden />
+                    </button>
+                  </form>
+                </li>
+              )}
             </ul>
-            {topics.length === 0 && !loading && (
+            {topics.length === 0 && !loading && !showNewTopic && (
               <p className="inline-empty board-nav-empty--categories">
                 Nessuna categoria.
               </p>
@@ -3932,17 +5491,141 @@ export const TasksScreen = ({
           />
         )}
 
-        <WorkspaceUserMenu {...userMenu} variant="sidebar" />
+        {!sidebarCollapsed && <WorkspaceUserMenu {...userMenu} variant="sidebar" />}
       </aside>
 
       <section className="board-main" aria-label="Board">
         <div className="board-main-body">
-        {historyList ? (
-          <TaskListHistoryPanel
+        {isAgentBoard && isOverviewView ? (
+          <div className="board-secondary-view-panel agent-secondary-view-panel">
+            <AgentManagementPanel
+              agents={agents}
+              searchQuery={searchQuery}
+              activityFilter={agentActivityFilter}
+              selectedAgentId={
+                boardFocus.type === 'agent' ? boardFocus.agentId : undefined
+              }
+              tasks={tasks}
+              onSelectAgent={(agentId) =>
+                onSelectFocus({ type: 'agent', agentId })
+              }
+              onWorkspaceChange={setAgentWorkspace}
+              directoryResetKey={agentDirectoryResetKey}
+              onSelectTask={onSelectTask}
+              onProvision={onProvisionAgent}
+            />
+          </div>
+        ) : isMemberBoard && isOverviewView ? (
+          <div className="board-secondary-view-panel member-secondary-view-panel">
+            <MembersOverviewPanel
+              members={boardMembers}
+              onInviteMember={onInviteMember}
+            />
+          </div>
+        ) : isAgentBoard ? (
+          <div className="board-board-view board-agent-board-view">
+            <div className="board-columns" role="list">
+              {taskLists[0] && (
+                <section
+                  ref={(element) => {
+                    if (element) columnRefs.current.set(taskLists[0].wire.id, element)
+                    else columnRefs.current.delete(taskLists[0].wire.id)
+                  }}
+                  className="board-column board-column--member board-column--agent"
+                  role="listitem"
+                  aria-label="Tasklist agenti"
+                >
+                  <AgentTaskListHeader
+                    onAddTask={() =>
+                      openCreateTaskInList(taskLists[0].wire.id, taskLists[0].wire.id)
+                    }
+                  />
+                  <ul className="board-cards">
+                    {visibleTasks
+                      .filter(
+                        (task) => task.wire.active_assignee_identity_id == null,
+                      )
+                      .map((task) => (
+                        <li key={task.wire.id}>
+                          <BoardTaskCard
+                            task={task}
+                            selected={selectedTaskId === task.wire.id}
+                            boardMemberById={boardMemberById}
+                            hideAssignee
+                            onSelect={() => onSelectTask(task.wire.id)}
+                            onComplete={() => {
+                              void onCompleteTask(task)
+                            }}
+                          />
+                        </li>
+                      ))}
+                  </ul>
+                </section>
+              )}
+              {orderedAgentColumns.map((agent) => {
+                const agentTasks = visibleTasks.filter(
+                  (task) =>
+                    task.wire.active_assignee_identity_id ===
+                    agent.principal_identity_id,
+                )
+                const taskList = taskLists[0]
+                return (
+                  <section
+                    key={agent.id}
+                    ref={(element) => {
+                      if (element) {
+                        columnRefs.current.set(
+                          agent.principal_identity_id,
+                          element,
+                        )
+                      } else {
+                        columnRefs.current.delete(agent.principal_identity_id)
+                      }
+                    }}
+                    className="board-column board-column--member board-column--agent"
+                    role="listitem"
+                    aria-label={`Tasklist ${agent.identity_handle}`}
+                  >
+                    <AgentColumnHeader
+                      agent={agent}
+                      onAddTask={() => {
+                        if (!taskList) return
+                        openCreateTaskInList(
+                          taskList.wire.id,
+                          agent.principal_identity_id,
+                        )
+                      }}
+                    />
+                    <ul className="board-cards">
+                      {agentTasks.map((task) => (
+                        <li key={task.wire.id}>
+                          <BoardTaskCard
+                            task={task}
+                            selected={selectedTaskId === task.wire.id}
+                            boardMemberById={boardMemberById}
+                            hideAssignee
+                            onSelect={() => onSelectTask(task.wire.id)}
+                            onComplete={() => {
+                              void onCompleteTask(task)
+                            }}
+                          />
+                        </li>
+                      ))}
+                    </ul>
+                    {!taskList && (
+                      <p className="inline-empty">
+                        Crea prima una tasklist in una categoria per aggiungere task.
+                      </p>
+                    )}
+                  </section>
+                )
+              })}
+            </div>
+          </div>
+        ) : historyList ? (
+          <div className="board-secondary-view-panel">
+            <TaskListHistoryPanel
             list={historyList}
-            tasks={tasks}
-            boardMembers={boardMembers}
-            selectedTaskId={selectedTaskId}
             isEditing={editingListId === historyList.wire.id}
             editName={listEditName}
             editColor={listEditColor}
@@ -3950,15 +5633,6 @@ export const TasksScreen = ({
             iconPickerOpen={
               listIconPickerOpen && editingListId === historyList.wire.id
             }
-            tintClassName={(() => {
-              const tint = resolveTaskListColumnTint(
-                resolveTaskListIconColorFromStored(
-                  historyList.document?.color,
-                  historyList.wire.id,
-                ),
-              )
-              return tint ? columnTintClass(tint) : undefined
-            })()}
             onEditNameChange={setListEditName}
             onStartEdit={() => {
               const listIndex = taskLists.findIndex(
@@ -3966,7 +5640,16 @@ export const TasksScreen = ({
               )
               startListEdit(historyList, listIndex >= 0 ? listIndex : 0)
             }}
-            onCancelEdit={cancelListEdit}
+            onAutoSave={() => {
+              const listIndex = taskLists.findIndex(
+                (item) => item.wire.id === historyList.wire.id,
+              )
+              commitListEdit(
+                historyList,
+                listIndex >= 0 ? listIndex : 0,
+                false,
+              )
+            }}
             onCommitEdit={() => {
               const listIndex = taskLists.findIndex(
                 (item) => item.wire.id === historyList.wire.id,
@@ -3990,48 +5673,81 @@ export const TasksScreen = ({
             onUploadInfoFile={onUploadInfoDocumentFile}
             onReadInfoFile={onReadInfoDocumentFile}
             onDownloadInfoFile={onDownloadInfoDocumentFile}
-            onSelectTask={(id) => {
-              closeListHistory()
-              onSelectTask(id)
-            }}
-            onClose={() => {
-              cancelListEdit()
-              closeListHistory()
-            }}
-          />
+              onClose={() => {
+                cancelListEdit()
+                closeListHistory()
+              }}
+            />
+          </div>
+        ) : isOverviewView ? (
+          <div className="board-secondary-view-panel">
+            <BoardOverviewView
+              project={project}
+              topic={focusedTopic}
+              onLoadProjectInfo={onLoadProjectInfo}
+              onCreateProjectInfoDocument={onCreateProjectInfoDocument}
+              onLoadTopicInfo={onLoadTopicInfo}
+              onCreateTopicInfoDocument={onCreateTopicInfoDocument}
+              onUpdateInfoDocument={onUpdateInfoDocument}
+              onUploadInfoDocumentFile={onUploadInfoDocumentFile}
+              onReadInfoDocumentFile={onReadInfoDocumentFile}
+              onDownloadInfoDocumentFile={onDownloadInfoDocumentFile}
+            />
+          </div>
+        ) : isHistoryView ? (
+          <div className="board-secondary-view-panel">
+            <BoardHistoryView
+              tasks={visibleTasks}
+              boardMembers={boardMembers}
+              taskLists={taskLists}
+              groupModes={taskFilterGroups.map((group) =>
+                group === 'listIds'
+                  ? 'tasklist'
+                  : group === 'types'
+                    ? 'type'
+                    : group === 'memberIds'
+                      ? 'member'
+                      : group === 'states'
+                        ? 'state'
+                        : 'date',
+              )}
+              selectedTaskId={selectedTaskId}
+              scopeName={boardScopeName}
+              onSelectTask={onSelectTask}
+            />
+          </div>
         ) : isTimelineView ? (
-          <BoardTimelineView
-            taskLists={timelineLists}
-            tasks={timelineTasks}
-            weekAnchor={timelineWeekAnchor}
-            scale={timelineScale}
-            onScaleChange={setTimelineScale}
-            onWeekAnchorChange={setTimelineWeekAnchor}
-            onScrollToToday={() =>
-              setTimelineScrollToFocusRequest((value) => value + 1)
-            }
-            scrollToFocusRequest={timelineScrollToFocusRequest}
-            selectedTaskId={selectedTaskId}
-            onSelectTask={onSelectTask}
-            onCompleteTask={onCompleteTask}
-            onResizeTask={(task, range) => {
-              void onUpdateTask(task, {
-                title: task.document.title,
-                notes: task.document.notes,
-                start_at: range.start_at,
-                due_at: range.due_at,
-                ...(task.document.priority !== undefined
-                  ? { priority: task.document.priority }
-                  : {}),
-                ...(task.document.recurrence !== undefined
-                  ? { recurrence: task.document.recurrence }
-                  : {}),
-              })
-            }}
-            onCreateTaskInDay={openCreateTaskInTimelineDay}
-          />
+          <div className="board-secondary-view-panel">
+            <BoardTimelineView
+              taskLists={timelineLists}
+              tasks={timelineTasks}
+              weekAnchor={timelineWeekAnchor}
+              scale={timelineScale}
+              onScaleChange={setTimelineScale}
+              onWeekAnchorChange={setTimelineWeekAnchor}
+              selectedTaskId={selectedTaskId}
+              onSelectTask={onSelectTask}
+              onCompleteTask={onCompleteTask}
+              onResizeTask={(task, range) => {
+                void onUpdateTask(task, {
+                  title: task.document.title,
+                  notes: task.document.notes,
+                  start_at: range.start_at,
+                  due_at: range.due_at,
+                  ...(task.document.priority !== undefined
+                    ? { priority: task.document.priority }
+                    : {}),
+                  ...(task.document.recurrence !== undefined
+                    ? { recurrence: task.document.recurrence }
+                    : {}),
+                })
+              }}
+              onCreateTaskInDay={openCreateTaskInTimelineDay}
+            />
+          </div>
         ) : (
-        <div className="board-columns" role="list">
+        <div className="board-board-view">
+          <div className="board-columns" role="list">
           {orderedLists.map((list, listIndex) => {
             const listTasks = visibleTasks.filter(
               (task) => task.wire.list_id === list.wire.id,
@@ -4088,20 +5804,34 @@ export const TasksScreen = ({
                   }}
                 />
 
-                <ul className="board-cards">
-                  {listTasks.map((task) => (
-                    <li key={task.wire.id}>
-                      <BoardTaskCard
-                        task={task}
-                        selected={selectedTaskId === task.wire.id}
-                        boardMemberById={boardMemberById}
-                        onSelect={() => onSelectTask(task.wire.id)}
-                        onComplete={() => {
-                          void onCompleteTask(task)
-                        }}
-                      />
-                    </li>
-                  ))}
+                <BoardColumnFilterBadges
+                  filters={advancedTaskFilters}
+                  members={boardMembers}
+                  onRemove={removeTaskFilter}
+                />
+
+                <div className="board-column-card-content">
+                  <BoardGroupedTaskCards
+                    tasks={listTasks}
+                    groups={taskFilterGroups.filter(
+                      (group) =>
+                        group !== 'listIds' &&
+                        !(
+                          group === 'dates' &&
+                          taskFilterGroups.length === 1 &&
+                          advancedTaskFilters.dates.length === 0
+                        ),
+                    )}
+                    members={boardMembers}
+                    selectedTaskId={selectedTaskId}
+                    boardMemberById={boardMemberById}
+                    onSelectTask={onSelectTask}
+                    onCompleteTask={(task) => {
+                      void onCompleteTask(task)
+                    }}
+                  />
+                </div>
+                <ul className="board-cards board-cards--locked">
                   {listLocked.map((task) => (
                     <li key={task.id} className="board-card locked">
                       <LockIcon />
@@ -4133,21 +5863,7 @@ export const TasksScreen = ({
                 role="listitem"
                 aria-label={member.label}
               >
-                <MemberColumnHeader
-                  member={member}
-                  addMenuOpen={memberAddMenuId === member.identityId}
-                  taskLists={taskLists}
-                  onToggleAddMenu={() =>
-                    setMemberAddMenuId((current) =>
-                      current === member.identityId
-                        ? undefined
-                        : member.identityId,
-                    )
-                  }
-                  onSelectList={(listId) =>
-                    openCreateTaskInList(listId, member.identityId)
-                  }
-                />
+                <MemberColumnHeader member={member} />
                 <ul className="board-cards">
                   {memberTasks.map((task) => (
                     <li key={task.wire.id}>
@@ -4167,72 +5883,6 @@ export const TasksScreen = ({
               </section>
             )
           })}
-
-          {isMemberBoard && (
-            <section
-              className={
-                showNewMember
-                  ? 'board-column board-column-add board-column-add--editing'
-                  : 'board-column board-column-add'
-              }
-              role="listitem"
-              aria-label="Nuovo utente"
-            >
-              {showNewMember ? (
-                <form
-                  className="board-new-list-form-inline board-new-member-form-inline"
-                  onSubmit={(event) => void createMemberInvite(event)}
-                >
-                  <input
-                    required
-                    autoFocus
-                    type="email"
-                    className="board-new-list-name board-new-member-field"
-                    placeholder="Email"
-                    value={memberEmail}
-                    onChange={(event) => setMemberEmail(event.target.value)}
-                    aria-label="Email membro"
-                  />
-                  <input
-                    required
-                    className="board-new-list-name board-new-member-field"
-                    placeholder="Nome"
-                    value={memberName}
-                    onChange={(event) => setMemberName(event.target.value)}
-                    aria-label="Nome membro"
-                  />
-                  <div className="board-create-actions board-new-list-actions">
-                    <button
-                      type="button"
-                      className="text-button board-new-list-cancel"
-                      onClick={() => {
-                        setShowNewMember(false)
-                        setMemberEmail('')
-                        setMemberName('')
-                      }}
-                    >
-                      Annulla
-                    </button>
-                    <button
-                      type="submit"
-                      className="primary-button board-new-list-submit"
-                    >
-                      Invita
-                    </button>
-                  </div>
-                </form>
-              ) : (
-                <button
-                  type="button"
-                  className="board-column-add-trigger"
-                  onClick={() => setShowNewMember(true)}
-                >
-                  <PlusIcon />
-                  Nuovo utente
-                </button>
-              )}
-            </section>
-          )}
 
           {!isMemberBoard && (
           <section
@@ -4349,8 +5999,52 @@ export const TasksScreen = ({
             )}
           </section>
           )}
+          </div>
         </div>
         )}
+        <div className="board-board-footer">
+            <div className="board-toolbar-secondary">
+              <nav
+                className="board-footer-path"
+                aria-label="Percorso file"
+                onClickCapture={(event) => {
+                  if (!openMobilePathPanel()) return
+                  event.preventDefault()
+                  event.stopPropagation()
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => onSelectFocus({ type: 'generali' })}
+                >
+                  {project.document?.name ?? 'Progetto'}
+                </button>
+                <span aria-hidden>›</span>
+                {focusedTopic ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => onSelectFocus({ type: 'generali' })}
+                    >
+                      Generali
+                    </button>
+                    <span aria-hidden>›</span>
+                    <strong>{boardFooterPath}</strong>
+                  </>
+                ) : (
+                  <strong>{boardFooterPath}</strong>
+                )}
+              </nav>
+              <button
+                type="button"
+                className="board-toolbar-agent"
+                onClick={() => setAiBadgeOpen(true)}
+              >
+                <img src="/sprout-ai-logo.png" alt="" aria-hidden />
+                Ask to AI
+              </button>
+            </div>
+        </div>
         </div>
         {mobileSearchOpen && (
           <div className="board-mobile-search-layer">
@@ -4438,6 +6132,15 @@ export const TasksScreen = ({
         />
       )}
 
+      {aiBadgeOpen && <BoardAiBadge onClose={() => setAiBadgeOpen(false)} />}
+      {mobilePathPanelOpen && (
+        <BoardPathBadge
+          topics={sortedTopics}
+          onSelectFocus={onSelectFocus}
+          onClose={() => setMobilePathPanelOpen(false)}
+        />
+      )}
+
       <nav className="board-mobile-island" aria-label="Navigazione board">
         <BoardMobileIslandViewModes
           mode={boardViewMode}
@@ -4458,8 +6161,14 @@ export const TasksScreen = ({
         </button>
         <button
           type="button"
-          className="board-mobile-island-agent"
-          aria-label="Agent"
+          className={
+            isAgentBoard
+              ? 'board-mobile-island-agent active'
+              : 'board-mobile-island-agent'
+          }
+          aria-label="Agenti"
+          aria-current={isAgentBoard ? 'page' : undefined}
+          onClick={handleIslandAgents}
         >
           <AgentIcon aria-hidden />
         </button>

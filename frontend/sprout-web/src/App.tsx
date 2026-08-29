@@ -10,12 +10,14 @@ import './App.css'
 import { ApiClient, ApiError } from './api/client'
 import { authErrorMessage } from './security/auth-errors'
 import type {
+  AgentDirectoryItemDto,
   AttachmentCollectionItemDto,
   EncryptedPayloadDto,
   ParticipantSuggestionDto,
   PermissionGrantDto,
   ProjectInvitationDto,
   ProjectView,
+  ProvisionAgentResponse,
   QuestionnaireDto,
   QuestionnaireSubmissionDto,
   QuestionnaireVersionDto,
@@ -39,6 +41,7 @@ import {
 } from './attachments/offline-queue'
 import { AuthScreen } from './components/AuthScreen'
 import {
+  AlertTriangleIcon,
   DownloadIcon,
   KeyIcon,
   ShieldIcon,
@@ -78,6 +81,7 @@ import {
   encryptInfoDocument,
   INITIAL_PAYLOAD_VERSION,
   resolveActiveResourceKey,
+  synchronizeProjectRootKey,
 } from './domain/resources'
 import type {
   DecryptedTask,
@@ -287,6 +291,7 @@ const ensureActiveResourceKey = async (
   resourceId: Uuid,
   preferredEpoch: number,
   missingMessage: string,
+  allowDevelopmentMint = true,
 ): Promise<{ epoch: number; key: Uint8Array }> => {
   const vault = services.auth.vault
   let resolved = resolveActiveResourceKey(vault, resourceId, preferredEpoch)
@@ -306,7 +311,7 @@ const ensureActiveResourceKey = async (
     }
     resolved = resolveActiveResourceKey(vault, resourceId, preferredEpoch)
   }
-  if (!resolved && import.meta.env.DEV) {
+  if (!resolved && import.meta.env.DEV && allowDevelopmentMint) {
     // Body keys are often missing after zero-key purge while header keys
     // remain (board still decrypts via header / DEV zero-key fallback).
     // Mint a replacement at the wire epoch so this device can rewrite payload.
@@ -341,19 +346,12 @@ const hydrateServerProject = async (
       project.id,
       identityId,
     )
-    const rootKey = services.auth.vault.getResourceKey(
-      project.root_resource_id,
-      project.key_epoch,
+    const hasProjectRootKey = await synchronizeProjectRootKey(
+      services.auth.vault,
+      project,
     )
-    if (rootKey) {
-      await services.auth.vault.putResourceKey(
-        project.id,
-        rootKey.slice(),
-        project.key_epoch,
-      )
-    }
     if (
-      !rootKey &&
+      !hasProjectRootKey &&
       imported === 0 &&
       !services.auth.vault.getResourceKey(project.id, project.key_epoch)
     ) {
@@ -475,6 +473,9 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   const [retentionWarnings, setRetentionWarnings] = useState<
     RetentionWarningDto[]
   >([])
+  const [agents, setAgents] = useState<AgentDirectoryItemDto[]>([])
+  const [agentDirectoryRefreshToken, setAgentDirectoryRefreshToken] =
+    useState(0)
   const deviceId = useMemo(getOrCreateDeviceId, [])
   const sessionRef = useRef(state.session)
   sessionRef.current = state.session
@@ -708,16 +709,38 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         dispatch({ type: 'set-projects', projects: items })
       })
       .catch((error: unknown) => {
-        if (active) {
-          dispatch({ type: 'set-error', message: errorMessage(error) })
+        if (!active) return
+        if (error instanceof ApiError && error.status === 401) {
+          clearDevSession()
+          services.wake.stop()
+          services.sync.clearMemory()
+          services.auth.logout()
+          dispatch({ type: 'logout' })
+          dispatch({
+            type: 'set-notice',
+            message: 'Sessione server scaduta. Accedi di nuovo per ricaricare tutti i progetti.',
+          })
+          return
         }
+        dispatch({ type: 'set-error', message: errorMessage(error) })
       })
-    void services.database.queueCount().then((count) => {
-      if (active) dispatch({ type: 'set-queue-count', count })
-    })
-    void services.database.listConflicts().then((conflicts) => {
-      if (active) dispatch({ type: 'set-conflicts', conflicts })
-    })
+    void services.database
+      .queueCount()
+      .then((count) => {
+        if (active) dispatch({ type: 'set-queue-count', count })
+      })
+      .catch(() => {
+        // The IndexedDB connection can close while HMR or logout tears down
+        // the current app instance. The next mount reloads this value.
+      })
+    void services.database
+      .listConflicts()
+      .then((conflicts) => {
+        if (active) dispatch({ type: 'set-conflicts', conflicts })
+      })
+      .catch(() => {
+        // See queueCount above: teardown races are expected and recoverable.
+      })
     return () => {
       active = false
     }
@@ -1057,6 +1080,57 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   ])
 
   useEffect(() => {
+    if (!state.selectedProjectId || !state.session) {
+      setAgents([])
+      return
+    }
+    let active = true
+    void api
+      .listAgents(state.selectedProjectId)
+      .then((nextAgents) => {
+        if (active) setAgents(nextAgents)
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setAgents([])
+          dispatch({ type: 'set-error', message: errorMessage(error) })
+        }
+      })
+    return () => {
+      active = false
+    }
+  }, [
+    agentDirectoryRefreshToken,
+    api,
+    dispatch,
+    state.selectedProjectId,
+    state.session,
+  ])
+
+  useEffect(() => {
+    if (!state.selectedProjectId || !state.session) return
+    const refreshInterval = window.setInterval(() => {
+      setAgentDirectoryRefreshToken((value) => value + 1)
+    }, 30_000)
+    return () => window.clearInterval(refreshInterval)
+  }, [state.selectedProjectId, state.session])
+
+  const provisionAgent = useCallback(
+    async (envelope: unknown): Promise<ProvisionAgentResponse> => {
+      if (!state.selectedProjectId) {
+        throw new Error('Seleziona un progetto prima di creare un agente.')
+      }
+      const response = await api.provisionAgent(
+        state.selectedProjectId,
+        envelope,
+      )
+      setAgentDirectoryRefreshToken((value) => value + 1)
+      return response
+    },
+    [api, state.selectedProjectId],
+  )
+
+  useEffect(() => {
     if (
       !services ||
       !state.online ||
@@ -1292,8 +1366,8 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           `Purged=${purged}, restored=${restored}, exact-hits=${coverage.hits}/${topicItems.length} (epochMiss=${coverage.epochMiss}, purposeMiss=${coverage.purposeMiss}), locked=${stillLocked}.` +
           (firstReason ? ` Errore: ${firstReason}` : '') +
           (stillLocked === 0
-            ? ' Board sbloccata (incluso recovery ciphertext a chiave-zero).'
-            : ' Se resta locked: ricrea le risorse dopo questo fix.'),
+            ? ' Board sbloccata: gli slot recuperati sono stati salvati automaticamente.'
+            : ' Nessuna chiave locale disponibile ha autenticato questi ciphertext; serve il vault del device originale o una recovery envelope valida.'),
       })
     } else {
       dispatch({
@@ -1492,9 +1566,20 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         persistDevVault(state.session, current.auth.vault)
       }
       await putRestRecord(current.database, projectRecord(project, payload))
+      const serverProjects = await api.listProjects()
+      const hydratedProjects = await Promise.all(
+        serverProjects.map((serverProject) =>
+          hydrateServerProject(
+            api,
+            current,
+            serverProject,
+            state.session?.identity_id,
+          ),
+        ),
+      )
       dispatch({
         type: 'set-projects',
-        projects: [...state.projects, { wire: project, document }],
+        projects: hydratedProjects,
       })
       dispatch({ type: 'select-project', projectId: id })
       setProjectName('')
@@ -2097,6 +2182,71 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     )
   }
 
+  const loadProjectInfoDocuments = async (
+    project: ProjectItem,
+  ): Promise<DecryptedInfoDocument[]> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to load project info')
+    }
+    const current = requireServices()
+    const response = await api.listProjectInfoDocuments(project.wire.id)
+    return Promise.all(
+      response.documents.map((document) =>
+        decryptInfoDocument(document, current.auth.vault),
+      ),
+    )
+  }
+
+  const createProjectInfoDocument = async (
+    project: ProjectItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to create project info')
+    }
+    const current = requireServices()
+    const hasProjectRootKey = await synchronizeProjectRootKey(
+      current.auth.vault,
+      project.wire,
+    )
+    if (hasProjectRootKey && import.meta.env.DEV) {
+      persistDevVault(state.session, current.auth.vault)
+    }
+    const active = await ensureActiveResourceKey(
+      api,
+      current,
+      state.session,
+      project.wire.id,
+      project.wire.root_resource_id,
+      project.wire.key_epoch,
+      'Missing active project resource key',
+      false,
+    )
+    const documentId = crypto.randomUUID()
+    const payload = await encryptInfoDocument(current.auth.vault, {
+      projectId: project.wire.id,
+      documentId,
+      containerResourceId: project.wire.root_resource_id,
+      aggregateVersion: INITIAL_PAYLOAD_VERSION,
+      keyEpoch: active.epoch,
+      kind: 'project',
+      document,
+    })
+    const { document: wire } = await api.createProjectInfoDocument(
+      project.wire.id,
+      {
+        id: documentId,
+        parent_document_id: parentDocumentId ?? null,
+        resource_node_id: project.wire.root_resource_id,
+        key_epoch: active.epoch,
+        payload,
+        idempotency_key: crypto.randomUUID(),
+      },
+    )
+    return { wire, document }
+  }
+
   const createTaskListInfoDocument = async (
     list: TaskListItem,
     parentDocumentId: Uuid | undefined,
@@ -2140,12 +2290,73 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     return { wire, document }
   }
 
+  const loadTopicInfoDocuments = async (
+    topic: TopicItem,
+  ): Promise<DecryptedInfoDocument[]> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to load topic info')
+    }
+    const current = requireServices()
+    const response = await api.listTopicInfoDocuments(
+      state.selectedProjectId,
+      topic.wire.id,
+    )
+    return Promise.all(
+      response.documents.map((document) =>
+        decryptInfoDocument(document, current.auth.vault),
+      ),
+    )
+  }
+
+  const createTopicInfoDocument = async (
+    topic: TopicItem,
+    parentDocumentId: Uuid | undefined,
+    document: InfoDocumentContent,
+  ): Promise<DecryptedInfoDocument> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to create topic info')
+    }
+    const current = requireServices()
+    const active = await ensureActiveResourceKey(
+      api,
+      current,
+      state.session,
+      state.selectedProjectId,
+      topic.wire.resource_node_id,
+      topic.wire.key_epoch,
+      'Missing active topic resource key',
+    )
+    const documentId = crypto.randomUUID()
+    const payload = await encryptInfoDocument(current.auth.vault, {
+      projectId: state.selectedProjectId,
+      documentId,
+      containerResourceId: topic.wire.resource_node_id,
+      aggregateVersion: INITIAL_PAYLOAD_VERSION,
+      keyEpoch: active.epoch,
+      kind: 'topic',
+      document,
+    })
+    const { document: wire } = await api.createTopicInfoDocument(
+      state.selectedProjectId,
+      topic.wire.id,
+      {
+        id: documentId,
+        parent_document_id: parentDocumentId ?? null,
+        resource_node_id: topic.wire.resource_node_id,
+        key_epoch: active.epoch,
+        payload,
+        idempotency_key: crypto.randomUUID(),
+      },
+    )
+    return { wire, document }
+  }
+
   const updateInfoDocument = async (
     value: DecryptedInfoDocument,
     document: InfoDocumentContent,
   ): Promise<DecryptedInfoDocument> => {
     if (!state.session || !state.selectedProjectId) {
-      throw new Error('Server sign-in is required to update task-list info')
+      throw new Error('Server sign-in is required to update info documents')
     }
     const current = requireServices()
     const active = await ensureActiveResourceKey(
@@ -2155,7 +2366,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       state.selectedProjectId,
       value.wire.resource_node_id,
       value.wire.key_epoch,
-      'Missing active task-list resource key',
+      'Missing active info-document resource key',
     )
     const payload = await encryptInfoDocument(current.auth.vault, {
       projectId: state.selectedProjectId,
@@ -2163,7 +2374,11 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       containerResourceId: value.wire.resource_node_id,
       aggregateVersion: value.wire.payload_version + 1,
       keyEpoch: active.epoch,
-      kind: value.wire.task_list_id ? 'task-list' : 'topic',
+      kind: value.wire.task_list_id
+        ? 'task-list'
+        : value.wire.topic_id
+          ? 'topic'
+          : 'project',
       document,
     })
     const { document: wire } = await api.updateInfoDocument(
@@ -2194,14 +2409,14 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       state.selectedProjectId,
       document.wire.resource_node_id,
       document.wire.key_epoch,
-      'Missing active task-list resource key',
+      'Missing active info-document resource key',
     )
     const resourceKey = current.auth.vault.getResourceKey(
       document.wire.resource_node_id,
       active.epoch,
     )
     if (!resourceKey) {
-      throw new Error('This device cannot decrypt the task-list info resource')
+      throw new Error('This device cannot decrypt the info-document resource')
     }
     const blobId = crypto.randomUUID()
     const blockId = crypto.randomUUID()
@@ -2290,7 +2505,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       document.wire.key_epoch,
     )
     if (!resourceKey) {
-      throw new Error('This device cannot decrypt the task-list info resource')
+      throw new Error('This device cannot decrypt the info-document resource')
     }
     const attachment = await api.getAttachment(
       document.wire.project_id,
@@ -5409,6 +5624,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   return (
     <div className="app-shell">
       <main className="main-content">
+        <div className="app-notifications" aria-live="polite">
         {state.phase === 'locked' && (
           <div className="app-banner warning-banner" role="alert">
             <KeyIcon />
@@ -5505,6 +5721,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             </button>
           </div>
         )}
+        </div>
 
         {state.screen === 'tasks' && (
           <TasksScreen
@@ -5514,6 +5731,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             tasks={state.tasks}
             lockedTasks={state.lockedTasks}
             boardMembers={state.boardMembers}
+            agents={agents}
             boardFocus={state.boardFocus}
             boardViewMode={state.boardViewMode}
             selectedTopicId={state.selectedTopicId}
@@ -5545,6 +5763,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             onDeleteTopic={deleteTopic}
             onCreateList={createTaskList}
             onUpdateTaskList={updateTaskList}
+            onLoadProjectInfo={loadProjectInfoDocuments}
+            onCreateProjectInfoDocument={createProjectInfoDocument}
+            onLoadTopicInfo={loadTopicInfoDocuments}
+            onCreateTopicInfoDocument={createTopicInfoDocument}
             onLoadTaskListInfo={loadTaskListInfoDocuments}
             onCreateTaskListInfoDocument={createTaskListInfoDocument}
             onUpdateInfoDocument={updateInfoDocument}
@@ -5557,6 +5779,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             onCompleteTask={completeTask}
             onCopyTask={copyTask}
             onInviteMember={inviteProjectParticipant}
+            onProvisionAgent={provisionAgent}
             taskAttachments={attachments}
             taskAttachmentLabels={attachmentLabels}
             onRefreshTaskAttachments={refreshTaskAttachments}
@@ -5700,6 +5923,14 @@ const App = ({ apiClient, initialSession }: AppProps) => {
                 />
               )}
             </div>
+            <button
+              type="button"
+              className="settings-report-issues"
+              aria-label="Report issues"
+            >
+              <AlertTriangleIcon aria-hidden />
+              <span>Report issues</span>
+            </button>
           </div>
         )}
       </main>

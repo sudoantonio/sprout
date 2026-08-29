@@ -79,7 +79,10 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             get(device_keys::transparency),
         )
         .route("/v1/projects", get(projects::list).post(projects::create))
-        .route("/v1/projects/{project_id}/agents", post(agents::provision))
+        .route(
+            "/v1/projects/{project_id}/agents",
+            get(agents::list).post(agents::provision),
+        )
         .route(
             "/v1/projects/{project_id}/agents/{agent_id}/runner/activate",
             axum::routing::put(agents::activate_runner),
@@ -394,6 +397,11 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
             "/v1/projects/{project_id}/topics/{topic_id}/info-documents",
             get(info_documents::list_topic_documents)
                 .post(info_documents::create_topic_document),
+        )
+        .route(
+            "/v1/projects/{project_id}/info-documents",
+            get(info_documents::list_project_documents)
+                .post(info_documents::create_project_document),
         )
         .route(
             "/v1/projects/{project_id}/topics/{topic_id}/task-lists",

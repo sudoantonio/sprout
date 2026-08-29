@@ -72,7 +72,7 @@ export const InfoMarkdown = ({ children }: { children: string }) => {
   if (!children.trim()) {
     return (
       <p className="tasklist-info-placeholder">
-        Inserisci testo, link e informazioni relative a questa task list.
+        Inserisci testo, link e informazioni relative a questa sezione.
       </p>
     )
   }

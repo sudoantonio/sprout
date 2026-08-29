@@ -256,6 +256,29 @@ pub struct ProvisionAgentResponse {
 }
 
 #[derive(Serialize)]
+pub struct AgentDirectoryItem {
+    id: AgentId,
+    principal_identity_id: UserId,
+    identity_handle: String,
+    controller_identity_id: UserId,
+    availability: String,
+    state: String,
+    created_at: DateTime<Utc>,
+    runner_id: Uuid,
+    runner_device_id: Uuid,
+    runner_state: String,
+    runner_last_seen_at: Option<DateTime<Utc>>,
+    local_goal_id: Option<Uuid>,
+    local_goal_revision: Option<i64>,
+    local_goal_state: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ListAgentsResponse {
+    agents: Vec<AgentDirectoryItem>,
+}
+
+#[derive(Serialize)]
 #[serde(transparent)]
 struct SensitiveToken(String);
 
@@ -263,6 +286,99 @@ impl std::fmt::Debug for SensitiveToken {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SensitiveToken([REDACTED])")
     }
+}
+
+/// Returns the server-derived directory for agents visible to the caller.
+/// Row-level security intentionally limits the result to controlled agents and
+/// project administrators; an empty list is therefore distinct from forbidden.
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<ListAgentsResponse>, AppError> {
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Member).await?;
+    let mut transaction = state.pool.begin().await?;
+    set_database_context(
+        &mut transaction,
+        actor.identity_id,
+        Some(actor.device_id),
+        Some(project_id),
+    )
+    .await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            agent.id,
+            agent.principal_identity_id,
+            directory.identity_handle,
+            agent.controller_identity_id,
+            agent.availability,
+            agent.state,
+            agent.created_at,
+            runner.id AS runner_id,
+            runner.device_id AS runner_device_id,
+            runner.state AS runner_state,
+            runner.last_seen_at AS runner_last_seen_at,
+            local_goal.id AS local_goal_id,
+            local_goal.revision AS local_goal_revision,
+            local_goal.state AS local_goal_state
+        FROM governed_agents agent
+        JOIN identity_directory directory
+          ON directory.identity_id = agent.principal_identity_id
+        JOIN agent_runners runner
+          ON runner.project_id = agent.project_id
+         AND runner.agent_id = agent.id
+        LEFT JOIN LATERAL (
+            SELECT goal.id, goal.revision, goal.state
+            FROM agent_local_goal_contracts goal
+            WHERE goal.project_id = agent.project_id
+              AND goal.agent_id = agent.id
+            ORDER BY goal.revision DESC, goal.recorded_at DESC
+            LIMIT 1
+        ) local_goal ON true
+        WHERE agent.project_id = $1
+        ORDER BY
+            CASE agent.state
+                WHEN 'active' THEN 0
+                WHEN 'suspended' THEN 1
+                ELSE 2
+            END,
+            agent.created_at DESC,
+            agent.id
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    let agents = rows
+        .into_iter()
+        .map(|row| -> Result<AgentDirectoryItem, sqlx::Error> {
+            Ok(AgentDirectoryItem {
+                id: AgentId::from(row.try_get::<Uuid, _>("id")?),
+                principal_identity_id: UserId::from(
+                    row.try_get::<Uuid, _>("principal_identity_id")?,
+                ),
+                identity_handle: row.try_get("identity_handle")?,
+                controller_identity_id: UserId::from(
+                    row.try_get::<Uuid, _>("controller_identity_id")?,
+                ),
+                availability: row.try_get("availability")?,
+                state: row.try_get("state")?,
+                created_at: row.try_get("created_at")?,
+                runner_id: row.try_get("runner_id")?,
+                runner_device_id: row.try_get("runner_device_id")?,
+                runner_state: row.try_get("runner_state")?,
+                runner_last_seen_at: row.try_get("runner_last_seen_at")?,
+                local_goal_id: row.try_get("local_goal_id")?,
+                local_goal_revision: row.try_get("local_goal_revision")?,
+                local_goal_state: row.try_get("local_goal_state")?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(ListAgentsResponse { agents }))
 }
 
 pub async fn provision(

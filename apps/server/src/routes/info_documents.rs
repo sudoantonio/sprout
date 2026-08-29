@@ -22,6 +22,7 @@ use crate::{
 
 #[derive(Clone, Copy)]
 enum Container {
+    Project,
     Topic(Uuid),
     TaskList(Uuid),
 }
@@ -29,6 +30,7 @@ enum Container {
 impl Container {
     const fn topic_id(self) -> Option<Uuid> {
         match self {
+            Self::Project => None,
             Self::Topic(id) => Some(id),
             Self::TaskList(_) => None,
         }
@@ -36,10 +38,28 @@ impl Container {
 
     const fn task_list_id(self) -> Option<Uuid> {
         match self {
+            Self::Project => None,
             Self::Topic(_) => None,
             Self::TaskList(id) => Some(id),
         }
     }
+}
+
+pub async fn list_project_documents(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<ListInfoDocumentsResponse>, AppError> {
+    list_documents(&state, actor, project_id, Container::Project).await
+}
+
+pub async fn create_project_document(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path(project_id): Path<Uuid>,
+    Json(request): Json<CreateInfoDocumentRequest>,
+) -> Result<Json<InfoDocumentResponse>, AppError> {
+    create_document(&state, actor, project_id, Container::Project, request).await
 }
 
 pub async fn list_topic_documents(
@@ -337,6 +357,17 @@ async fn container_resource(
 ) -> Result<Uuid, AppError> {
     let mut transaction = begin(state, actor, project_id).await?;
     let resource_node_id = match container {
+        Container::Project => {
+            sqlx::query_scalar(
+                "SELECT id FROM resource_nodes
+                 WHERE project_id = $1
+                   AND node_kind = 'root'
+                   AND deleted_at IS NULL",
+            )
+            .bind(project_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+        }
         Container::Topic(topic_id) => {
             sqlx::query_scalar(
                 "SELECT resource_node_id FROM topics

@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react'
 import type { ProjectItem } from '../store/app-store'
-import { CheckIcon, ChevronDownIcon, FolderIcon, PlusIcon } from './icons'
+import { CheckIcon, FolderIcon, PlusIcon } from './icons'
 
 const projectLabelFor = (item: ProjectItem): string =>
   item.document?.name ?? `Locked ${item.wire.id.slice(0, 8)}`
@@ -90,7 +90,6 @@ export const BoardProjectSwitcher = ({
       >
         <FolderIcon />
         <span className="board-project-switcher-label">{displayName}</span>
-        <ChevronDownIcon className="board-project-switcher-chevron" />
       </button>
       {open && (
         <div

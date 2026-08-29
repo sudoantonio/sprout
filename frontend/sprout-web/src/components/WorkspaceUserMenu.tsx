@@ -13,7 +13,6 @@ import { createPortal } from 'react-dom'
 import type { AppearanceOption } from '../theme'
 import type { ProjectItem } from '../store/app-store'
 import type { AppScreen } from '../store/app-store'
-import { BoardProjectSwitcher } from './BoardProjectSwitcher'
 import {
   AlertTriangleIcon,
   CheckIcon,
@@ -24,11 +23,11 @@ import {
   LayoutGridIcon,
   LockIcon,
   LogOutIcon,
-  PaletteIcon,
   PaperclipIcon,
   RefreshCwIcon,
   SearchIcon,
   SlidersIcon,
+  SunIcon,
   UsersIcon,
 } from './icons'
 
@@ -81,11 +80,12 @@ export interface WorkspaceUserMenuProps {
 
 type WorkspaceUserPanelProps = Omit<
   WorkspaceUserMenuProps,
-  'variant' | 'userLabel'
+  'variant'
 > & {
   onClose?(): void
   allowProjectCreate?: boolean
   showNavSearch?: boolean
+  portalAppearanceMenu?: boolean
 }
 
 const appearanceOptions: Array<{ value: AppearanceOption; label: string }> = [
@@ -100,24 +100,51 @@ const appearanceLabelFor = (value: AppearanceOption): string =>
   appearanceOptions.find((option) => option.value === value)?.label ?? 'System'
 
 const WorkspaceUserPanel = ({
-  projects,
-  selectedProjectId,
+  userLabel,
   currentScreen,
   conflictCount,
-  projectName,
-  onProjectNameChange,
-  onSelectProject,
-  onCreateProject,
   onNavigate,
   onLogout,
   appearance,
   onAppearanceChange,
   onClose,
-  allowProjectCreate = true,
   showNavSearch = false,
+  portalAppearanceMenu = false,
 }: WorkspaceUserPanelProps) => {
   const [appearanceOpen, setAppearanceOpen] = useState(false)
+  const [appearanceMenuStyle, setAppearanceMenuStyle] = useState<CSSProperties>({})
   const [navQuery, setNavQuery] = useState('')
+  const appearanceTriggerRef = useRef<HTMLButtonElement>(null)
+
+  const shouldPortalAppearanceMenu = showNavSearch || portalAppearanceMenu
+
+  useLayoutEffect(() => {
+    if (!appearanceOpen || !shouldPortalAppearanceMenu || !appearanceTriggerRef.current) return
+
+    const updatePosition = () => {
+      const triggerRect = appearanceTriggerRef.current?.getBoundingClientRect()
+      if (!triggerRect) return
+
+      const menuWidth = 188
+      const menuHeight = 190
+      setAppearanceMenuStyle({
+        top: Math.min(triggerRect.bottom + 6, window.innerHeight - menuHeight - 8),
+        left: Math.max(
+          8,
+          Math.min(triggerRect.right - 48, window.innerWidth - menuWidth - 8),
+        ),
+        width: menuWidth,
+      })
+    }
+
+    updatePosition()
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+    return () => {
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
+    }
+  }, [appearanceOpen, shouldPortalAppearanceMenu])
 
   const navigate = (screen: AppScreen) => {
     onNavigate(screen)
@@ -136,27 +163,46 @@ const WorkspaceUserPanel = ({
       )
     : menuItems
 
+  const appearanceMenu = appearanceOpen ? (
+    <ul
+      className={`workspace-user-appearance-menu${shouldPortalAppearanceMenu ? ' workspace-user-appearance-menu--portaled' : ''}`}
+      role="menu"
+      aria-label="Interface appearance"
+      style={shouldPortalAppearanceMenu ? appearanceMenuStyle : undefined}
+    >
+      {appearanceOptions.map((option) => (
+        <li key={option.value} role="none">
+          <button
+            type="button"
+            role="menuitemradio"
+            aria-checked={appearance === option.value}
+            className={
+              appearance === option.value
+                ? 'workspace-user-appearance-option active'
+                : 'workspace-user-appearance-option'
+            }
+            onClick={() => selectAppearance(option.value)}
+          >
+            <span className="workspace-user-appearance-option-label">
+              <span
+                className={`workspace-user-appearance-swatch workspace-user-appearance-swatch--${option.value}`}
+              />
+              <span>{option.label}</span>
+            </span>
+            {appearance === option.value && (
+              <CheckIcon
+                className="workspace-user-appearance-check"
+                aria-hidden
+              />
+            )}
+          </button>
+        </li>
+      ))}
+    </ul>
+  ) : null
+
   return (
     <>
-      <div className="workspace-user-popover-section">
-        <p className="workspace-user-popover-heading">Progetto</p>
-        <BoardProjectSwitcher
-          projects={projects}
-          selectedProjectId={selectedProjectId}
-          projectName={projectName}
-          onProjectNameChange={onProjectNameChange}
-          onSelectProject={(projectId) => {
-            onSelectProject(projectId)
-            onClose?.()
-          }}
-          onCreateProject={(event) => {
-            void onCreateProject(event)
-            onClose?.()
-          }}
-          allowCreate={allowProjectCreate}
-        />
-      </div>
-
       {showNavSearch ? (
         <label className="workspace-settings-search">
           <SearchIcon className="workspace-settings-search-icon" aria-hidden />
@@ -178,106 +224,92 @@ const WorkspaceUserPanel = ({
           {visibleMenuItems.map((item) => {
             const Icon = item.icon
             return (
-              <li key={item.id} role="none">
-                <button
-                  type="button"
-                  role="menuitem"
-                  className={
-                    currentScreen === item.id
-                      ? 'workspace-user-nav-item active'
-                      : 'workspace-user-nav-item'
-                  }
-                  onClick={() => navigate(item.id)}
-                >
-                  <span className="workspace-user-nav-item-label">
-                    <Icon className="workspace-user-nav-icon" />
-                    <span>{item.label}</span>
-                  </span>
-                  {item.id === 'conflicts' && conflictCount > 0 && (
-                    <span className="count-badge">{conflictCount}</span>
-                  )}
-                </button>
-              </li>
+              <>
+                <li key={item.id} role="none">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className={
+                      currentScreen === item.id
+                        ? 'workspace-user-nav-item active'
+                        : 'workspace-user-nav-item'
+                    }
+                    onClick={() => navigate(item.id)}
+                  >
+                    <span className="workspace-user-nav-item-label">
+                      <Icon className="workspace-user-nav-icon" />
+                      <span>{item.label}</span>
+                    </span>
+                    {item.id === 'conflicts' && conflictCount > 0 && (
+                      <span className="count-badge">{conflictCount}</span>
+                    )}
+                  </button>
+                </li>
+                {item.id === 'tasks' && (
+                  <li role="none" className="workspace-user-appearance">
+                    <button
+                      ref={appearanceTriggerRef}
+                      type="button"
+                      role="menuitem"
+                      className="workspace-user-nav-item workspace-user-appearance-trigger"
+                      aria-expanded={appearanceOpen}
+                      aria-haspopup="menu"
+                      aria-label={`Appearance, ${appearanceLabelFor(appearance)}`}
+                      onClick={() => setAppearanceOpen((value) => !value)}
+                    >
+                      <span className="workspace-user-nav-item-label">
+                        <SunIcon className="workspace-user-nav-icon" />
+                        <span>Appearance</span>
+                      </span>
+                      <span className="workspace-user-appearance-value">
+                        {appearanceLabelFor(appearance)}
+                      </span>
+                      <ChevronDownIcon
+                        className={
+                          appearanceOpen
+                            ? 'workspace-user-appearance-chevron open'
+                            : 'workspace-user-appearance-chevron'
+                        }
+                      />
+                    </button>
+                    {shouldPortalAppearanceMenu
+                      ? appearanceMenu && createPortal(appearanceMenu, document.body)
+                      : appearanceMenu}
+                  </li>
+                )}
+              </>
             )
           })}
         </ul>
       </div>
 
-      <div className="workspace-user-popover-section">
-        <ul className="workspace-user-nav" role="none">
-          <li role="none" className="workspace-user-appearance">
-            <button
-              type="button"
-              role="menuitem"
-              className="workspace-user-nav-item workspace-user-appearance-trigger"
-              aria-expanded={appearanceOpen}
-              aria-haspopup="menu"
-              aria-label={`Appearance, ${appearanceLabelFor(appearance)}`}
-              onClick={() => setAppearanceOpen((value) => !value)}
-            >
-              <span className="workspace-user-nav-item-label">
-                <PaletteIcon className="workspace-user-nav-icon" />
-                <span>Appearance</span>
-              </span>
-              <span className="workspace-user-appearance-value">
-                {appearanceLabelFor(appearance)}
-              </span>
-              <ChevronDownIcon
-                className={
-                  appearanceOpen
-                    ? 'workspace-user-appearance-chevron open'
-                    : 'workspace-user-appearance-chevron'
-                }
-              />
-            </button>
-            {appearanceOpen && (
-              <ul
-                className="workspace-user-appearance-menu"
-                role="menu"
-                aria-label="Interface appearance"
-              >
-                {appearanceOptions.map((option) => (
-                  <li key={option.value} role="none">
-                    <button
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={appearance === option.value}
-                      className={
-                        appearance === option.value
-                          ? 'workspace-user-appearance-option active'
-                          : 'workspace-user-appearance-option'
-                      }
-                      onClick={() => selectAppearance(option.value)}
-                    >
-                      <span>{option.label}</span>
-                      {appearance === option.value && (
-                        <CheckIcon
-                          className="workspace-user-appearance-check"
-                          aria-hidden
-                        />
-                      )}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </li>
-        </ul>
-      </div>
-
       <div className="workspace-user-popover-footer">
-        <button
-          type="button"
-          role="menuitem"
-          className="workspace-user-logout"
-          onClick={() => {
-            onClose?.()
-            onLogout()
-          }}
-        >
-          <LogOutIcon className="workspace-user-nav-icon" />
-          Esci e cancella memoria
-        </button>
+        {showNavSearch ? (
+          <button
+            type="button"
+            className="workspace-user-trigger workspace-user-overview-trigger"
+            aria-label={`Account di ${displayLabelFor(userLabel)}`}
+          >
+            <span className="workspace-user-avatar" aria-hidden>
+              {initialFor(userLabel)}
+            </span>
+            <span className="workspace-user-label">{displayLabelFor(userLabel)}</span>
+            <ChevronUpIcon className="workspace-user-chevron" aria-hidden />
+          </button>
+        ) : (
+          <button
+            type="button"
+            role="menuitem"
+            className="workspace-user-logout"
+            onClick={() => {
+              onClose?.()
+              onLogout()
+            }}
+          >
+            <LogOutIcon className="workspace-user-nav-icon" />
+            Esci e cancella memoria
+          </button>
+        )}
       </div>
     </>
   )
@@ -320,17 +352,20 @@ export const WorkspaceUserMenu = ({
     const updatePosition = () => {
       if (!rootRef.current || !triggerRef.current) return
 
-      const menuRect = rootRef.current.getBoundingClientRect()
       const triggerRect = triggerRef.current.getBoundingClientRect()
-      const width = popoverWidthFor(
+      const width =
         variant === 'tab'
-          ? Math.max(16, triggerRect.right - Math.min(272, window.innerWidth - 32))
-          : menuRect.left,
-      )
+          ? popoverWidthFor(
+              Math.max(
+                16,
+                triggerRect.right - Math.min(272, window.innerWidth - 32),
+              ),
+            )
+          : triggerRect.width
       const left =
         variant === 'tab'
           ? Math.max(16, Math.min(triggerRect.right - width, window.innerWidth - width - 16))
-          : menuRect.left
+          : triggerRect.left
 
       setPortaledPopoverStyle({
         left,
@@ -360,6 +395,12 @@ export const WorkspaceUserMenu = ({
     const onPointerDown = (event: MouseEvent) => {
       const target = event.target as Node
       if (
+        target instanceof Element &&
+        target.closest('.workspace-user-appearance-menu--portaled')
+      ) {
+        return
+      }
+      if (
         !rootRef.current?.contains(target) &&
         !popoverRef.current?.contains(target)
       ) {
@@ -378,6 +419,7 @@ export const WorkspaceUserMenu = ({
   }, [open, variant])
 
   const panelProps = {
+    userLabel,
     projects,
     selectedProjectId,
     currentScreen,
@@ -390,6 +432,7 @@ export const WorkspaceUserMenu = ({
     onLogout,
     appearance,
     onAppearanceChange,
+    portalAppearanceMenu: usePortaledPopover,
   }
 
   if (variant === 'overview') {
@@ -402,8 +445,9 @@ export const WorkspaceUserMenu = ({
           type="button"
           className="settings-back workspace-settings-back"
           onClick={() => onNavigate('tasks')}
+          aria-label="Torna alla board"
         >
-          ← back
+          ← Back to Sprout
         </button>
         <div className="workspace-user-panel" aria-label="Account e impostazioni">
           <WorkspaceUserPanel
@@ -460,7 +504,7 @@ export const WorkspaceUserMenu = ({
             <div
               ref={popoverRef}
               id={menuId}
-              className="workspace-user-popover workspace-user-popover--portaled"
+              className={`workspace-user-popover workspace-user-popover--portaled workspace-user-popover--${variant}`}
               style={portaledPopoverStyle}
               role="menu"
               aria-label="Account e impostazioni"

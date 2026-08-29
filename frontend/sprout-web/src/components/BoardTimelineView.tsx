@@ -40,7 +40,6 @@ import type { DecryptedTask } from '../domain/models'
 import type { TaskListItem } from '../store/app-store'
 import { LockIcon, PlusIcon } from './icons'
 import { BoardTimelineNav } from './BoardTimelineNav'
-import { BoardTimelineScaleControls } from './BoardTimelineScaleControls'
 import { TaskListAvatarContent } from './TaskListAvatarContent'
 
 const LIST_COL_WIDTH = 200
@@ -52,8 +51,6 @@ export interface BoardTimelineViewProps {
   scale: number
   onScaleChange(scale: number): void
   onWeekAnchorChange(anchor: Date): void
-  onScrollToToday(): void
-  scrollToFocusRequest?: number
   selectedTaskId?: string
   onSelectTask(id: string): void
   onCompleteTask(task: DecryptedTask): void
@@ -78,8 +75,6 @@ export const BoardTimelineView = ({
   scale,
   onScaleChange,
   onWeekAnchorChange,
-  onScrollToToday,
-  scrollToFocusRequest,
   selectedTaskId,
   onSelectTask,
   onCompleteTask,
@@ -213,17 +208,6 @@ export const BoardTimelineView = ({
     node.scrollBy({ left: delta, behavior: 'smooth' })
   }
 
-  useEffect(() => {
-    if (scrollToFocusRequest === undefined) return
-    const node = scrollRef.current
-    if (!node) return
-    centerTimeRef.current = weekAnchor
-    node.scrollTo({
-      left: scrollLeftForTime(weekAnchor, node),
-      behavior: 'smooth',
-    })
-  }, [scrollToFocusRequest, weekAnchor])
-
   const level = window.level
   const showTaskTime = level === 'hour'
 
@@ -256,6 +240,7 @@ export const BoardTimelineView = ({
         } as CSSProperties
       }
     >
+      <div className="board-timeline-list-gutter" aria-hidden />
       <div ref={scrollRef} className="board-timeline-scroll">
         {taskLists.length === 0 ? (
           <p className="board-timeline-empty-state">Nessuna task list.</p>
@@ -268,11 +253,31 @@ export const BoardTimelineView = ({
               } as CSSProperties
             }
           >
+            <div
+              className="board-timeline-board-grid"
+              style={{ width: window.widthPx }}
+              aria-hidden
+            >
+              {bands
+                .filter((band) => band.kind !== 'divider')
+                .map((band) => (
+                  <div
+                    key={`board-${band.key}`}
+                    className={`board-timeline-band board-timeline-band--${band.kind}`}
+                    style={{ left: band.x, width: band.width }}
+                  />
+                ))}
+              {nowX !== null ? (
+                <div
+                  className="board-timeline-today-line board-timeline-today-line--board"
+                  style={{ left: nowX }}
+                />
+              ) : null}
+            </div>
             <div className="board-timeline-gantt-header">
-              <div
-                className="board-timeline-list-label board-timeline-list-label--corner"
-                aria-hidden
-              />
+              <div className="board-timeline-list-label board-timeline-list-label--corner">
+                <BoardTimelineNav rangeLabel={rangeLabel} onPan={handlePan} />
+              </div>
               <div
                 className="board-timeline-axis"
                 style={{ width: window.widthPx }}
@@ -343,22 +348,6 @@ export const BoardTimelineView = ({
                       handleLaneCreate(lane.listId, event)
                     }
                   >
-                    {bands
-                      .filter((band) => band.kind !== 'divider')
-                      .map((band) => (
-                        <div
-                          key={`${lane.listId}-${band.key}`}
-                          className={`board-timeline-band board-timeline-band--${band.kind}`}
-                          style={{ left: band.x, width: band.width }}
-                        />
-                      ))}
-                    {nowX !== null ? (
-                      <div
-                        className="board-timeline-today-line"
-                        style={{ left: nowX }}
-                        aria-hidden
-                      />
-                    ) : null}
                     {dayColumns.map((column) => (
                       <TimelineLaneDayCell
                         key={`${lane.listId}-${column.key}`}
@@ -396,15 +385,6 @@ export const BoardTimelineView = ({
           </div>
         )}
       </div>
-      <footer className="board-timeline-footer">
-        <BoardTimelineNav rangeLabel={rangeLabel} onPan={handlePan} />
-        <BoardTimelineScaleControls
-          scale={scale}
-          onScaleChange={onScaleChange}
-          onWeekAnchorChange={onWeekAnchorChange}
-          onScrollToToday={onScrollToToday}
-        />
-      </footer>
     </section>
   )
 }

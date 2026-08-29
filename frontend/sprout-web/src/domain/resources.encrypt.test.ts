@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { EncryptedDatabase } from '../storage/encrypted-db'
 import { KeyVault } from '../security/key-vault'
 import type { DeviceSecrets } from '../security/wasm'
+import type { EncryptedPayloadDto, ProjectView } from '../api/contracts'
 
 const secrets = (): DeviceSecrets => ({
   keyVersion: 1,
@@ -22,6 +23,7 @@ describe('createEncryptedResource key lifetime', () => {
   })
 
   afterEach(() => {
+    vi.unstubAllGlobals()
     vi.unstubAllEnvs()
     vi.doUnmock('../security/wasm')
   })
@@ -171,5 +173,113 @@ describe('createEncryptedResource key lifetime', () => {
     expect(captured?.resourceId).toBe(documentId)
     expect(captured?.kind).toBe('task-list')
     expect(captured?.resourceKey).toEqual(key)
+  })
+
+  it('mirrors the project metadata key to the project root resource', async () => {
+    const { synchronizeProjectRootKey } = await import('./resources')
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const projectId = crypto.randomUUID()
+    const rootResourceId = crypto.randomUUID()
+    const key = crypto.getRandomValues(new Uint8Array(32))
+    const project: ProjectView = {
+      id: projectId,
+      root_resource_id: rootResourceId,
+      owner_identity_id: crypto.randomUUID(),
+      encrypted_metadata_b64: 'opaque',
+      key_epoch: 1,
+      status: 'active',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }
+    vault.setSessionSecrets(crypto.randomUUID(), secrets(), crypto.randomUUID())
+    await vault.putResourceKey(projectId, key)
+
+    await expect(synchronizeProjectRootKey(vault, project)).resolves.toBe(true)
+    expect(vault.getResourceKey(rootResourceId)).toEqual(key)
+  })
+
+  it('does not invent a project root key when neither alias is available', async () => {
+    const { synchronizeProjectRootKey } = await import('./resources')
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const project: ProjectView = {
+      id: crypto.randomUUID(),
+      root_resource_id: crypto.randomUUID(),
+      owner_identity_id: crypto.randomUUID(),
+      encrypted_metadata_b64: 'opaque',
+      key_epoch: 1,
+      status: 'active',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }
+    vault.setSessionSecrets(crypto.randomUUID(), secrets(), crypto.randomUUID())
+
+    await expect(synchronizeProjectRootKey(vault, project)).resolves.toBe(false)
+    expect(vault.getResourceKey(project.root_resource_id)).toBeUndefined()
+  })
+
+  it('rebinds a legacy backup slot only after ciphertext authentication', async () => {
+    const storage = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    })
+    const key = crypto.getRandomValues(new Uint8Array(32))
+    const wireResourceId = crypto.randomUUID()
+    const document = { schema: 1 as const, name: 'Recuperata' }
+    vi.doMock('../security/wasm', async () => {
+      const actual =
+        await vi.importActual<typeof import('../security/wasm')>(
+          '../security/wasm',
+        )
+      return {
+        ...actual,
+        decryptDocument: async (
+          _ciphertext: EncryptedPayloadDto,
+          options: { resourceId: string; resourceKey: Uint8Array },
+        ) => {
+          if (
+            options.resourceId !== wireResourceId ||
+            options.resourceKey.length !== key.length ||
+            options.resourceKey.some((byte, index) => byte !== key[index])
+          ) {
+            throw new Error('authentication failed')
+          }
+          return document
+        },
+      }
+    })
+
+    const { backupDevResourceKeys, recoverDevResourceKeyFromBackup } =
+      await import('../security/dev-resource-keys')
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const identityId = crypto.randomUUID()
+    vault.setSessionSecrets(crypto.randomUUID(), secrets(), identityId)
+    await vault.putResourceKey(crypto.randomUUID(), key, 1)
+    backupDevResourceKeys(identityId, vault)
+
+    const recovered = await recoverDevResourceKeyFromBackup<typeof document>(
+      vault,
+      {
+        ciphertext: {
+          version: 1,
+          key_id: crypto.randomUUID(),
+          algorithm: 'test',
+          nonce_b64: 'n',
+          ciphertext_b64: 'c',
+        },
+        projectId: crypto.randomUUID(),
+        resourceId: wireResourceId,
+        kind: 'topic',
+        aggregateVersion: 1,
+        keyEpoch: 1,
+        purpose: 'body',
+      },
+    )
+
+    expect(recovered).toEqual(document)
+    expect(vault.getResourceKey(wireResourceId, 1)).toEqual(key)
   })
 })

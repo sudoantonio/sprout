@@ -8,7 +8,11 @@ import {
 import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
-import type { DecryptedInfoDocument, DecryptedTask } from '../domain/models'
+import type {
+  DecryptedInfoDocument,
+  DecryptedTask,
+  InfoDocumentContent,
+} from '../domain/models'
 import { startOfWeek } from '../domain/timeline'
 import type {
   BoardMember,
@@ -174,6 +178,8 @@ const baseProps = {
   ],
   lockedTasks: [],
   boardMembers: members,
+  agents: [],
+  agentsLoading: false,
   boardFocus: { type: 'generali' as const },
   boardViewMode: 'board' as const,
   selectedTopicId: topicId,
@@ -193,6 +199,10 @@ const baseProps = {
   onDeleteTopic: vi.fn().mockResolvedValue(undefined),
   onCreateList: vi.fn().mockResolvedValue(undefined),
   onUpdateTaskList: vi.fn().mockResolvedValue(undefined),
+  onLoadProjectInfo: vi.fn().mockResolvedValue([infoRoot]),
+  onCreateProjectInfoDocument: vi.fn().mockResolvedValue(infoRoot),
+  onLoadTopicInfo: vi.fn().mockResolvedValue([infoRoot]),
+  onCreateTopicInfoDocument: vi.fn().mockResolvedValue(infoRoot),
   onLoadTaskListInfo: vi.fn().mockResolvedValue([infoRoot]),
   onCreateTaskListInfoDocument: vi.fn().mockResolvedValue(infoRoot),
   onUpdateInfoDocument: vi.fn().mockResolvedValue(infoRoot),
@@ -212,6 +222,16 @@ const baseProps = {
   onCompleteTask: vi.fn().mockResolvedValue(undefined),
   onCopyTask: vi.fn().mockResolvedValue(undefined),
   onInviteMember: vi.fn().mockResolvedValue(undefined),
+  onRefreshAgents: vi.fn(),
+  onProvisionAgent: vi.fn().mockResolvedValue({
+    agent_id: crypto.randomUUID(),
+    principal_identity_id: crypto.randomUUID(),
+    runner_id: crypto.randomUUID(),
+    runner_device_id: crypto.randomUUID(),
+    bootstrap_token: 'bootstrap-test-token',
+    bootstrap_expires_at: '2026-08-26T03:00:00.000Z',
+    runner_state: 'pending_key' as const,
+  }),
   taskAttachments: [],
   taskAttachmentLabels: {},
   onRefreshTaskAttachments: vi.fn().mockResolvedValue(undefined),
@@ -231,6 +251,21 @@ const baseProps = {
     appearance: 'system' as const,
     onAppearanceChange: vi.fn(),
   },
+}
+
+const openSlashMenu = (editor: HTMLElement) => {
+  const emptyLine = document.createElement('p')
+  emptyLine.innerHTML = '<br>'
+  editor.append(emptyLine)
+
+  const range = document.createRange()
+  range.selectNodeContents(emptyLine)
+  range.collapse(true)
+  const selection = window.getSelection()
+  selection?.removeAllRanges()
+  selection?.addRange(range)
+
+  fireEvent.keyDown(editor, { key: '/' })
 }
 
 describe('board shell', () => {
@@ -284,8 +319,13 @@ describe('board shell', () => {
     await user.click(
       sidebar().getByRole('button', { name: /Nuova categoria/i }),
     )
-    await user.type(sidebar().getByLabelText('Topic name'), 'Ospiti')
-    await user.click(sidebar().getByRole('button', { name: /^Crea$/i }))
+    const topicInput = sidebar().getByLabelText('Topic name')
+    expect(sidebar().queryByRole('button', { name: /^Crea$/i })).toBeNull()
+    expect(sidebar().queryByRole('button', { name: /Annulla/i })).toBeNull()
+    await user.type(topicInput, 'Ospiti')
+    await user.click(
+      sidebar().getByRole('button', { name: 'Conferma categoria' }),
+    )
     expect(onCreateTopic).toHaveBeenCalledWith('Ospiti')
   })
 
@@ -348,18 +388,19 @@ describe('board shell', () => {
     expect(onCreateProject).toHaveBeenCalled()
   })
 
-  it('invites a member from the board add column', async () => {
+  it('invites a member from the members overview', async () => {
     const user = userEvent.setup()
     const onInviteMember = vi.fn().mockResolvedValue(undefined)
     render(
       <TasksScreen
         {...baseProps}
         boardFocus={{ type: 'members' }}
+        boardViewMode="overview"
         onInviteMember={onInviteMember}
       />,
     )
 
-    await user.click(screen.getByRole('button', { name: /Nuovo utente/i }))
+    await user.click(screen.getByRole('button', { name: /Invita nuovo membro/i }))
     await user.type(screen.getByLabelText('Email membro'), 'lucia@example.com')
     await user.type(screen.getByLabelText('Nome membro'), 'Lucia Bianchi')
     await user.click(screen.getByRole('button', { name: /^Invita$/i }))
@@ -388,12 +429,317 @@ describe('board shell', () => {
     ).toBeTruthy()
   })
 
-  it('shows the board and timeline switch next to the filter', () => {
+  it('shows fixed category views in the toolbar', () => {
     render(<TasksScreen {...baseProps} />)
 
+    expect(
+      sidebar()
+        .getByRole('button', { name: 'Generali' })
+        .getAttribute('aria-current'),
+    ).toBe('page')
     const viewSwitch = within(screen.getByRole('group', { name: 'Vista board' }))
+    expect(
+      screen
+        .getByRole('group', { name: 'Vista board' })
+        .closest('.board-view-navigation'),
+    ).toBeTruthy()
+    expect(viewSwitch.getByRole('button', { name: /Overview/i })).toBeTruthy()
     expect(viewSwitch.getByRole('button', { name: /Board/i })).toBeTruthy()
     expect(viewSwitch.getByRole('button', { name: /Timeline/i })).toBeTruthy()
+    expect(viewSwitch.getByRole('button', { name: /History/i })).toBeTruthy()
+  })
+
+  it('loads the encrypted topic document in category Overview', async () => {
+    const onLoadTopicInfo = vi.fn().mockResolvedValue([infoRoot])
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'topic', topicId }}
+        boardViewMode="overview"
+        onLoadTopicInfo={onLoadTopicInfo}
+      />,
+    )
+
+    expect(document.querySelector('.board-overview-scroll')).toBeTruthy()
+    await waitFor(() => expect(onLoadTopicInfo).toHaveBeenCalledWith(topic))
+    expect(screen.getByRole('textbox', { name: 'Testo info in Markdown' })).toBeTruthy()
+  })
+
+  it('edits and saves the encrypted project document in Generali Overview', async () => {
+    const user = userEvent.setup()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+    }
+    const onLoadProjectInfo = vi.fn().mockResolvedValue([projectRoot])
+    const onUpdateInfoDocument = vi.fn(
+      async (
+        _current: DecryptedInfoDocument,
+        document: InfoDocumentContent,
+      ) => ({
+        ...projectRoot,
+        wire: { ...projectRoot.wire, payload_version: 2 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={onLoadProjectInfo}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    await waitFor(() => expect(onLoadProjectInfo).toHaveBeenCalledWith(project))
+    const editor = screen.getByRole('textbox', {
+      name: 'Testo info in Markdown',
+    })
+    editor.innerHTML = '<h1>Scopo del progetto</h1>'
+    fireEvent.input(editor)
+    fireEvent.blur(editor)
+
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalled())
+    expect(onUpdateInfoDocument.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        blocks: expect.arrayContaining([
+          expect.objectContaining({
+            type: 'text',
+            markdown: '# Scopo del progetto',
+          }),
+        ]),
+      }),
+    )
+
+    const sourceHeading = editor.querySelector('h1')
+    openSlashMenu(editor)
+    await user.click(await screen.findByRole('menuitem', { name: /Titolo medio/ }))
+    const insertedHeading = editor.querySelector('h2')
+    expect(insertedHeading).toBeTruthy()
+    expect(insertedHeading?.textContent).toBe('')
+    expect(editor.querySelector('h1')).toBe(sourceHeading)
+    expect(document.activeElement).toBe(editor)
+    expect(insertedHeading?.contains(window.getSelection()?.anchorNode ?? null)).toBe(true)
+  })
+
+  it('supports interactive Overview tasks and separate attachment commands', async () => {
+    const user = userEvent.setup()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{
+          id: crypto.randomUUID(),
+          type: 'text',
+          markdown: '- [ ] Verifica allegati\n',
+        }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (_current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...projectRoot,
+        document,
+      }),
+    )
+    const onUploadInfoDocumentFile = vi.fn().mockResolvedValue({
+      id: crypto.randomUUID(),
+      type: 'file',
+      blob_id: crypto.randomUUID(),
+      file_name: 'schema.png',
+      content_type: 'image/png',
+      plaintext_size: 4,
+    })
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+        onUploadInfoDocumentFile={onUploadInfoDocumentFile}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    const task = screen.getByRole('checkbox', { name: 'Completa task' })
+    await user.click(task)
+    fireEvent.blur(editor)
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalled())
+    expect(onUpdateInfoDocument.mock.calls.at(-1)?.[1]).toEqual(
+      expect.objectContaining({
+        blocks: expect.arrayContaining([
+          expect.objectContaining({ markdown: '- [x] Verifica allegati\n' }),
+        ]),
+      }),
+    )
+
+    openSlashMenu(editor)
+    expect(await screen.findByRole('menuitem', { name: 'Immagine' })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'File' })).toBeTruthy()
+    await user.click(screen.getByRole('menuitem', { name: 'Immagine' }))
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')
+    expect(fileInput?.accept).toBe('image/*')
+    fireEvent.change(fileInput!, {
+      target: { files: [new File(['test'], 'schema.png', { type: 'image/png' })] },
+    })
+    await waitFor(() => expect(onUploadInfoDocumentFile).toHaveBeenCalled())
+    const resizeHandle = await screen.findByRole('separator', { name: 'Ridimensiona schema.png' })
+    const imageFrame = resizeHandle.parentElement!
+    const imageFigure = imageFrame.parentElement!
+    vi.spyOn(imageFrame, 'getBoundingClientRect').mockReturnValue({
+      width: 400,
+    } as DOMRect)
+    vi.spyOn(imageFigure, 'getBoundingClientRect').mockReturnValue({
+      width: 800,
+    } as DOMRect)
+    fireEvent.keyDown(resizeHandle, { key: 'ArrowRight' })
+    await waitFor(() => {
+      const payloads = onUpdateInfoDocument.mock.calls.map((call) => call[1])
+      expect(payloads.some((payload) => payload.blocks.some(
+        (block) => block.type === 'file' && block.display_width === 424,
+      ))).toBe(true)
+    })
+    expect(imageFrame).toHaveStyle({ width: '424px' })
+
+    const trailingEditor = await screen.findByRole('textbox', { name: 'Testo dopo gli allegati' })
+    trailingEditor.innerHTML = '<p>Nota dopo immagine</p>'
+    fireEvent.input(trailingEditor)
+    fireEvent.blur(trailingEditor)
+    await waitFor(() => {
+      const payloads = onUpdateInfoDocument.mock.calls.map((call) => call[1])
+      expect(payloads.some((payload) => payload.blocks.some(
+        (block) => block.type === 'text' && block.markdown === 'Nota dopo immagine',
+      ))).toBe(true)
+    })
+
+    openSlashMenu(trailingEditor)
+    await user.click(await screen.findByRole('menuitem', { name: 'Documento' }))
+    expect(screen.getByRole('textbox', { name: 'Nome sotto-documento' })).toBeTruthy()
+  })
+
+  it('uses the document path to return from an Overview child document', async () => {
+    const user = userEvent.setup()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: { schema: 1, blocks: [{ id: crypto.randomUUID(), type: 'text', markdown: '' }] },
+    }
+    const child: DecryptedInfoDocument = {
+      ...projectRoot,
+      wire: {
+        ...projectRoot.wire,
+        id: crypto.randomUUID(),
+        parent_document_id: projectRoot.wire.id,
+      },
+      document: {
+        schema: 1,
+        title: 'Specifica',
+        blocks: [{ id: crypto.randomUUID(), type: 'text', markdown: '' }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (document: DecryptedInfoDocument, content: InfoDocumentContent) => ({
+        ...document,
+        document: content,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onCreateProjectInfoDocument={vi.fn().mockResolvedValue(child)}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    openSlashMenu(editor)
+    await user.click(await screen.findByRole('menuitem', { name: 'Documento' }))
+    await user.type(screen.getByRole('textbox', { name: 'Nome sotto-documento' }), 'Specifica')
+    await user.click(screen.getByRole('button', { name: 'Crea' }))
+
+    const path = await screen.findByRole('navigation', { name: 'Percorso documenti' })
+    expect(within(path).getByRole('button', { name: 'Specifica' })).toBeDisabled()
+    await user.click(within(path).getByRole('button', { name: 'Project' }))
+    expect(screen.getByRole('textbox', { name: 'Titolo Overview' })).toHaveValue('Project')
+  })
+
+  it('retries loading Generali after a project document decryption error', async () => {
+    const user = userEvent.setup()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+    }
+    const onLoadProjectInfo = vi
+      .fn()
+      .mockRejectedValueOnce(new DOMException('decrypt failed', 'OperationError'))
+      .mockResolvedValueOnce([projectRoot])
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={onLoadProjectInfo}
+      />,
+    )
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Il documento non può essere decifrato con le chiavi di questo dispositivo.',
+    )
+    await user.click(screen.getByRole('button', { name: 'Riprova' }))
+
+    await waitFor(() => expect(onLoadProjectInfo).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('textbox', { name: 'Testo info in Markdown' })).toBeTruthy()
+  })
+
+  it('shows completed tasks in category History', () => {
+    const completed = makeTask('Task completato', listId, memberId)
+    completed.wire.state = {
+      state: 'completed',
+      completed_by: memberId,
+      completed_at: '2026-07-19T09:00:00.000Z',
+    }
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'topic', topicId }}
+        boardViewMode="history"
+        tasks={[completed]}
+      />,
+    )
+
+    expect(screen.getByRole('region', { name: 'History Impianti' })).toBeTruthy()
+    expect(
+      screen.getByRole('button', { name: /Task completato: Completata/i }),
+    ).toBeTruthy()
   })
 
   it('switches to timeline view and hides kanban columns', async () => {
@@ -427,7 +773,12 @@ describe('board shell', () => {
       />,
     )
 
-    expect(screen.getByRole('region', { name: 'Timeline giornaliera' })).toBeTruthy()
+    const timelineRegion = screen.getByRole('region', {
+      name: 'Timeline giornaliera',
+    })
+    expect(timelineRegion).toBeTruthy()
+    expect(timelineRegion.querySelector('.board-timeline-board-grid')).toBeTruthy()
+    expect(timelineRegion.querySelector('.board-timeline-list-gutter')).toBeTruthy()
     expect(screen.getByText('Scadenza')).toBeTruthy()
     expect(screen.getByText('Elena Russo')).toBeTruthy()
     expect(screen.queryByRole('listitem', { name: 'Nuova task list' })).toBeNull()
@@ -482,13 +833,13 @@ describe('board shell', () => {
     expect(
       screen.getByRole('complementary', { name: 'Board navigation' }),
     ).toHaveAttribute('aria-expanded', 'true')
-    expect(sidebar().getByText('Nuova categoria')).toBeTruthy()
+    expect(sidebar().getByRole('button', { name: 'Nuova categoria' })).toBeTruthy()
 
     await user.click(screen.getByRole('button', { name: /Riduci sidebar/i }))
     expect(
       screen.getByRole('complementary', { name: 'Board navigation' }),
     ).toHaveAttribute('aria-expanded', 'false')
-    expect(sidebar().queryByText('Nuova categoria')).toBeNull()
+    expect(sidebar().queryByRole('button', { name: 'Nuova categoria' })).toBeNull()
     expect(sidebar().getByRole('button', { name: /Generali/i })).toBeTruthy()
     expect(
       screen.getByRole('button', { name: /Espandi sidebar/i }),
@@ -498,7 +849,7 @@ describe('board shell', () => {
     expect(
       screen.getByRole('complementary', { name: 'Board navigation' }),
     ).toHaveAttribute('aria-expanded', 'true')
-    expect(sidebar().getByText('Nuova categoria')).toBeTruthy()
+    expect(sidebar().getByRole('button', { name: 'Nuova categoria' })).toBeTruthy()
   })
 
   it('shows member columns when selecting a member', () => {
@@ -517,12 +868,13 @@ describe('board shell', () => {
       <TasksScreen
         {...baseProps}
         boardFocus={{ type: 'member', identityId: memberId }}
+        boardViewMode="board"
       />,
     )
     expect(screen.getByRole('listitem', { name: 'Elena Russo' })).toBeTruthy()
     expect(screen.queryByRole('listitem', { name: 'Lucia Bianchi' })).toBeNull()
     expect(screen.queryByRole('listitem', { name: 'Mattina' })).toBeNull()
-    expect(screen.getByRole('listitem', { name: 'Nuovo utente' })).toBeTruthy()
+    expect(screen.queryByRole('listitem', { name: 'Nuovo utente' })).toBeNull()
     expect(screen.queryByRole('listitem', { name: 'Nuova task list' })).toBeNull()
     expect(screen.getByText('Color test')).toBeTruthy()
   })
@@ -536,10 +888,16 @@ describe('board shell', () => {
     fireEvent.click(sidebar().getByRole('button', { name: /^Membri$/i }))
     expect(onSelectFocus).toHaveBeenCalledWith({ type: 'members' })
 
-    rerender(<TasksScreen {...baseProps} boardFocus={{ type: 'members' }} />)
+    rerender(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'members' }}
+        boardViewMode="board"
+      />,
+    )
     expect(screen.getByRole('listitem', { name: 'Elena Russo' })).toBeTruthy()
     expect(screen.getByRole('listitem', { name: 'Lucia Bianchi' })).toBeTruthy()
-    expect(screen.getByRole('listitem', { name: 'Nuovo utente' })).toBeTruthy()
+    expect(screen.queryByRole('listitem', { name: 'Nuovo utente' })).toBeNull()
     expect(screen.queryByRole('listitem', { name: 'Mattina' })).toBeNull()
     expect(screen.queryByRole('listitem', { name: 'Nuova task list' })).toBeNull()
     expect(screen.getByText('Color test')).toBeTruthy()
@@ -1067,11 +1425,13 @@ describe('board shell', () => {
     const onFilter = vi.fn()
     render(<TasksScreen {...baseProps} onFilter={onFilter} />)
 
-    expect(
-      screen.getByRole('button', { name: 'Filtra task: Aperti' }),
-    ).toBeTruthy()
+    const filterTrigger = screen.getByRole('button', {
+      name: 'Filtra task: Aperti',
+    })
+    expect(filterTrigger).toBeTruthy()
+    expect(filterTrigger.textContent).toBe('')
 
-    await user.click(screen.getByRole('button', { name: 'Filtra task: Aperti' }))
+    await user.click(filterTrigger)
     await user.click(screen.getByRole('menuitemradio', { name: 'Oggi' }))
 
     expect(onFilter).toHaveBeenCalledWith('today')

@@ -1,5 +1,6 @@
 import type {
   AssignmentDto,
+  AgentDirectoryItemDto,
   AttachmentDto,
   CreateAttachmentResponse,
   CreateInfoDocumentFileRequest,
@@ -9,6 +10,7 @@ import type {
   CreateTaskCompletedAttachmentRequest,
   CreateTaskRequiredAttachmentRequest,
   ListAttachmentsResponse,
+  ListAgentsResponse,
   ListInfoDocumentsResponse,
   DeviceKeyPackageView,
   DeviceSessionRequest,
@@ -32,6 +34,7 @@ import type {
   ProjectRecoveryStatus,
   ProjectDeviceKeyPackage,
   ProvisionProjectRecoveryRequest,
+  ProvisionAgentResponse,
   ProjectInvitationDto,
   ProjectView,
   ParticipantSuggestionDto,
@@ -459,6 +462,22 @@ export class ApiClient {
     )
   }
 
+  listAgents(projectId: Uuid): Promise<AgentDirectoryItemDto[]> {
+    return this.request<ListAgentsResponse>(
+      `/v1/projects/${encodeURIComponent(projectId)}/agents`,
+    ).then((response) => response.agents)
+  }
+
+  provisionAgent(
+    projectId: Uuid,
+    input: unknown,
+  ): Promise<ProvisionAgentResponse> {
+    return this.request(
+      `/v1/projects/${encodeURIComponent(projectId)}/agents`,
+      { method: 'POST', body: input },
+    )
+  }
+
   listTopics(projectId: Uuid): Promise<ListTopicsResponse> {
     return this.request(`/v1/projects/${projectId}/topics`)
   }
@@ -527,6 +546,12 @@ export class ApiClient {
     )
   }
 
+  listProjectInfoDocuments(
+    projectId: Uuid,
+  ): Promise<ListInfoDocumentsResponse> {
+    return this.request(`/v1/projects/${projectId}/info-documents`)
+  }
+
   listTopicInfoDocuments(
     projectId: Uuid,
     topicId: Uuid,
@@ -545,6 +570,16 @@ export class ApiClient {
       `/v1/projects/${projectId}/task-lists/${listId}/info-documents`,
       { method: 'POST', body },
     )
+  }
+
+  createProjectInfoDocument(
+    projectId: Uuid,
+    body: CreateInfoDocumentRequest,
+  ): Promise<InfoDocumentResponse> {
+    return this.request(`/v1/projects/${projectId}/info-documents`, {
+      method: 'POST',
+      body,
+    })
   }
 
   createTopicInfoDocument(

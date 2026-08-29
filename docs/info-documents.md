@@ -1,8 +1,9 @@
-# Info: documenti informativi di topic e task list
+# Info: documenti informativi di progetto, topic e task list
 
 ## Scopo
 
-`Info` è lo spazio documentale E2EE associato a un topic o a una task list.
+`Info` è lo spazio documentale E2EE associato al progetto, a un topic o a una
+task list.
 Serve a conservare informazioni durevoli che descrivono il contenitore, senza
 confonderle con le task operative o con lo storico delle task.
 
@@ -12,8 +13,9 @@ Nella UI corrente il dettaglio di una task list contiene due viste:
 - **Info**: il documento collaborativo con testo Markdown, link, file,
   immagini e sotto-documenti.
 
-Il backend supporta documenti Info sia per task list sia per topic. Il frontend
-attualmente espone la vista Info soltanto nel dettaglio delle task list.
+Il backend supporta documenti Info per il progetto radice, per i topic e per
+le task list. Il frontend espone il documento del progetto e del topic nella
+vista `Overview`, oltre alla vista `Info` nel dettaglio delle task list.
 
 Questo documento descrive il comportamento realmente implementato. Per il
 modello generale di autorizzazione vedere
@@ -41,11 +43,11 @@ risalire lungo la gerarchia fino alla root `Info`.
 
 ## Modello concettuale
 
-Ogni topic o task list può avere un solo documento root attivo e un numero
-arbitrario di documenti annidati:
+Ogni progetto, topic o task list può avere un solo documento root attivo e un
+numero arbitrario di documenti annidati:
 
 ```text
-topic oppure task list
+progetto, topic oppure task list
 └── Info root
     ├── testo Markdown
     ├── file o immagini
@@ -245,7 +247,7 @@ La tabella `info_documents` contiene:
 | Campo | Scopo |
 | --- | --- |
 | `id`, `project_id` | identità e isolamento progetto |
-| `topic_id` / `task_list_id` | esattamente un contenitore |
+| `topic_id` / `task_list_id` | entrambi `NULL` per il progetto, altrimenti identifica il contenitore |
 | `parent_document_id` | gerarchia ricorsiva; `NULL` identifica la root |
 | `resource_node_id` | risorsa che governa permessi e chiavi |
 | `encrypted_payload` | contenuto opaco serializzato |
@@ -257,7 +259,9 @@ La tabella `info_documents` contiene:
 
 Vincoli principali:
 
-- esattamente uno tra `topic_id` e `task_list_id` deve essere valorizzato;
+- al massimo uno tra `topic_id` e `task_list_id` può essere valorizzato;
+- entrambi `NULL` identificano il contenitore progetto e richiedono il suo
+  resource node radice;
 - può esistere una sola root attiva per contenitore;
 - un documento non può essere parent di sé stesso;
 - il payload cifrato non può essere vuoto;
@@ -272,6 +276,13 @@ non assegna a tale ordine un significato documentale. Parent/child e ordine di
 presentazione restano nel payload cifrato.
 
 ## API
+
+### Documento generale del progetto
+
+```text
+GET  /v1/projects/{project_id}/info-documents
+POST /v1/projects/{project_id}/info-documents
+```
 
 ### Documenti di topic
 
@@ -422,6 +433,9 @@ La feature dispone attualmente di verifiche per:
 - contesto di cifratura del documento Info;
 - apertura della tab Info, caricamento, rendering link e salvataggio testo nel
   test component React;
+- sincronizzazione deterministica tra alias della chiave progetto e del
+  resource node radice, senza generare una chiave sostitutiva incompatibile;
+- retry della Overview `Generali` dopo un errore di decifratura;
 - presenza di schema, indici, FK, trigger e RLS nelle verifiche SQL;
 - unicità della root e impossibilità di spostare un documento fuori dal
   contenitore nei test PostgreSQL;
@@ -435,20 +449,18 @@ concorrenza tra due utenti.
 
 ## Limiti e casi parziali attuali
 
-1. **UI solo task list.** Le route topic sono implementate, ma non esiste ancora
-   la relativa vista frontend.
-2. **Un solo blocco testo modificabile.** Il renderer copre CommonMark/GFM, ma
+1. **Un solo blocco testo modificabile.** Il renderer copre CommonMark/GFM, ma
    l'editor modifica soltanto il primo blocco testo del documento.
-3. **Ordine visuale raggruppato.** File e documenti sono mostrati in sezioni
+2. **Ordine visuale raggruppato.** File e documenti sono mostrati in sezioni
    separate, non intercalati nel testo secondo l'ordine completo dei blocchi.
-4. **Operazioni composte non atomiche.** Upload file e creazione figlio
+3. **Operazioni composte non atomiche.** Upload file e creazione figlio
    precedono l'update del payload parent. Se l'ultimo update fallisce, può
    restare un blob o un figlio valido ma non referenziato nella UI finché una
    procedura di cleanup non lo gestisce.
-5. **Nessuna gestione blocchi.** La UI non consente ancora rename, delete,
+4. **Nessuna gestione blocchi.** La UI non consente ancora rename, delete,
    unlink, reorder o drag-and-drop.
-6. **Conflitti manuali.** Un `409` non viene automaticamente risolto o unito.
-7. **Nessun E2E reale dedicato.** La copertura è distribuita tra test unitari,
+5. **Conflitti manuali.** Un `409` non viene automaticamente risolto o unito.
+6. **Nessun E2E automatizzato dedicato.** La copertura è distribuita tra test unitari,
    component, route-auth e SQL.
 
 Questi limiti non autorizzano a spostare plaintext o struttura semantica sul
@@ -459,7 +471,7 @@ server. Le evoluzioni devono preservare il confine E2EE.
 Qualunque modifica a Info deve mantenere:
 
 1. un solo contenitore per documento;
-2. una sola root attiva per topic/task list;
+2. una sola root attiva per progetto/topic/task list;
 3. parent e figli nello stesso progetto, contenitore e resource node;
 4. contenuto, URL, ordine, titoli, filename e MIME semantici cifrati;
 5. AAD legata a progetto, document/blob ID, kind, versione ed epoca;

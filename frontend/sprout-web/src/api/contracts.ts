@@ -61,6 +61,37 @@ export interface ParticipantSuggestionDto {
   most_recent_shared_project_at: IsoDateTime
 }
 
+export interface AgentDirectoryItemDto {
+  id: Uuid
+  principal_identity_id: Uuid
+  identity_handle: string
+  controller_identity_id: Uuid
+  availability: 'controller_private' | 'project_delegable'
+  state: 'active' | 'suspended' | 'retired'
+  created_at: IsoDateTime
+  runner_id: Uuid
+  runner_device_id: Uuid
+  runner_state: 'pending_key' | 'active' | 'revoked'
+  runner_last_seen_at: IsoDateTime | null
+  local_goal_id: Uuid | null
+  local_goal_revision: number | null
+  local_goal_state: 'active' | 'completed' | 'failed' | 'superseded' | null
+}
+
+export interface ListAgentsResponse {
+  agents: AgentDirectoryItemDto[]
+}
+
+export interface ProvisionAgentResponse {
+  agent_id: Uuid
+  principal_identity_id: Uuid
+  runner_id: Uuid
+  runner_device_id: Uuid
+  bootstrap_token: string
+  bootstrap_expires_at: IsoDateTime
+  runner_state: 'pending_key'
+}
+
 export interface ProjectDeviceKeyPackage {
   identity_id: Uuid
   device_id: Uuid

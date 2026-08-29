@@ -204,6 +204,8 @@ export interface InfoFileBlock {
   file_name: string
   content_type: string
   plaintext_size: number
+  /** Persisted presentation width for image blocks, in CSS pixels. */
+  display_width?: number
 }
 
 export interface InfoChildDocumentBlock {

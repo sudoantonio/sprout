@@ -8,6 +8,7 @@ import type {
   Uuid,
 } from '../api/contracts'
 import type { KeyVault } from '../security/key-vault'
+import { recoverDevResourceKeyFromBackup } from '../security/dev-resource-keys'
 import {
   base64ToBytes,
   bytesToBase64,
@@ -68,6 +69,50 @@ export const resolveActiveResourceKey = (
     if (genesis) return { epoch: 1, key: genesis }
   }
   return undefined
+}
+
+/**
+ * Project metadata and the project's root resource are created from the same
+ * body key. Keep both vault aliases available so project Info documents never
+ * fall back to a newly minted, incompatible root key after a reload.
+ */
+export const synchronizeProjectRootKey = async (
+  vault: KeyVault,
+  project: ProjectView,
+): Promise<boolean> => {
+  const rootKey = vault.getResourceKey(
+    project.root_resource_id,
+    project.key_epoch,
+  )
+  if (rootKey) {
+    try {
+      if (!vault.getResourceKey(project.id, project.key_epoch)) {
+        await vault.putResourceKey(
+          project.id,
+          rootKey,
+          project.key_epoch,
+          'body',
+        )
+      }
+      return true
+    } finally {
+      zeroBytes(rootKey)
+    }
+  }
+
+  const projectKey = vault.getResourceKey(project.id, project.key_epoch)
+  if (!projectKey) return false
+  try {
+    await vault.putResourceKey(
+      project.root_resource_id,
+      projectKey,
+      project.key_epoch,
+      'body',
+    )
+    return true
+  } finally {
+    zeroBytes(projectKey)
+  }
 }
 
 const requireKey = (
@@ -131,41 +176,84 @@ const decryptBodyOrHeader = async <T>(
     keyEpoch: number
   },
 ): Promise<T> => {
-  const ciphertext = input.payload ?? input.header
-  if (!ciphertext) {
+  if (!input.payload && !input.header) {
     throw new Error('No encrypted resource content was returned')
   }
-  const resolved = input.payload
-    ? resolveActiveResourceKey(vault, input.resourceId, input.keyEpoch)
-    : (() => {
-        const exact = vault.getHeaderKey(input.resourceId, input.keyEpoch)
-        if (exact) return { epoch: input.keyEpoch, key: exact }
-        const latest = vault.getLatestHeaderKey(input.resourceId)
-        if (latest) return latest
-        if (input.keyEpoch !== 1) {
-          const genesis = vault.getHeaderKey(input.resourceId, 1)
-          if (genesis) return { epoch: 1, key: genesis }
-        }
-        return undefined
-      })()
-  const options = {
-    projectId: input.projectId,
-    resourceId: input.resourceId,
-    kind: input.kind,
-    aggregateVersion: input.aggregateVersion,
-    keyEpoch: resolved?.epoch ?? input.keyEpoch,
-  }
-  if (resolved) {
+
+  const attempt = async (
+    ciphertext: EncryptedPayloadDto,
+    purpose: 'body' | 'header',
+  ): Promise<T> => {
+    const resolved =
+      purpose === 'body'
+        ? resolveActiveResourceKey(vault, input.resourceId, input.keyEpoch)
+        : (() => {
+            const exact = vault.getHeaderKey(input.resourceId, input.keyEpoch)
+            if (exact) return { epoch: input.keyEpoch, key: exact }
+            const latest = vault.getLatestHeaderKey(input.resourceId)
+            if (latest) return latest
+            if (input.keyEpoch !== 1) {
+              const genesis = vault.getHeaderKey(input.resourceId, 1)
+              if (genesis) return { epoch: 1, key: genesis }
+            }
+            return undefined
+          })()
+    const options = {
+      projectId: input.projectId,
+      resourceId: input.resourceId,
+      kind: input.kind,
+      aggregateVersion: input.aggregateVersion,
+      keyEpoch: resolved?.epoch ?? input.keyEpoch,
+    }
+    let primaryError: unknown
+    if (resolved) {
+      try {
+        return await decryptDocument<T>(ciphertext, {
+          ...options,
+          resourceKey: resolved.key,
+        })
+      } catch (error) {
+        primaryError = error
+      }
+    }
+    const recovered = await recoverDevResourceKeyFromBackup<T>(vault, {
+      ciphertext,
+      projectId: input.projectId,
+      resourceId: input.resourceId,
+      kind: input.kind,
+      aggregateVersion: input.aggregateVersion,
+      keyEpoch: input.keyEpoch,
+      purpose,
+    })
+    if (recovered !== undefined) return recovered
     try {
-      return await decryptDocument<T>(ciphertext, {
+      return await decryptWithDevZeroKeyFallback<T>(ciphertext, {
         ...options,
-        resourceKey: resolved.key,
-      })
+        keyEpoch: input.keyEpoch,
+      }, primaryError)
     } catch (error) {
-      return decryptWithDevZeroKeyFallback<T>(ciphertext, options, error)
+      if (primaryError instanceof Error) throw primaryError
+      throw error
     }
   }
-  return decryptWithDevZeroKeyFallback<T>(ciphertext, options)
+
+  let bodyError: unknown
+  if (input.payload) {
+    try {
+      return await attempt(input.payload, 'body')
+    } catch (error) {
+      bodyError = error
+    }
+  }
+  if (input.header) {
+    try {
+      return await attempt(input.header, 'header')
+    } catch (error) {
+      if (!bodyError) bodyError = error
+    }
+  }
+  if (bodyError instanceof Error) throw bodyError
+  throw new Error('This resource key is not available on this device')
 }
 
 export const decryptProject = async (
@@ -181,6 +269,7 @@ export const decryptProject = async (
     keyEpoch: project.key_epoch,
   }
   const key = vault.getResourceKey(project.id, project.key_epoch)
+  let primaryError: unknown
   if (key) {
     try {
       return await decryptDocument<ProjectDocument>(ciphertext, {
@@ -188,14 +277,27 @@ export const decryptProject = async (
         resourceKey: key,
       })
     } catch (error) {
-      return decryptWithDevZeroKeyFallback<ProjectDocument>(
-        ciphertext,
-        options,
-        error,
-      )
+      primaryError = error
     }
   }
-  return decryptWithDevZeroKeyFallback<ProjectDocument>(ciphertext, options)
+  const recovered = await recoverDevResourceKeyFromBackup<ProjectDocument>(
+    vault,
+    {
+      ciphertext,
+      projectId: project.id,
+      resourceId: project.id,
+      kind: 'project',
+      aggregateVersion: 0,
+      keyEpoch: project.key_epoch,
+      purpose: 'body',
+    },
+  )
+  if (recovered !== undefined) return recovered
+  return decryptWithDevZeroKeyFallback<ProjectDocument>(
+    ciphertext,
+    options,
+    primaryError,
+  )
 }
 
 export const decryptTopic = (
@@ -256,7 +358,11 @@ export const decryptInfoDocument = async (
     document: await decryptDocument<InfoDocumentContent>(document.payload, {
       projectId: document.project_id,
       resourceId: document.id,
-      kind: document.task_list_id ? 'task-list' : 'topic',
+      kind: document.task_list_id
+        ? 'task-list'
+        : document.topic_id
+          ? 'topic'
+          : 'project',
       aggregateVersion: document.payload_version,
       keyEpoch: document.key_epoch,
       resourceKey,
@@ -272,7 +378,7 @@ export const encryptInfoDocument = (
     containerResourceId: Uuid
     aggregateVersion: number
     keyEpoch: number
-    kind: 'task-list' | 'topic'
+    kind: 'project' | 'task-list' | 'topic'
     document: InfoDocumentContent
   },
 ): Promise<EncryptedPayloadDto> =>
