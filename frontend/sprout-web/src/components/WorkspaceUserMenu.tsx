@@ -261,7 +261,9 @@ const WorkspaceUserPanel = ({
                         <SunIcon className="workspace-user-nav-icon" />
                         <span>Appearance</span>
                       </span>
-                      <span className="workspace-user-appearance-value">
+                      <span
+                        className={`workspace-user-appearance-value workspace-user-appearance-value--${appearance}`}
+                      >
                         {appearanceLabelFor(appearance)}
                       </span>
                       <ChevronDownIcon

@@ -26,7 +26,10 @@ interface AgentManagementPanelProps {
   selectedAgentId?: Uuid
   tasks?: DecryptedTask[]
   onSelectAgent(agentId: Uuid): void
-  onWorkspaceChange?(workspace: { name: string; avatar: string } | undefined): void
+  onWorkspaceChange?(
+    workspace: { agentId?: Uuid; name: string; avatar: string } | undefined,
+  ): void
+  restoreDemoWorkspace?: boolean
   directoryResetKey?: number
   onSelectTask?(taskId: Uuid): void
   onProvision(envelope: unknown): Promise<ProvisionAgentResponse>
@@ -174,6 +177,7 @@ export const AgentManagementPanel = ({
   tasks = [],
   onSelectAgent,
   onWorkspaceChange,
+  restoreDemoWorkspace = false,
   directoryResetKey,
   onSelectTask,
   onProvision,
@@ -213,6 +217,7 @@ export const AgentManagementPanel = ({
     onWorkspaceChange?.(
       workspaceAgentName
         ? {
+            ...(selectedAgent ? { agentId: selectedAgent.id } : {}),
             name: displayedAgentName ?? workspaceAgentName,
             avatar: displayedAgentAvatar ?? workspaceAgentInitial ?? '',
           }
@@ -230,6 +235,11 @@ export const AgentManagementPanel = ({
     if (directoryResetKey === undefined) return
     setDemoWorkspaceOpen(false)
   }, [directoryResetKey])
+
+  useEffect(() => {
+    if (!restoreDemoWorkspace || selectedAgentId) return
+    setDemoWorkspaceOpen(true)
+  }, [restoreDemoWorkspace, selectedAgentId])
 
   useEffect(() => {
     const saved = agentPreferenceKey

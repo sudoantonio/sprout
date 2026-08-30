@@ -212,6 +212,49 @@ export interface TasksScreenProps {
 
 const SIDEBAR_MEMBER_VISIBLE_MAX = 3
 
+type AgentDetailSessionState =
+  | { type: 'agent'; agentId: Uuid }
+  | { type: 'demo' }
+
+const agentDetailSessionKey = (projectId: Uuid): string =>
+  `sprout.board.agent-detail.${projectId}`
+
+const readAgentDetailSession = (
+  projectId: Uuid | undefined,
+): AgentDetailSessionState | undefined => {
+  if (!projectId) return undefined
+  try {
+    const value = window.sessionStorage.getItem(agentDetailSessionKey(projectId))
+    if (value === 'demo') return { type: 'demo' }
+    if (value?.startsWith('agent:') && value.length > 6) {
+      return { type: 'agent', agentId: value.slice(6) as Uuid }
+    }
+  } catch {
+    // Navigation still works in memory when session storage is unavailable.
+  }
+  return undefined
+}
+
+const writeAgentDetailSession = (
+  projectId: Uuid | undefined,
+  detail: AgentDetailSessionState | undefined,
+) => {
+  if (!projectId) return
+  try {
+    const key = agentDetailSessionKey(projectId)
+    if (!detail) {
+      window.sessionStorage.removeItem(key)
+      return
+    }
+    window.sessionStorage.setItem(
+      key,
+      detail.type === 'demo' ? 'demo' : `agent:${detail.agentId}`,
+    )
+  } catch {
+    // Keep the in-memory state as the fallback.
+  }
+}
+
 const initialFor = (label: string): string => {
   const trimmed = label.trim()
   if (!trimmed) return '?'
@@ -1787,10 +1830,12 @@ const BoardAiBadge = ({ onClose }: { onClose(): void }) => {
 const BoardPathBadge = ({
   topics,
   onSelectFocus,
+  onSelectAgents,
   onClose,
 }: {
   topics: TopicItem[]
   onSelectFocus(focus: BoardFocus): void
+  onSelectAgents?(): void
   onClose(): void
 }) => {
   useEffect(() => {
@@ -1819,7 +1864,17 @@ const BoardPathBadge = ({
           <SidebarUserIcon aria-hidden />
           Membri
         </button>
-        <button type="button" onClick={() => select({ type: 'agents' })}>
+        <button
+          type="button"
+          onClick={() => {
+            if (onSelectAgents) {
+              onSelectAgents()
+              onClose()
+              return
+            }
+            select({ type: 'agents' })
+          }}
+        >
           <SidebarAgentIcon aria-hidden />
           Agenti
         </button>
@@ -4160,8 +4215,28 @@ export const TasksScreen = ({
     }) as AdvancedTaskFilters)
   }
   const [agentWorkspace, setAgentWorkspace] = useState<
-    { name: string; avatar: string } | undefined
+    { agentId?: Uuid; name: string; avatar: string } | undefined
   >()
+  const [lastAgentDetail, setLastAgentDetail] = useState<
+    AgentDetailSessionState | undefined
+  >(() => readAgentDetailSession(project?.wire.id))
+  const rememberedAgentId =
+    lastAgentDetail?.type === 'agent' &&
+    agents.some((agent) => agent.id === lastAgentDetail.agentId)
+      ? lastAgentDetail.agentId
+      : undefined
+
+  useEffect(() => {
+    setAgentWorkspace(undefined)
+    setLastAgentDetail(readAgentDetailSession(project?.wire.id))
+  }, [project?.wire.id])
+
+  // The sidebar and path picker select the generic Agents focus. When the user
+  // left from an agent detail, immediately restore that detail instead.
+  useEffect(() => {
+    if (boardFocus.type !== 'agents' || !rememberedAgentId) return
+    onSelectFocus({ type: 'agent', agentId: rememberedAgentId })
+  }, [boardFocus, onSelectFocus, rememberedAgentId])
   const [agentDirectoryResetKey, setAgentDirectoryResetKey] = useState(0)
   const [listHistoryId, setListHistoryId] = useState<Uuid | undefined>()
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false)
@@ -4852,8 +4927,41 @@ export const TasksScreen = ({
 
   const handleIslandAgents = () => {
     closeListHistory()
-    onSelectFocus({ type: 'agents' })
+    onSelectFocus(
+      rememberedAgentId
+        ? { type: 'agent', agentId: rememberedAgentId }
+        : { type: 'agents' },
+    )
   }
+
+  const rememberAgentDetail = useCallback(
+    (detail: AgentDetailSessionState) => {
+      setLastAgentDetail(detail)
+      writeAgentDetailSession(project?.wire.id, detail)
+    },
+    [project?.wire.id],
+  )
+
+  const clearAgentDetail = useCallback(() => {
+    setAgentWorkspace(undefined)
+    setLastAgentDetail(undefined)
+    writeAgentDetailSession(project?.wire.id, undefined)
+  }, [project?.wire.id])
+
+  const handleAgentWorkspaceChange = useCallback(
+    (
+      workspace: { agentId?: Uuid; name: string; avatar: string } | undefined,
+    ) => {
+      setAgentWorkspace(workspace)
+      if (!workspace) return
+      rememberAgentDetail(
+        workspace.agentId
+          ? { type: 'agent', agentId: workspace.agentId }
+          : { type: 'demo' },
+      )
+    },
+    [rememberAgentDetail],
+  )
 
   const createTopic = async (event: FormEvent) => {
     event.preventDefault()
@@ -5128,7 +5236,7 @@ export const TasksScreen = ({
               <AgentViewNavigation
                 workspace={agentWorkspace}
                 onBack={() => {
-                  setAgentWorkspace(undefined)
+                  clearAgentDetail()
                   setAgentDirectoryResetKey((value) => value + 1)
                   onSelectFocus({ type: 'agents' })
                 }}
@@ -5277,7 +5385,7 @@ export const TasksScreen = ({
                         ? 'board-nav-item board-nav-item--view active'
                         : 'board-nav-item board-nav-item--view'
                     }
-                    onClick={() => onSelectFocus({ type: 'agents' })}
+                    onClick={handleIslandAgents}
                     aria-current={isAgentBoard ? 'page' : undefined}
                   >
                     <SidebarAgentIcon
@@ -5491,7 +5599,9 @@ export const TasksScreen = ({
           />
         )}
 
-        {!sidebarCollapsed && <WorkspaceUserMenu {...userMenu} variant="sidebar" />}
+        {(!sidebarCollapsed || sidebarPreviewOpen) && (
+          <WorkspaceUserMenu {...userMenu} variant="sidebar" />
+        )}
       </aside>
 
       <section className="board-main" aria-label="Board">
@@ -5506,10 +5616,12 @@ export const TasksScreen = ({
                 boardFocus.type === 'agent' ? boardFocus.agentId : undefined
               }
               tasks={tasks}
-              onSelectAgent={(agentId) =>
+              onSelectAgent={(agentId) => {
+                rememberAgentDetail({ type: 'agent', agentId })
                 onSelectFocus({ type: 'agent', agentId })
-              }
-              onWorkspaceChange={setAgentWorkspace}
+              }}
+              onWorkspaceChange={handleAgentWorkspaceChange}
+              restoreDemoWorkspace={lastAgentDetail?.type === 'demo'}
               directoryResetKey={agentDirectoryResetKey}
               onSelectTask={onSelectTask}
               onProvision={onProvisionAgent}
@@ -6139,6 +6251,7 @@ export const TasksScreen = ({
         <BoardPathBadge
           topics={sortedTopics}
           onSelectFocus={onSelectFocus}
+          onSelectAgents={handleIslandAgents}
           onClose={() => setMobilePathPanelOpen(false)}
         />
       )}

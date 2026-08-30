@@ -20,6 +20,7 @@ import {
   ListIcon,
   PaperclipIcon,
   PencilIcon,
+  XIcon,
 } from './icons'
 import { InfoMarkdown } from './InfoMarkdown'
 
@@ -159,12 +160,14 @@ const InfoImageBlock = ({
   onRead,
   onDownload,
   onResize,
+  onRemove,
 }: {
   document: DecryptedInfoDocument
   file: InfoFileBlock
   onRead(document: DecryptedInfoDocument, file: InfoFileBlock): Promise<Blob>
   onDownload(document: DecryptedInfoDocument, file: InfoFileBlock): Promise<void>
   onResize(file: InfoFileBlock, width: number): Promise<void>
+  onRemove(file: InfoFileBlock): void
 }) => {
   const [source, setSource] = useState<string>()
   const [imageWidth, setImageWidth] = useState<number | undefined>(
@@ -207,6 +210,15 @@ const InfoImageBlock = ({
         ) : (
           <span className="tasklist-info-image-placeholder">Immagine cifrata</span>
         )}
+        <button
+          type="button"
+          className="tasklist-info-block-remove tasklist-info-image-remove"
+          aria-label={`Elimina ${file.file_name}`}
+          title="Elimina immagine"
+          onClick={() => onRemove(file)}
+        >
+          <XIcon aria-hidden />
+        </button>
         <span
           className="tasklist-info-image-resize-handle"
           role="separator"
@@ -727,6 +739,35 @@ export function InfoDocumentPanel<T extends InfoDocumentContainer>({
     }
   }
 
+  const removeFile = async (file: InfoFileBlock) => {
+    if (!current || busy) return
+    const base = withTrailingMarkdown(
+      withMarkdown(current.document, markdown),
+      trailingMarkdown,
+    )
+    const content: InfoDocumentContent = {
+      ...base,
+      ...(presentation === 'overview' ? { title } : {}),
+      blocks: base.blocks.filter(
+        (block) => block.type !== 'file' || block.id !== file.id,
+      ),
+    }
+    const previous = current
+    setBusy(true)
+    setError(undefined)
+    replaceDocument({ ...current, document: content })
+    try {
+      const next = await onUpdateDocument(current, content)
+      replaceDocument(next)
+      setTrailingMarkdown(trailingMarkdownFor(next))
+    } catch (reason) {
+      replaceDocument(previous)
+      setError(infoErrorMessage(reason, 'Eliminazione file non riuscita'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const addDocument = async () => {
     if (!current || !newDocumentTitle.trim()) return
     setBusy(true)
@@ -1016,6 +1057,7 @@ export function InfoDocumentPanel<T extends InfoDocumentContainer>({
                 onRead={onReadFile}
                 onDownload={onDownloadFile}
                 onResize={resizeImage}
+                onRemove={(file) => void removeFile(file)}
               />
             ) : (
               <div
@@ -1029,6 +1071,15 @@ export function InfoDocumentPanel<T extends InfoDocumentContainer>({
                   onClick={() => void onDownloadFile(current, file)}
                 >
                   {file.file_name}
+                </button>
+                <button
+                  type="button"
+                  className="tasklist-info-block-remove tasklist-info-file-remove"
+                  aria-label={`Elimina ${file.file_name}`}
+                  title="Elimina file"
+                  onClick={() => void removeFile(file)}
+                >
+                  <XIcon aria-hidden />
                 </button>
               </div>
             )
