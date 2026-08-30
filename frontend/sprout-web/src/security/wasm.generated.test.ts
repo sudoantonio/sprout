@@ -17,6 +17,7 @@ import {
   wrapResourceKeyForRecipient,
 } from './wasm'
 import type { GeneratedSproutCryptoModule } from './wasm'
+import type { ResourceKind } from '../domain/models'
 
 const encoder = new TextEncoder()
 const bytes = (start: number): Uint8Array =>
@@ -27,6 +28,13 @@ const fromHex = (value: string): Uint8Array =>
   Uint8Array.from(
     value.match(/../g)?.map((byte) => Number.parseInt(byte, 16)) ?? [],
   )
+const uuidBytes = (value: string): Uint8Array =>
+  fromHex(value.replaceAll('-', ''))
+const arrayBuffer = (value: Uint8Array): ArrayBuffer =>
+  value.buffer.slice(
+    value.byteOffset,
+    value.byteOffset + value.byteLength,
+  ) as ArrayBuffer
 
 interface CryptoVectorCorpus {
   corpus_version: number
@@ -107,6 +115,130 @@ const loadGeneratedModule =
   }
 
 describe('generated Rust/WASM crypto boundary', () => {
+  it('encrypts every application resource as a resource payload', async () => {
+    const module = await loadGeneratedModule()
+    configureCryptoModuleForTests(module)
+    const resourceKey = new Uint8Array(32).fill(0x41)
+    const kinds: ResourceKind[] = [
+      'project',
+      'topic',
+      'task-list',
+      'task',
+      'preset',
+      'recurrence',
+      'questionnaire',
+      'attachment',
+    ]
+    try {
+      for (const kind of kinds) {
+        const encrypted = await encryptDocument(
+          { schema: 1, kind },
+          {
+            projectId: '00010203-0405-4607-8809-0a0b0c0d0e0f',
+            resourceId: '70717273-7475-4677-8879-7a7b7c7d7e7f',
+            keyId: crypto.randomUUID(),
+            kind,
+            aggregateVersion: 0,
+            keyEpoch: 1,
+            resourceKey,
+          },
+        )
+        await expect(
+          decryptDocument(encrypted, {
+            projectId: '00010203-0405-4607-8809-0a0b0c0d0e0f',
+            resourceId: '70717273-7475-4677-8879-7a7b7c7d7e7f',
+            kind,
+            aggregateVersion: 0,
+            keyEpoch: 1,
+            resourceKey,
+          }),
+        ).resolves.toEqual({ schema: 1, kind })
+      }
+    } finally {
+      configureCryptoModuleForTests()
+    }
+  })
+
+  it('decrypts legacy payloads whose content-kind byte encoded the resource kind', async () => {
+    const module = await loadGeneratedModule()
+    const projectId = '00010203-0405-4607-8809-0a0b0c0d0e0f'
+    const resourceId = '70717273-7475-4677-8879-7a7b7c7d7e7f'
+    const keyId = '10111213-1415-4617-9819-1a1b1c1d1e1f'
+    const resourceKey = new Uint8Array(32).fill(0x42)
+    const aad = encoder.encode(
+      `sprout/v1/${projectId}/${resourceId}/task/0/1`,
+    )
+    const header = module.canonicalHeader(
+      1,
+      1,
+      4,
+      uuidBytes(resourceId),
+      uuidBytes(keyId),
+      0n,
+      new Uint8Array(32),
+      aad,
+    )
+    const result = module.encrypt(
+      header,
+      encoder.encode(JSON.stringify({ schema: 1, legacy: true })),
+    )
+    const wrapNonce = new Uint8Array(12).fill(0x43)
+    const wrappingKey = await crypto.subtle.importKey(
+      'raw',
+      arrayBuffer(resourceKey),
+      { name: 'AES-GCM' },
+      false,
+      ['encrypt'],
+    )
+    const wrappedDek = new Uint8Array(
+      await crypto.subtle.encrypt(
+        {
+          name: 'AES-GCM',
+          iv: arrayBuffer(wrapNonce),
+          additionalData: arrayBuffer(header),
+          tagLength: 128,
+        },
+        wrappingKey,
+        arrayBuffer(result.dek),
+      ),
+    )
+    const base64 = (value: Uint8Array): string =>
+      Buffer.from(value).toString('base64')
+    const encrypted = {
+      version: 1 as const,
+      algorithm: 'sprout-protocol-v1',
+      key_id: keyId,
+      nonce_b64: base64(new Uint8Array(12)),
+      ciphertext_b64: base64(
+        encoder.encode(
+          JSON.stringify({
+            wrapping_mode: 'resource_key_aes_gcm_v1',
+            payload_b64: base64(result.payload),
+            wrapped_dek_b64: base64(wrappedDek),
+            wrap_nonce_b64: base64(wrapNonce),
+          }),
+        ),
+      ),
+    }
+    result.destroy()
+
+    configureCryptoModuleForTests(module)
+    try {
+      await expect(
+        decryptDocument(encrypted, {
+          projectId,
+          resourceId,
+          kind: 'task',
+          aggregateVersion: 0,
+          keyEpoch: 1,
+          resourceKey,
+        }),
+      ).resolves.toEqual({ schema: 1, legacy: true })
+    } finally {
+      configureCryptoModuleForTests()
+    }
+  })
+
   it('consumes the frozen native corpus byte-for-byte', async () => {
     const [module, vectors] = await Promise.all([
       loadGeneratedModule(),

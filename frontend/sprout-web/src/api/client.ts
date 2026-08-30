@@ -1,12 +1,17 @@
 import type {
   AssignmentDto,
+  AgentDirectoryItemDto,
   AttachmentDto,
   CreateAttachmentResponse,
+  CreateInfoDocumentFileRequest,
+  CreateInfoDocumentRequest,
   CreatePretaskTemplateAttachmentRequest,
   CreateQuestionnaireVersionRequest,
   CreateTaskCompletedAttachmentRequest,
   CreateTaskRequiredAttachmentRequest,
   ListAttachmentsResponse,
+  ListAgentsResponse,
+  ListInfoDocumentsResponse,
   DeviceKeyPackageView,
   DeviceSessionRequest,
   EmailStartResponse,
@@ -18,6 +23,7 @@ import type {
   ListPresetsResponse,
   MaterializationChoiceDto,
   MaterializePresetResponse,
+  InfoDocumentResponse,
   ListRetentionArchivesResponse,
   ListRetentionWarningsResponse,
   ListTaskListsResponse,
@@ -28,6 +34,7 @@ import type {
   ProjectRecoveryStatus,
   ProjectDeviceKeyPackage,
   ProvisionProjectRecoveryRequest,
+  ProvisionAgentResponse,
   ProjectInvitationDto,
   ProjectView,
   ParticipantSuggestionDto,
@@ -55,6 +62,7 @@ import type {
   TopicDto,
   Uuid,
   UpdateQuestionnaireDraftRequest,
+  UpdateInfoDocumentRequest,
   UpsertQuestionnaireDraftRequest,
   WebAuthnChallenge,
 } from './contracts'
@@ -454,6 +462,22 @@ export class ApiClient {
     )
   }
 
+  listAgents(projectId: Uuid): Promise<AgentDirectoryItemDto[]> {
+    return this.request<ListAgentsResponse>(
+      `/v1/projects/${encodeURIComponent(projectId)}/agents`,
+    ).then((response) => response.agents)
+  }
+
+  provisionAgent(
+    projectId: Uuid,
+    input: unknown,
+  ): Promise<ProvisionAgentResponse> {
+    return this.request(
+      `/v1/projects/${encodeURIComponent(projectId)}/agents`,
+      { method: 'POST', body: input },
+    )
+  }
+
   listTopics(projectId: Uuid): Promise<ListTopicsResponse> {
     return this.request(`/v1/projects/${projectId}/topics`)
   }
@@ -511,6 +535,80 @@ export class ApiClient {
       method: 'PUT',
       body,
     })
+  }
+
+  listTaskListInfoDocuments(
+    projectId: Uuid,
+    listId: Uuid,
+  ): Promise<ListInfoDocumentsResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/task-lists/${listId}/info-documents`,
+    )
+  }
+
+  listProjectInfoDocuments(
+    projectId: Uuid,
+  ): Promise<ListInfoDocumentsResponse> {
+    return this.request(`/v1/projects/${projectId}/info-documents`)
+  }
+
+  listTopicInfoDocuments(
+    projectId: Uuid,
+    topicId: Uuid,
+  ): Promise<ListInfoDocumentsResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/topics/${topicId}/info-documents`,
+    )
+  }
+
+  createTaskListInfoDocument(
+    projectId: Uuid,
+    listId: Uuid,
+    body: CreateInfoDocumentRequest,
+  ): Promise<InfoDocumentResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/task-lists/${listId}/info-documents`,
+      { method: 'POST', body },
+    )
+  }
+
+  createProjectInfoDocument(
+    projectId: Uuid,
+    body: CreateInfoDocumentRequest,
+  ): Promise<InfoDocumentResponse> {
+    return this.request(`/v1/projects/${projectId}/info-documents`, {
+      method: 'POST',
+      body,
+    })
+  }
+
+  createTopicInfoDocument(
+    projectId: Uuid,
+    topicId: Uuid,
+    body: CreateInfoDocumentRequest,
+  ): Promise<InfoDocumentResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/topics/${topicId}/info-documents`,
+      { method: 'POST', body },
+    )
+  }
+
+  updateInfoDocument(
+    projectId: Uuid,
+    documentId: Uuid,
+    body: UpdateInfoDocumentRequest,
+  ): Promise<InfoDocumentResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/info-documents/${documentId}`,
+      { method: 'PUT', body },
+    )
+  }
+
+  deleteInfoDocument(projectId: Uuid, documentId: Uuid): Promise<void> {
+    return this.request(
+      `/v1/projects/${projectId}/info-documents/${documentId}`,
+      { method: 'DELETE' },
+    )
   }
 
   listTasks(projectId: Uuid, listId: Uuid): Promise<ListTasksResponse> {
@@ -861,6 +959,17 @@ export class ApiClient {
   ): Promise<CreateAttachmentResponse> {
     return this.request(
       `/v1/projects/${projectId}/tasks/${taskId}/completed-attachments`,
+      { method: 'POST', body },
+    )
+  }
+
+  declareInfoDocumentFile(
+    projectId: Uuid,
+    documentId: Uuid,
+    body: CreateInfoDocumentFileRequest,
+  ): Promise<CreateAttachmentResponse> {
+    return this.request(
+      `/v1/projects/${projectId}/info-documents/${documentId}/files`,
       { method: 'POST', body },
     )
   }

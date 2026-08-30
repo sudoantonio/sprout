@@ -28,6 +28,7 @@ export type AppScreen =
   | 'recovery'
   | 'retention'
   | 'security'
+  | 'ai'
   | 'conflicts'
 
 export interface ProjectItem {
@@ -57,18 +58,25 @@ export type BoardFocus =
   | { type: 'generali' }
   | { type: 'members' }
   | { type: 'member'; identityId: Uuid }
+  | { type: 'agents' }
+  | { type: 'agent'; agentId: Uuid }
   | { type: 'topic'; topicId: Uuid }
 
-export type BoardViewMode = 'board' | 'timeline'
+export type BoardViewMode = 'overview' | 'board' | 'timeline' | 'history'
 
 const BOARD_VIEW_MODE_KEY = 'sprout-board-view-mode'
 
 export const readBoardViewMode = (): BoardViewMode => {
   try {
     const value = localStorage.getItem(BOARD_VIEW_MODE_KEY)
-    return value === 'timeline' ? 'timeline' : 'board'
+    return value === 'overview' ||
+      value === 'board' ||
+      value === 'timeline' ||
+      value === 'history'
+      ? value
+      : 'overview'
   } catch {
-    return 'board'
+    return 'overview'
   }
 }
 
@@ -260,7 +268,7 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
         ...state,
         selectedProjectId: action.projectId,
         boardFocus: { type: 'generali' },
-        boardViewMode: 'board',
+        boardViewMode: 'overview',
         boardMembers: [],
         selectedTopicId: undefined,
         selectedListId: undefined,

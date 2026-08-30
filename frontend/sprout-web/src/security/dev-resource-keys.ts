@@ -1,8 +1,9 @@
-import type { Uuid } from '../api/contracts'
+import type { EncryptedPayloadDto, Uuid } from '../api/contracts'
+import type { ResourceKind } from '../domain/models'
 import type { DevVaultSnapshot, KeyVault } from './key-vault'
 import type { SessionResponse } from '../api/contracts'
 import { saveDevSession, loadDevSession } from './dev-session'
-import { base64ToBytes, zeroBytes } from './wasm'
+import { base64ToBytes, decryptDocument, zeroBytes } from './wasm'
 
 const STORAGE_KEY = 'sprout-dev-resource-keys'
 
@@ -187,6 +188,59 @@ export const restoreAllDevResourceKeys = async (
     total += await restoreDevResourceKeys(identityId as Uuid, vault)
   }
   return total
+}
+
+/**
+ * Recover a DEV key whose historical backup slot no longer matches the wire
+ * resource id. AEAD authentication is the mapping oracle: a candidate is only
+ * rebound after it successfully decrypts the exact resource ciphertext/AAD.
+ */
+export const recoverDevResourceKeyFromBackup = async <T>(
+  vault: KeyVault,
+  input: {
+    ciphertext: EncryptedPayloadDto
+    projectId: Uuid
+    resourceId: Uuid
+    kind: ResourceKind
+    aggregateVersion: number
+    keyEpoch: number
+    purpose: 'body' | 'header'
+  },
+): Promise<T | undefined> => {
+  if (!import.meta.env.DEV || !vault.isUnlocked) return undefined
+  const candidates = new Set<string>()
+  for (const slots of Object.values(readBackup())) {
+    for (const value of Object.values(filterLiveKeys(slots))) {
+      candidates.add(value)
+    }
+  }
+
+  for (const value of candidates) {
+    const bytes = base64ToBytes(value)
+    try {
+      const document = await decryptDocument<T>(input.ciphertext, {
+        projectId: input.projectId,
+        resourceId: input.resourceId,
+        kind: input.kind,
+        aggregateVersion: input.aggregateVersion,
+        keyEpoch: input.keyEpoch,
+        resourceKey: bytes,
+      })
+      await vault.putResourceKey(
+        input.resourceId,
+        bytes,
+        input.keyEpoch,
+        input.purpose,
+      )
+      return document
+    } catch {
+      // Authentication failure means this candidate belongs to another
+      // resource. Continue without ever persisting the incorrect mapping.
+    } finally {
+      zeroBytes(bytes)
+    }
+  }
+  return undefined
 }
 
 /** Purge zeroed/corrupt keys left by earlier clearMemory races. */

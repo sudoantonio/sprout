@@ -32,8 +32,8 @@ cleanup() {
 trap cleanup EXIT
 
 seq 1 "${requests}" | xargs -P "${concurrency}" -I '{}' \
-  sh -c 'curl --silent --show-error --max-time 10 --output /dev/null --write-out "%{http_code}\n" "$1/health/live"' \
-  sh "${base_url%/}" >"${statuses}"
+  curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}\n' \
+  "${base_url%/}/health/live" >"${statuses}"
 if ! awk '$1 != "200" { failures += 1 } END { exit failures > 0 }' "${statuses}"; then
   echo "Concurrent liveness load produced non-200 responses" >&2
   exit 1

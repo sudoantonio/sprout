@@ -1,34 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# HLT-07: two-client offline sync convergence oracle at the API layer.
-# Requires a migrated database and uses storage-level idempotency + version
-# conflict semantics that the PWA SyncEngine resolves after REST catch-up.
+# HLT-07: storage-level idempotency, version-conflict, projection rollback,
+# reconstruction, and stale-replay oracle. The behavior fixture is deliberately
+# transactional and rolls itself back, so this gate must execute it directly
+# instead of assuming another process left its rows behind.
 
 : "${DATABASE_URL:?DATABASE_URL is required}"
 
-psql "${DATABASE_URL}" --set ON_ERROR_STOP=1 <<'SQL'
-DO $test$
-DECLARE
-    project_id uuid := '30000000-0000-0000-0000-000000000001';
-    resource_id uuid := '40000000-0000-0000-0000-000000000004';
-    projection_version bigint;
-BEGIN
-    SELECT aggregate_version INTO projection_version
-    FROM sync_current_projections
-    WHERE project_id = project_id AND resource_node_id = resource_id;
-    IF projection_version IS NULL THEN
-        RAISE EXCEPTION 'HLT-07 missing projection fixture from verify_behavior.sql';
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM sync_idempotency
-        WHERE project_id = project_id
-          AND idempotency_key = '76000000-0000-0000-0000-000000000001'
-    ) THEN
-        RAISE EXCEPTION 'HLT-07 missing idempotency fixture (T-LLR-07.3)';
-    END IF;
-END;
-$test$;
-SQL
+behavior_sql="${HLT07_BEHAVIOR_SQL:-db/tests/verify_behavior.sql}"
+if [[ ! -f "${behavior_sql}" ]]; then
+  echo "HLT-07 behavior oracle not found: ${behavior_sql}" >&2
+  exit 1
+fi
+psql "${DATABASE_URL}" --set ON_ERROR_STOP=1 --file "${behavior_sql}" >/dev/null
 
-echo "HLT-07 sync projection/idempotency fixtures verified"
+echo "HLT-07 sync projection/idempotency behavior verified"

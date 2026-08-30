@@ -1,0 +1,1 @@
+{"artifact_kind":"protocol_manifest","canonicalization":"sprout-governance-json-v1","compiler_id":"sprout.responsibility.compiler","compiler_version":1,"input":"e2ee-plaintext-commitment","output_schema":"ResponsibilityCompilerOutput","signature_context":"sprout-governance-compilation-v1","task_kind":"responsibility","tcb":"authorized-administrator-device"}

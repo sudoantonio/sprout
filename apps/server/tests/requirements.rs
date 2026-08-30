@@ -143,6 +143,43 @@ async fn fixture() -> Fixture {
         .await
         .expect("insert requirements device");
     }
+    sqlx::query(
+        r#"
+        INSERT INTO device_keys (
+            identity_id, device_id, key_version,
+            encryption_public_key, signing_public_key,
+            previous_package_hash, package_hash,
+            x25519_public_key, ed25519_public_key
+        ) VALUES
+            ($1, $2, 1,
+             decode(repeat('11', 32), 'hex'), decode(repeat('22', 32), 'hex'),
+             decode(repeat('00', 32), 'hex'), digest($2::text, 'sha256'),
+             decode(repeat('11', 32), 'hex'), decode(repeat('22', 32), 'hex')),
+            ($3, $4, 1,
+             decode(repeat('33', 32), 'hex'), decode(repeat('44', 32), 'hex'),
+             decode(repeat('00', 32), 'hex'), digest($4::text, 'sha256'),
+             decode(repeat('33', 32), 'hex'), decode(repeat('44', 32), 'hex')),
+            ($5, $6, 1,
+             decode(repeat('55', 32), 'hex'), decode(repeat('66', 32), 'hex'),
+             decode(repeat('00', 32), 'hex'), digest($6::text, 'sha256'),
+             decode(repeat('55', 32), 'hex'), decode(repeat('66', 32), 'hex')),
+            ($7, $8, 1,
+             decode(repeat('77', 32), 'hex'), decode(repeat('88', 32), 'hex'),
+             decode(repeat('00', 32), 'hex'), digest($8::text, 'sha256'),
+             decode(repeat('77', 32), 'hex'), decode(repeat('88', 32), 'hex'))
+        "#,
+    )
+    .bind(owner_id)
+    .bind(owner_device_id)
+    .bind(creator_id)
+    .bind(creator_device_id)
+    .bind(allowed_assignee_id)
+    .bind(assignee_device_id)
+    .bind(denied_assignee_id)
+    .bind(unrelated_device_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("insert requirements device keys");
 
     sqlx::query(
         "INSERT INTO projects (id, owner_identity_id, encrypted_metadata)
@@ -213,6 +250,31 @@ async fn fixture() -> Fixture {
         .execute(&mut *transaction)
         .await
         .expect("insert requirements resource node");
+    }
+    for (resource_id, creator_id_for_epoch, creator_device_id_for_epoch) in [
+        (root_resource_id, owner_id, owner_device_id),
+        (topic_resource_id, owner_id, owner_device_id),
+        (list_resource_id, owner_id, owner_device_id),
+        (task_resource_id, creator_id, creator_device_id),
+        (assigned_task_resource_id, owner_id, owner_device_id),
+    ] {
+        sqlx::query(
+            "INSERT INTO resource_epochs (
+                 project_id, resource_node_id, epoch,
+                 created_by_identity_id, created_by_device_id,
+                 created_by_device_key_version, key_commitment, reason
+             ) VALUES (
+                 $1, $2, 1, $3, $4, 1,
+                 decode(repeat('aa', 32), 'hex'), 'created'
+             )",
+        )
+        .bind(project_id)
+        .bind(resource_id)
+        .bind(creator_id_for_epoch)
+        .bind(creator_device_id_for_epoch)
+        .execute(&mut *transaction)
+        .await
+        .expect("insert requirements resource epoch");
     }
     sqlx::query(
         "INSERT INTO topics (id, project_id, resource_node_id, encrypted_payload)
@@ -314,21 +376,25 @@ async fn fixture() -> Fixture {
             identity_id: owner_id,
             device_id: owner_device_id,
             session_id: owner_session_id,
+            is_agent: false,
         },
         creator: AuthSession {
             identity_id: creator_id,
             device_id: creator_device_id,
             session_id: creator_session_id,
+            is_agent: false,
         },
         assignee: AuthSession {
             identity_id: allowed_assignee_id,
             device_id: assignee_device_id,
             session_id: Uuid::new_v4(),
+            is_agent: false,
         },
         unrelated: AuthSession {
             identity_id: denied_assignee_id,
             device_id: unrelated_device_id,
             session_id: Uuid::new_v4(),
+            is_agent: false,
         },
         owner_token,
         creator_token,
@@ -656,29 +722,6 @@ async fn unrecoverable_projects_fail_closed() {
         .execute(&mut *provision)
         .await
         .expect("bypass rls for recovery set fixture");
-    sqlx::query(
-        r#"
-        INSERT INTO device_keys (
-            identity_id, device_id, key_version,
-            encryption_public_key, signing_public_key
-        ) VALUES
-            ($1, $2, 1, decode(repeat('11', 32), 'hex'), decode(repeat('22', 32), 'hex')),
-            ($3, $4, 1, decode(repeat('33', 32), 'hex'), decode(repeat('44', 32), 'hex')),
-            ($5, $6, 1, decode(repeat('55', 32), 'hex'), decode(repeat('66', 32), 'hex')),
-            ($7, $8, 1, decode(repeat('77', 32), 'hex'), decode(repeat('88', 32), 'hex'))
-        "#,
-    )
-    .bind(fixture.owner.identity_id)
-    .bind(fixture.owner.device_id)
-    .bind(fixture.creator.identity_id)
-    .bind(fixture.creator.device_id)
-    .bind(fixture.assignee.identity_id)
-    .bind(fixture.assignee.device_id)
-    .bind(fixture.unrelated.identity_id)
-    .bind(fixture.unrelated.device_id)
-    .execute(&mut *provision)
-    .await
-    .expect("insert classic device keys for recovery fixture");
     sqlx::query(
         r#"
         INSERT INTO project_recovery_sets (

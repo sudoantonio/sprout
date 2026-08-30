@@ -21,10 +21,10 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sprout_api_contract::{
     AttachmentCollectionItemDto, AttachmentDto, AttachmentKindDto, AttachmentStateDto,
-    CreateAttachmentResponse, CreatePretaskTemplateAttachmentRequest,
-    CreateTaskCompletedAttachmentRequest, CreateTaskRequiredAttachmentRequest,
-    EncryptedBlobDeclarationDto, EncryptedPayloadDto, ListAttachmentsResponse, OpaqueDigestDto,
-    SensitiveUrlDto,
+    CreateAttachmentResponse, CreateInfoDocumentFileRequest,
+    CreatePretaskTemplateAttachmentRequest, CreateTaskCompletedAttachmentRequest,
+    CreateTaskRequiredAttachmentRequest, EncryptedBlobDeclarationDto, EncryptedPayloadDto,
+    ListAttachmentsResponse, OpaqueDigestDto, SensitiveUrlDto,
 };
 use sqlx::{FromRow, Postgres, Transaction};
 use tokio::io::AsyncWriteExt;
@@ -58,6 +58,7 @@ enum AttachmentInsert {
         assignment_id: Uuid,
         required_attachment_id: Option<Uuid>,
     },
+    InfoDocument,
 }
 
 pub async fn list_template(
@@ -421,6 +422,47 @@ pub async fn create_completed(
     .await
 }
 
+pub async fn create_info_document_file(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, document_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<CreateInfoDocumentFileRequest>,
+) -> Result<Json<CreateAttachmentResponse>, AppError> {
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let resource_node_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT resource_node_id FROM info_documents
+         WHERE project_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(project_id)
+    .bind(document_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    transaction.commit().await?;
+    if resource_node_id != request.blob.resource_node_id {
+        return Err(AppError::BadRequest(
+            "info file must use the document container resource",
+        ));
+    }
+    require_resource_access(
+        &state.pool,
+        actor,
+        project_id,
+        resource_node_id,
+        ResourceAccess::EditInfo,
+    )
+    .await?;
+    create_attachment(
+        &state,
+        actor,
+        project_id,
+        request.id,
+        &request.blob,
+        AttachmentInsert::InfoDocument,
+    )
+    .await
+}
+
 async fn create_attachment(
     state: &AppState,
     actor: AuthSession,
@@ -440,7 +482,14 @@ async fn create_attachment(
         i32::try_from(blob.key_epoch).map_err(|_| AppError::BadRequest("invalid key epoch"))?;
     let storage_key = format!("{}.blob", Uuid::new_v4().simple());
     validate_storage_key(&storage_key)?;
-    let link_id = Uuid::new_v4();
+    let link_id = match kind {
+        AttachmentInsert::InfoDocument => attachment_id,
+        _ => Uuid::new_v4(),
+    };
+    let link_kind = match kind {
+        AttachmentInsert::InfoDocument => "inline",
+        _ => "attachment",
+    };
     let mut transaction = begin(state, actor, project_id).await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 19))")
         .bind(project_id)
@@ -506,13 +555,14 @@ async fn create_attachment(
             id, project_id, blob_id, resource_node_id, link_kind,
             encrypted_metadata, created_by_identity_id
         )
-        VALUES ($1, $2, $3, $4, 'attachment', $5, $6)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         "#,
     )
     .bind(link_id)
     .bind(project_id)
     .bind(blob.blob_id)
     .bind(blob.resource_node_id)
+    .bind(link_kind)
     .bind(&encrypted_attachment_metadata)
     .bind(actor.identity_id)
     .execute(&mut *transaction)
@@ -598,6 +648,7 @@ async fn create_attachment(
             .execute(&mut *transaction)
             .await?;
         }
+        AttachmentInsert::InfoDocument => {}
     }
     transaction.commit().await?;
     let attachment = load_attachment(state, actor, project_id, blob.blob_id).await?;
@@ -780,6 +831,16 @@ async fn load_authorized_file(
             let task_id = row.task_id.ok_or(AppError::Internal)?;
             let assignment_id = row.assignment_id.ok_or(AppError::Internal)?;
             require_exact_active_assignee(state, actor, project_id, task_id, assignment_id).await?;
+        }
+        FileAuthorization::Upload if row.attachment_kind == "info_document" => {
+            require_resource_access(
+                &state.pool,
+                actor,
+                project_id,
+                row.resource_node_id,
+                ResourceAccess::EditInfo,
+            )
+            .await?;
         }
         FileAuthorization::Upload => {
             require_resource_access(
@@ -1172,6 +1233,7 @@ fn parse_attachment_kind(value: &str) -> Result<AttachmentKindDto, AppError> {
         "pretask_template" => Ok(AttachmentKindDto::PretaskTemplate),
         "task_required" => Ok(AttachmentKindDto::TaskRequired),
         "task_completed" => Ok(AttachmentKindDto::TaskCompleted),
+        "info_document" => Ok(AttachmentKindDto::InfoDocument),
         _ => Err(AppError::Internal),
     }
 }
@@ -1221,11 +1283,12 @@ SELECT
     blob.created_by_identity_id,
     blob.created_at,
     blob.available_at,
-    COALESCE(template.id, required.id, completed.id) AS attachment_id,
+    COALESCE(template.id, required.id, completed.id, inline_link.id) AS attachment_id,
     CASE
         WHEN template.id IS NOT NULL THEN 'pretask_template'
         WHEN required.id IS NOT NULL THEN 'task_required'
         WHEN completed.id IS NOT NULL THEN 'task_completed'
+        WHEN inline_link.id IS NOT NULL THEN 'info_document'
     END AS attachment_kind,
     COALESCE(required.task_id, completed.task_id) AS task_id,
     template.pretask_id,
@@ -1244,6 +1307,11 @@ LEFT JOIN task_required_attachments required
 LEFT JOIN task_completed_attachments completed
   ON completed.project_id = blob.project_id
  AND completed.blob_id = blob.id
+LEFT JOIN file_links inline_link
+  ON inline_link.project_id = blob.project_id
+ AND inline_link.blob_id = blob.id
+ AND inline_link.link_kind = 'inline'
+ AND inline_link.removed_at IS NULL
 WHERE blob.project_id = $1
   AND blob.id = $2
   AND blob.upload_state <> 'deleted'
@@ -1251,6 +1319,7 @@ WHERE blob.project_id = $1
       template.id IS NOT NULL
       OR required.id IS NOT NULL
       OR completed.id IS NOT NULL
+      OR inline_link.id IS NOT NULL
   )
 "#;
 

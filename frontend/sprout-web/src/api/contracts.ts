@@ -61,6 +61,37 @@ export interface ParticipantSuggestionDto {
   most_recent_shared_project_at: IsoDateTime
 }
 
+export interface AgentDirectoryItemDto {
+  id: Uuid
+  principal_identity_id: Uuid
+  identity_handle: string
+  controller_identity_id: Uuid
+  availability: 'controller_private' | 'project_delegable'
+  state: 'active' | 'suspended' | 'retired'
+  created_at: IsoDateTime
+  runner_id: Uuid
+  runner_device_id: Uuid
+  runner_state: 'pending_key' | 'active' | 'revoked'
+  runner_last_seen_at: IsoDateTime | null
+  local_goal_id: Uuid | null
+  local_goal_revision: number | null
+  local_goal_state: 'active' | 'completed' | 'failed' | 'superseded' | null
+}
+
+export interface ListAgentsResponse {
+  agents: AgentDirectoryItemDto[]
+}
+
+export interface ProvisionAgentResponse {
+  agent_id: Uuid
+  principal_identity_id: Uuid
+  runner_id: Uuid
+  runner_device_id: Uuid
+  bootstrap_token: string
+  bootstrap_expires_at: IsoDateTime
+  runner_state: 'pending_key'
+}
+
 export interface ProjectDeviceKeyPackage {
   identity_id: Uuid
   device_id: Uuid
@@ -248,6 +279,44 @@ export interface ListTopicsResponse {
 
 export interface ListTaskListsResponse {
   task_lists: TaskListDto[]
+}
+
+export interface InfoDocumentDto {
+  id: Uuid
+  project_id: Uuid
+  topic_id: Uuid | null
+  task_list_id: Uuid | null
+  parent_document_id: Uuid | null
+  resource_node_id: Uuid
+  payload: EncryptedPayloadDto
+  key_epoch: number
+  payload_version: number
+  created_at: IsoDateTime
+  updated_at: IsoDateTime
+}
+
+export interface CreateInfoDocumentRequest {
+  id: Uuid
+  parent_document_id: Uuid | null
+  resource_node_id: Uuid
+  key_epoch: number
+  payload: EncryptedPayloadDto
+  idempotency_key: Uuid
+}
+
+export interface UpdateInfoDocumentRequest {
+  expected_payload_version: number
+  key_epoch: number
+  payload: EncryptedPayloadDto
+  idempotency_key: Uuid
+}
+
+export interface InfoDocumentResponse {
+  document: InfoDocumentDto
+}
+
+export interface ListInfoDocumentsResponse {
+  documents: InfoDocumentDto[]
 }
 
 export interface ListTasksResponse {
@@ -489,7 +558,11 @@ export interface AttachmentDto {
   id: Uuid
   project_id: Uuid
   resource_node_id: Uuid
-  attachment_kind: 'pretask_template' | 'task_required' | 'task_completed'
+  attachment_kind:
+    | 'pretask_template'
+    | 'task_required'
+    | 'task_completed'
+    | 'info_document'
   blob_id: Uuid
   task_id: Uuid | null
   pretask_id: Uuid | null
@@ -509,7 +582,11 @@ export interface AttachmentCollectionItemDto {
   project_id: Uuid
   resource_node_id: Uuid
   key_epoch: number
-  attachment_kind: 'pretask_template' | 'task_required' | 'task_completed'
+  attachment_kind:
+    | 'pretask_template'
+    | 'task_required'
+    | 'task_completed'
+    | 'info_document'
   blob_id: Uuid
   task_id: Uuid | null
   pretask_id: Uuid | null
@@ -552,6 +629,12 @@ export interface CreateTaskCompletedAttachmentRequest {
   id: Uuid
   assignment_id: Uuid
   required_attachment_id: Uuid | null
+  blob: EncryptedBlobDeclarationDto
+  idempotency_key: Uuid
+}
+
+export interface CreateInfoDocumentFileRequest {
+  id: Uuid
   blob: EncryptedBlobDeclarationDto
   idempotency_key: Uuid
 }

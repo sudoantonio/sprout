@@ -50,6 +50,7 @@ pub struct Config {
     pub blob_project_quota_bytes: u64,
     pub cors_origins: Vec<Url>,
     pub session_ttl: Duration,
+    pub agent_work_lease: Duration,
     pub ceremony_ttl: Duration,
     pub email_verification_ttl: Duration,
     pub account_recovery_ttl: Duration,
@@ -82,6 +83,7 @@ impl fmt::Debug for Config {
             .field("blob_project_quota_bytes", &self.blob_project_quota_bytes)
             .field("cors_origins", &self.cors_origins)
             .field("session_ttl", &self.session_ttl)
+            .field("agent_work_lease", &self.agent_work_lease)
             .field("ceremony_ttl", &self.ceremony_ttl)
             .field("email_verification_ttl", &self.email_verification_ttl)
             .field("account_recovery_ttl", &self.account_recovery_ttl)
@@ -127,6 +129,7 @@ impl Config {
             &DEFAULT_BLOB_PROJECT_QUOTA.to_string(),
         )?;
         let session_ttl_seconds: u64 = parse_or("SPROUT_SESSION_TTL_SECONDS", "86400")?;
+        let agent_work_lease_seconds: u64 = parse_or("SPROUT_AGENT_WORK_LEASE_SECONDS", "300")?;
         let ceremony_ttl_seconds: u64 = parse_or("SPROUT_CEREMONY_TTL_SECONDS", "300")?;
         let email_verification_ttl_seconds: u64 =
             parse_or("SPROUT_EMAIL_VERIFICATION_TTL_SECONDS", "1800")?;
@@ -193,6 +196,7 @@ impl Config {
             blob_project_quota_bytes,
             cors_origins,
             session_ttl: Duration::from_secs(session_ttl_seconds),
+            agent_work_lease: Duration::from_secs(agent_work_lease_seconds),
             ceremony_ttl: Duration::from_secs(ceremony_ttl_seconds),
             email_verification_ttl: Duration::from_secs(email_verification_ttl_seconds),
             account_recovery_ttl: Duration::from_secs(account_recovery_ttl_seconds),
@@ -232,6 +236,9 @@ impl Config {
             || self.account_recovery_ttl.is_zero()
         {
             return Err(ConfigError::Invalid("authentication TTL"));
+        }
+        if self.agent_work_lease.is_zero() {
+            return Err(ConfigError::Invalid("SPROUT_AGENT_WORK_LEASE_SECONDS"));
         }
         if self.archive_signing_key_id.is_nil() {
             return Err(ConfigError::Invalid("SPROUT_ARCHIVE_SIGNING_KEY_ID"));
@@ -290,6 +297,7 @@ impl Config {
             blob_project_quota_bytes: 4096,
             cors_origins: vec![Url::parse("http://localhost:3000").expect("valid origin")],
             session_ttl: Duration::from_secs(3600),
+            agent_work_lease: Duration::from_secs(300),
             ceremony_ttl: Duration::from_secs(300),
             email_verification_ttl: Duration::from_secs(1800),
             account_recovery_ttl: Duration::from_secs(900),
@@ -469,6 +477,16 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ExperimentalCryptoDevelopmentOptInRequired)
+        ));
+    }
+
+    #[test]
+    fn agent_work_lease_must_be_nonzero() {
+        let mut config = Config::for_test();
+        config.agent_work_lease = Duration::ZERO;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Invalid("SPROUT_AGENT_WORK_LEASE_SECONDS"))
         ));
     }
 }

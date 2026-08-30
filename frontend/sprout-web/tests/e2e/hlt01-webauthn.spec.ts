@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { expect, test } from '@playwright/test'
 
@@ -11,6 +12,9 @@ const evidencePath =
   process.env.HLT01_EVIDENCE_PATH ??
   process.env.HLT05_EVIDENCE_PATH ??
   '/evidence/hlt05.json'
+const evidencePathWasConfigured = Boolean(
+  process.env.HLT01_EVIDENCE_PATH ?? process.env.HLT05_EVIDENCE_PATH,
+)
 
 test('HLT-01 and T-LLR-01.2 enforce a single-use, origin-bound, UV passkey ceremony', async ({
   context,
@@ -18,6 +22,10 @@ test('HLT-01 and T-LLR-01.2 enforce a single-use, origin-bound, UV passkey cerem
   browserName,
 }) => {
   test.skip(browserName !== 'chromium', 'Chromium exposes the virtual authenticator protocol')
+  test.skip(
+    !evidencePathWasConfigured && !existsSync(evidencePath),
+    'Requires backend-generated HLT-05 identity evidence',
+  )
   const evidence = JSON.parse(
     await readFile(evidencePath, 'utf8'),
   ) as IdentityEvidence

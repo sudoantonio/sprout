@@ -115,6 +115,7 @@ impl fmt::Debug for EncryptedPayload {
 impl<'de> Deserialize<'de> for EncryptedPayload {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct WirePayload {
             version: u16,
             algorithm: String,

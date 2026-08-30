@@ -308,17 +308,28 @@ const isWeekend = (date: Date): boolean => {
 
 const MS_PER_HALF_HOUR = MS_PER_MINUTE * 30
 
+/**
+ * Keep a readable amount of space between hour labels as the timeline zooms.
+ * The grid becomes progressively denser, rather than switching straight to a
+ * label for every hour as soon as hour mode opens.
+ */
 const hourTickPlan = (
   pxPerDay: number,
 ): { majorStepMs: number; minorStepMs: number | null } => {
   const pxPerHour = pxPerDay / 24
-  if (pxPerHour >= 36) {
+  if (pxPerHour >= 42) {
     return { majorStepMs: MS_PER_HOUR, minorStepMs: MS_PER_HALF_HOUR }
   }
-  if (pxPerHour >= 20) {
-    return { majorStepMs: MS_PER_HOUR, minorStepMs: null }
+  if (pxPerHour >= 30) {
+    return { majorStepMs: 2 * MS_PER_HOUR, minorStepMs: MS_PER_HOUR }
   }
-  return { majorStepMs: 2 * MS_PER_HOUR, minorStepMs: MS_PER_HOUR }
+  if (pxPerHour >= 22) {
+    return { majorStepMs: 3 * MS_PER_HOUR, minorStepMs: MS_PER_HOUR }
+  }
+  if (pxPerHour >= 16) {
+    return { majorStepMs: 4 * MS_PER_HOUR, minorStepMs: 2 * MS_PER_HOUR }
+  }
+  return { majorStepMs: 6 * MS_PER_HOUR, minorStepMs: 3 * MS_PER_HOUR }
 }
 
 export const buildTimelineTicks = (
@@ -341,15 +352,10 @@ export const buildTimelineTicks = (
 
     const alignHourCursor = (value: Date, stepMs: number): Date => {
       const aligned = new Date(value)
-      aligned.setSeconds(0, 0)
-      if (stepMs === MS_PER_HALF_HOUR) {
-        aligned.setMinutes(aligned.getMinutes() >= 30 ? 30 : 0)
-        return aligned
-      }
-      aligned.setMinutes(0)
-      if (stepMs === 2 * MS_PER_HOUR) {
-        aligned.setHours(aligned.getHours() - (aligned.getHours() % 2))
-      }
+      const stepMinutes = stepMs / MS_PER_MINUTE
+      const minuteOfDay = aligned.getHours() * 60 + aligned.getMinutes()
+      const alignedMinutes = Math.floor(minuteOfDay / stepMinutes) * stepMinutes
+      aligned.setHours(0, alignedMinutes, 0, 0)
       return aligned
     }
 

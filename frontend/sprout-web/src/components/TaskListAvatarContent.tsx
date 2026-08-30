@@ -1,5 +1,5 @@
 import type { TaskListIcon } from '../domain/task-list-icon'
-import { TaskListGlyphIcon } from './task-list-glyphs'
+import { TaskListGlyphIcon } from './TaskListGlyphIcon'
 
 export const TaskListAvatarContent = ({
   icon,

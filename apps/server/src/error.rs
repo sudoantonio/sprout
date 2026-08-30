@@ -94,7 +94,9 @@ impl From<sqlx::Error> for AppError {
             sqlx::Error::Database(database) if database.code().as_deref() == Some("40001") => {
                 Self::Conflict
             }
-            sqlx::Error::Database(database) if database.code().as_deref() == Some("55000") => {
+            sqlx::Error::Database(database)
+                if matches!(database.code().as_deref(), Some("55000" | "55P03")) =>
+            {
                 Self::Conflict
             }
             sqlx::Error::Database(database) if database.code().as_deref() == Some("42501") => {

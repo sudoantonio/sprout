@@ -1,6 +1,7 @@
 import type {
   AttachmentCollectionItemDto,
   EncryptedPayloadDto,
+  InfoDocumentDto,
   PresetDto,
   ProjectView,
   PushSyncRequest,
@@ -188,6 +189,46 @@ export interface TaskListDocument {
   name: string
   color?: TaskListColumnColor
   icon?: TaskListIcon
+}
+
+export interface InfoTextBlock {
+  id: Uuid
+  type: 'text'
+  markdown: string
+}
+
+export interface InfoFileBlock {
+  id: Uuid
+  type: 'file'
+  blob_id: Uuid
+  file_name: string
+  content_type: string
+  plaintext_size: number
+  /** Persisted presentation width for image blocks, in CSS pixels. */
+  display_width?: number
+}
+
+export interface InfoChildDocumentBlock {
+  id: Uuid
+  type: 'document'
+  document_id: Uuid
+  title: string
+}
+
+export type InfoDocumentBlock =
+  | InfoTextBlock
+  | InfoFileBlock
+  | InfoChildDocumentBlock
+
+export interface InfoDocumentContent {
+  schema: 1
+  title?: string
+  blocks: InfoDocumentBlock[]
+}
+
+export interface DecryptedInfoDocument {
+  wire: InfoDocumentDto
+  document: InfoDocumentContent
 }
 
 export interface TaskDocument {

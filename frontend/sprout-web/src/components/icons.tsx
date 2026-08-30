@@ -1,6 +1,31 @@
-import type { SVGProps } from 'react'
+import type { CSSProperties, HTMLAttributes, SVGProps } from 'react'
 
 type IconProps = SVGProps<SVGSVGElement>
+type NounProjectIconProps = HTMLAttributes<HTMLSpanElement>
+
+type NounProjectIconStyle = CSSProperties & {
+  WebkitMaskImage?: string
+  maskImage?: string
+}
+
+const NounProjectIcon = ({
+  asset,
+  className,
+  style,
+  ...props
+}: NounProjectIconProps & { asset: string }) => (
+  <span
+    {...props}
+    className={['noun-project-icon', className].filter(Boolean).join(' ')}
+    style={
+      {
+        WebkitMaskImage: `url("${asset}")`,
+        maskImage: `url("${asset}")`,
+        ...style,
+      } as NounProjectIconStyle
+    }
+  />
+)
 
 const iconProps = {
   viewBox: '0 0 24 24',
@@ -34,6 +59,15 @@ export const SearchIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <circle cx="11" cy="11" r="6.5" />
     <path d="m16 16 4 4" />
+  </svg>
+)
+
+export const FilterIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path
+      strokeWidth={2}
+      d="M20 5.6c0-.56 0-.84-.109-1.054a1 1 0 0 0-.437-.437C19.24 4 18.96 4 18.4 4H5.6c-.56 0-.84 0-1.054.109a1 1 0 0 0-.437.437C4 4.76 4 5.04 4 5.6v.737c0 .245 0 .367.028.482a1 1 0 0 0 .12.29c.061.1.148.187.321.36l5.062 5.062c.173.173.259.259.321.36a1 1 0 0 1 .12.29c.028.114.028.235.028.474v4.756c0 .857 0 1.286.18 1.544a1 1 0 0 0 .674.416c.311.046.695-.145 1.461-.529l.8-.4c.322-.16.482-.241.599-.36a1 1 0 0 0 .231-.374c.055-.158.055-.338.055-.697v-4.348c0-.245 0-.367.028-.482a1 1 0 0 1 .12-.29c.061-.1.147-.186.317-.356l.004-.004 5.062-5.062c.173-.173.259-.26.321-.36a1 1 0 0 0 .12-.29c.028-.114.028-.235.028-.475V5.6Z"
+    />
   </svg>
 )
 
@@ -91,6 +125,13 @@ export const PaperclipIcon = (props: IconProps) => (
   </svg>
 )
 
+export const FileIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M6 3h8l4 4v14H6Z" />
+    <path d="M14 3v5h4" />
+  </svg>
+)
+
 export const DownloadIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <path d="M12 3v12" />
@@ -124,18 +165,18 @@ export const WifiOffIcon = (props: IconProps) => (
   </svg>
 )
 
-export const SidebarCollapseIcon = (props: IconProps) => (
-  <svg {...iconProps} {...props}>
-    <rect x="4" y="5" width="16" height="14" rx="2" />
-    <path d="M9 5v14" />
-  </svg>
+export const SidebarCollapseIcon = (props: NounProjectIconProps) => (
+  <NounProjectIcon
+    asset="/icons/noun-project/side-panel-6450286.png"
+    {...props}
+  />
 )
 
-export const SidebarExpandIcon = (props: IconProps) => (
-  <svg {...iconProps} {...props}>
-    <rect x="4" y="5" width="16" height="14" rx="2" />
-    <path d="M15 5v14" />
-  </svg>
+export const SidebarExpandIcon = (props: NounProjectIconProps) => (
+  <NounProjectIcon
+    asset="/icons/noun-project/side-panel-6450286.png"
+    {...props}
+  />
 )
 
 export const LayoutGridIcon = (props: IconProps) => (
@@ -194,11 +235,12 @@ export const SidebarHomeIcon = (props: IconProps) => (
   </svg>
 )
 
-export const SidebarUserIcon = (props: IconProps) => (
-  <svg {...sidebarNavIconProps} {...props}>
-    <circle cx="12" cy="9" r="2.75" />
-    <path d="M7 19.25c.85-2.35 2.75-3.75 5-3.75s4.15 1.4 5 3.75" />
-  </svg>
+export const SidebarUserIcon = (props: NounProjectIconProps) => (
+  <NounProjectIcon asset="/icons/noun-project/user-8410585.png" {...props} />
+)
+
+export const SidebarAgentIcon = (props: NounProjectIconProps) => (
+  <NounProjectIcon asset="/icons/noun-project/cursor-8019257.png" {...props} />
 )
 
 export const SlidersIcon = (props: IconProps) => (
@@ -225,6 +267,23 @@ export const ClipboardListIcon = (props: IconProps) => (
   </svg>
 )
 
+export const ListIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <circle cx="5" cy="7" r="1" fill="currentColor" stroke="none" />
+    <circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" />
+    <circle cx="5" cy="17" r="1" fill="currentColor" stroke="none" />
+    <path d="M9 7h10M9 12h10M9 17h10" />
+  </svg>
+)
+
+export const ImageIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <circle cx="8.5" cy="9" r="1.5" />
+    <path d="m21 15-4.5-4.5L7 20" />
+  </svg>
+)
+
 export const RefreshCwIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
@@ -238,6 +297,14 @@ export const ClockIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <circle cx="12" cy="12" r="9" />
     <path d="M12 7v5l3 3" />
+  </svg>
+)
+
+export const TimeHistoryIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M3 12a9 9 0 1 0 3-6.7" />
+    <path d="M3 4v5h5" />
+    <path d="M12 7v5l3 2" />
   </svg>
 )
 
@@ -277,6 +344,13 @@ export const PaletteIcon = (props: IconProps) => (
     <circle cx="8.5" cy="7.5" r="0.5" fill="currentColor" stroke="none" />
     <circle cx="6.5" cy="12" r="0.5" fill="currentColor" stroke="none" />
     <path d="M12 2a10 10 0 0 0-1 19.9V22a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1v-1.1A10 10 0 0 0 12 2Z" />
+  </svg>
+)
+
+export const SunIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <circle cx="12" cy="12" r="4" />
+    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
   </svg>
 )
 

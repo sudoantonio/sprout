@@ -297,13 +297,12 @@ pub async fn verification_finish(
     .await?
     .is_some();
     if !consumed {
-        let already_active = sqlx::query_scalar::<_, bool>(
-            "SELECT status = 'active' FROM identities WHERE id = $1",
-        )
-        .bind(request.identity_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .unwrap_or(false);
+        let already_active =
+            sqlx::query_scalar::<_, bool>("SELECT status = 'active' FROM identities WHERE id = $1")
+                .bind(request.identity_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .unwrap_or(false);
         if already_active {
             return Err(AppError::BadRequest(
                 "account is already verified; use passkey sign-in or account recovery",

@@ -51,6 +51,27 @@ async fn identical_idempotency_digest_replays_and_collision_conflicts() {
     .await
     .expect("device");
     sqlx::query(
+        "INSERT INTO device_keys (
+             identity_id, device_id, key_version,
+             encryption_public_key, signing_public_key,
+             previous_package_hash, package_hash,
+             x25519_public_key, ed25519_public_key
+         ) VALUES (
+             $1, $2, 1,
+             decode(repeat('11', 32), 'hex'),
+             decode(repeat('22', 32), 'hex'),
+             decode(repeat('00', 32), 'hex'),
+             digest($2::text, 'sha256'),
+             decode(repeat('11', 32), 'hex'),
+             decode(repeat('22', 32), 'hex')
+         )",
+    )
+    .bind(identity_id)
+    .bind(device_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("device key");
+    sqlx::query(
         "INSERT INTO projects (id, owner_identity_id, encrypted_metadata)
          VALUES ($1, $2, decode('01', 'hex'))",
     )

@@ -79,6 +79,23 @@ entity_id!(RequiredAttachmentId);
 entity_id!(CompletedAttachmentId);
 entity_id!(DeviceId);
 entity_id!(SyncEventId);
+entity_id!(AgentId);
+entity_id!(ResponsibilityId);
+entity_id!(LocalGoalId);
+entity_id!(LanguageTaskId);
+entity_id!(InvocationId);
+entity_id!(ProxyThreadId);
+entity_id!(ProxyRequestId);
+entity_id!(InterrogationId);
+entity_id!(GoalId);
+entity_id!(RunId);
+entity_id!(WorkItemId);
+entity_id!(ClaimId);
+entity_id!(EvidenceId);
+entity_id!(BlockerId);
+entity_id!(CommentId);
+entity_id!(ToolCallId);
+entity_id!(GovernanceReviewId);
 
 #[derive(Clone, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]

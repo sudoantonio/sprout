@@ -142,6 +142,36 @@ describe('local key vault', () => {
     expect(vault.localIdentityId).toBe(identityId)
   })
 
+  it('never exports device-local AI settings and deletes them explicitly', async () => {
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const secrets: DeviceSecrets = {
+      keyVersion: 1,
+      suiteVersion: 0x8001,
+      publicPackage: crypto.getRandomValues(new Uint8Array(64)),
+      x25519PrivateKey: crypto.getRandomValues(new Uint8Array(32)),
+      mlKem768PrivateKey: crypto.getRandomValues(new Uint8Array(48)),
+      ed25519PrivateKey: crypto.getRandomValues(new Uint8Array(32)),
+      mlDsa65PrivateKey: crypto.getRandomValues(new Uint8Array(64)),
+    }
+    vault.setSessionSecrets(crypto.randomUUID(), secrets, crypto.randomUUID())
+    const profile = '{"credential":"never-export-ai-secret"}'
+    expect(await vault.putLocalSetting('device:ai-generation-profile-v1', profile)).toBe(false)
+    expect(vault.getLocalSetting('device:ai-generation-profile-v1')).toBe(profile)
+    expect(JSON.stringify(vault.exportDevSnapshot() ?? null)).not.toContain(
+      'never-export-ai-secret',
+    )
+
+    expect(await vault.deleteLocalSetting('device:ai-generation-profile-v1')).toBe(false)
+    expect(vault.getLocalSetting('device:ai-generation-profile-v1')).toBeUndefined()
+    await vault.putLocalSetting('device:ai-generation-profile-v1', profile)
+    vault.clearMemory()
+    expect(vault.getLocalSetting('device:ai-generation-profile-v1')).toBeUndefined()
+    expect(JSON.stringify(vault.exportDevSnapshot() ?? null)).not.toContain(
+      'never-export-ai-secret',
+    )
+  })
+
   it('persists only PRF-wrapped key material and clears memory', async () => {
     let stored: VaultCipherRecord | undefined
     const database = {

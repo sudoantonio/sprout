@@ -31,6 +31,7 @@ const ARCHIVE_WRAP_DOMAIN: &[u8] = b"sprout-retention-archive-wrap-v1";
 pub enum WorkerKind {
     Retention,
     Export,
+    AgentCompletion,
     All,
 }
 
@@ -73,6 +74,22 @@ async fn run_cycle(
     options: WorkerOptions,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    if !options.dry_run && matches!(options.kind, WorkerKind::AgentCompletion | WorkerKind::All) {
+        let timed_out = crate::routes::agent_tools::materialize_server_timeouts(pool).await?;
+        if timed_out > 0 {
+            tracing::info!(
+                timed_out_tool_calls = timed_out,
+                "materialized external tool timeouts"
+            );
+        }
+        let recovered = crate::routes::agent_runs::recover_expired_claims(pool).await?;
+        if recovered > 0 {
+            tracing::info!(
+                recovered_claims = recovered,
+                "recovered expired agent work claims"
+            );
+        }
+    }
     if !options.dry_run && matches!(options.kind, WorkerKind::Retention | WorkerKind::All) {
         sqlx::query("SELECT sprout_private.materialize_retention_subjects($1)")
             .bind(now)
@@ -102,6 +119,7 @@ async fn run_cycle(
             WorkerKind::Export => {
                 export_project(pool, config, worker_id, project_id, options, now).await?
             }
+            WorkerKind::AgentCompletion => {}
             WorkerKind::All => {
                 retention_project(
                     pool, config, worker_id, project_id, options, now, true, false,
@@ -881,6 +899,11 @@ async fn load_ciphertext_records(
         UNION ALL
         SELECT 'task.encrypted_value_snapshot', id, encrypted_value_snapshot
         FROM tasks
+        WHERE project_id = $1 AND resource_node_id = $2
+
+        UNION ALL
+        SELECT 'info_document.encrypted_payload', id, encrypted_payload
+        FROM info_documents
         WHERE project_id = $1 AND resource_node_id = $2
 
         UNION ALL

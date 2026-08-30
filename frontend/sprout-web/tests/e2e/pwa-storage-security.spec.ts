@@ -4,13 +4,21 @@ test('T-LLR-09.1 keeps queued ciphertext after persistence refusal and quota fai
   page,
 }) => {
   await page.goto('/')
+  await expect(page.getByRole('button', { name: 'Entra (dev)' })).toBeEnabled()
 
   const result = await page.evaluate(async () => {
-    Object.defineProperty(navigator.storage, 'persisted', {
+    const storage = navigator.storage ?? {}
+    if (!navigator.storage) {
+      Object.defineProperty(navigator, 'storage', {
+        configurable: true,
+        value: storage,
+      })
+    }
+    Object.defineProperty(storage, 'persisted', {
       configurable: true,
       value: async () => false,
     })
-    Object.defineProperty(navigator.storage, 'persist', {
+    Object.defineProperty(storage, 'persist', {
       configurable: true,
       value: async () => false,
     })
@@ -169,6 +177,7 @@ test('T-LLR-09.5 blocks inline XSS and third-party scripts', async ({ page }) =>
       executed: Reflect.get(window, '__sproutXssExecuted'),
       trustedTypesBlocked,
       trustedTypesAvailable: 'trustedTypes' in window,
+      origin: window.location.origin,
       scriptSources: Array.from(document.scripts, (script) => script.src),
     }
   })
@@ -179,7 +188,7 @@ test('T-LLR-09.5 blocks inline XSS and third-party scripts', async ({ page }) =>
   expect(externalSources.length).toBeGreaterThan(0)
   expect(
     externalSources.every(
-      (source) => new URL(source).origin === 'http://127.0.0.1:4173',
+      (source) => new URL(source).origin === result.origin,
     ),
   ).toBe(true)
 })

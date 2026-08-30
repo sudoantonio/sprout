@@ -11,7 +11,12 @@ compose_file="tests/system/compose.retention-restart.yml"
 server_bin="${SPROUT_SERVER_BIN:-target/debug/sprout-server}"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/sprout-retention-restart.XXXXXX")"
 export COMPOSE_PROJECT_NAME="sprout_retention_restart_${$}"
-export DATABASE_URL="postgresql://sprout_retention_restart@127.0.0.1:55432/sprout_retention_restart"
+postgres_data_dir="${SPROUT_POSTGRES_DATA_DIR:-}"
+if [[ -n "${postgres_data_dir}" ]]; then
+  : "${DATABASE_URL:?Set DATABASE_URL for the user-managed PostgreSQL instance}"
+else
+  export DATABASE_URL="postgresql://sprout_retention_restart@127.0.0.1:55432/sprout_retention_restart"
+fi
 export SPROUT_BASE_URL="http://localhost:8080"
 export SPROUT_CORS_ORIGINS="http://localhost:4173"
 export SPROUT_ENVIRONMENT="development"
@@ -42,8 +47,10 @@ cleanup() {
       awk '{ print }' "${log}" >&2
     done
   fi
-  docker compose -f "${compose_file}" down --volumes --remove-orphans \
-    >/dev/null 2>&1 || true
+  if [[ -z "${postgres_data_dir}" ]]; then
+    docker compose -f "${compose_file}" down --volumes --remove-orphans \
+      >/dev/null 2>&1 || true
+  fi
   rm -rf "${work_dir}"
   return "${status}"
 }
@@ -53,10 +60,19 @@ trap cleanup EXIT
   echo "Missing ${server_bin}; build sprout-server before this oracle" >&2
   exit 1
 }
-command -v docker >/dev/null
 command -v psql >/dev/null
 
-docker compose -f "${compose_file}" up -d --wait postgres
+if [[ -n "${postgres_data_dir}" ]]; then
+  [[ -d "${postgres_data_dir}" ]] || {
+    echo "Missing PostgreSQL data directory: ${postgres_data_dir}" >&2
+    exit 1
+  }
+  command -v pg_ctl >/dev/null
+  pg_isready --dbname="${DATABASE_URL}" >/dev/null
+else
+  command -v docker >/dev/null
+  docker compose -f "${compose_file}" up -d --wait postgres
+fi
 
 # Running an empty cycle applies the pinned migrations through the same binary
 # used by the interrupted and recovery workers.
@@ -166,8 +182,13 @@ done
   exit 1
 }
 
-docker compose -f "${compose_file}" restart postgres
-docker compose -f "${compose_file}" up -d --wait postgres
+if [[ -n "${postgres_data_dir}" ]]; then
+  pg_ctl --pgdata="${postgres_data_dir}" restart --mode=fast --wait
+  pg_isready --dbname="${DATABASE_URL}" >/dev/null
+else
+  docker compose -f "${compose_file}" restart postgres
+  docker compose -f "${compose_file}" up -d --wait postgres
+fi
 
 wait "${worker_pid}" 2>/dev/null || true
 worker_pid=""
