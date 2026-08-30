@@ -1441,9 +1441,9 @@ span.agent-stage-avatar.member-stage-avatar {
   display: flex;
   align-items: center;
   gap: 0.65rem;
-  margin: 0 0 1.35rem -1.6rem;
+  margin: 0 0 1.35rem -1.05rem;
   padding-bottom: 0.55rem;
-  transform: translateY(-0.5rem);
+  transform: translateY(0.1rem);
 }
 
 .agent-workspace-conversation .agent-workspace-agent-identity .agent-stage-avatar {
@@ -1524,10 +1524,10 @@ span.agent-stage-avatar.member-stage-avatar {
   width: 100%;
   align-items: center;
   justify-content: end;
-  margin-right: -1.6rem;
+  margin-right: -0.8rem;
   margin-bottom: 0.5rem;
   padding-bottom: 0.55rem;
-  transform: translate(2rem, -0.3rem);
+  transform: translate(0.9rem, 0.15rem);
 }
 
 .agent-workspace-tasks-toggle {
@@ -1903,11 +1903,12 @@ span.agent-stage-avatar.member-stage-avatar {
 
 .agent-editor-dialog {
   display: flex;
-  width: min(31rem, calc(100vw - 3rem));
-  min-height: min(25rem, calc(100vh - 3rem));
+  width: var(--task-create-panel-width);
+  min-height: min(18rem, calc(100vh - 3rem));
   max-height: calc(100vh - 3rem);
   flex-direction: column;
   border-color: var(--border-neutral);
+  border-radius: var(--radius-card);
   background: var(--task-create-surface);
   box-shadow: var(--shadow-popover);
   padding: 0.9rem 0.75rem;
@@ -1972,12 +1973,12 @@ span.agent-stage-avatar.member-stage-avatar {
 .agent-editor-fields input,
 .agent-editor-fields textarea {
   border: 0;
-  border-radius: 0;
+  border-radius: 0.2rem;
   background: transparent;
   color: var(--text-primary);
   font-size: 0.9rem;
   line-height: 1.4;
-  padding: 0.1rem 0;
+  padding: 0.65rem 0.75rem;
   outline: none;
 }
 
@@ -1992,6 +1993,11 @@ span.agent-stage-avatar.member-stage-avatar {
   height: 100%;
   flex: 1 1 auto;
   resize: none;
+}
+
+.agent-editor-fields textarea::placeholder {
+  color: var(--text-secondary);
+  opacity: 1;
 }
 
 .agent-editor-capabilities {
@@ -2020,15 +2026,15 @@ span.agent-stage-avatar.member-stage-avatar {
 
 .agent-editor-avatar-trigger {
   display: grid;
-  width: 1.75rem;
-  height: 1.75rem;
+  width: 2.25rem;
+  height: 2.25rem;
   place-items: center;
   border: 0;
   border-radius: 50%;
   color: var(--text-on-accent);
   cursor: pointer;
   font: inherit;
-  font-size: 0.9rem;
+  font-size: 1.1rem;
 }
 
 .agent-editor-name {
@@ -2038,11 +2044,11 @@ span.agent-stage-avatar.member-stage-avatar {
   box-shadow: none !important;
   color: var(--text-primary);
   font: inherit;
-  font-size: 1.1rem;
+  font-size: 1.45rem;
   font-weight: 600;
   line-height: 1.25;
   outline: none;
-  padding: 0;
+  padding: 0.2rem 0.35rem;
 }
 
 .agent-editor-name:focus,
@@ -2065,15 +2071,21 @@ span.agent-stage-avatar.member-stage-avatar {
 }
 
 .agent-editor-add-capability {
-  display: grid;
-  width: 1.7rem;
-  height: 1.7rem;
-  place-items: center;
+  display: inline-flex;
+  min-width: 5.75rem;
+  min-height: 1.8rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
   border: 0;
-  border-radius: var(--radius-pill);
-  background: var(--task-create-surface);
-  color: var(--text-icon);
+  border-radius: 0.3rem;
+  background: var(--surface-control-highlight);
+  color: var(--text-secondary);
   cursor: pointer;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 0.3rem 0.5rem;
 }
 
 .agent-editor-add-capability svg {
@@ -2083,7 +2095,7 @@ span.agent-stage-avatar.member-stage-avatar {
 
 .agent-editor-add-capability:hover {
   background: var(--surface-hover);
-  color: var(--text-board);
+  color: var(--text-primary);
 }
 
 .agent-editor-footer-tools .agent-editor-capability-menu {
@@ -7134,8 +7146,13 @@ span.task-create-pill-btn {
   background: var(--surface-timeline-header, var(--surface-card));
 }
 
+/* The header remains a single, calm surface; alternating bands belong to the grid. */
+.board-timeline-axis .board-timeline-band {
+  display: none;
+}
+
 .board-timeline-lane {
-  min-height: 6rem;
+  min-height: 3.5rem;
   background: transparent;
 }
 
@@ -7232,7 +7249,7 @@ span.task-create-pill-btn {
   position: absolute;
   top: 0;
   bottom: 0;
-  z-index: 1;
+  z-index: 3;
   width: 2px;
   transform: translateX(-50%);
   background: var(--accent-action);
@@ -7259,7 +7276,7 @@ span.task-create-pill-btn {
 
 .board-timeline-cell-add {
   position: absolute;
-  top: 0;
+  top: 0.2rem;
   left: 0;
   right: 0;
   z-index: 1;
@@ -7278,6 +7295,7 @@ span.task-create-pill-btn {
   cursor: pointer;
   opacity: 0;
   padding: 0;
+  transform: none;
   transition:
     height 0.15s ease,
     opacity 0.15s ease,
@@ -7286,23 +7304,25 @@ span.task-create-pill-btn {
     border-color 0.15s ease;
 }
 
+
 .board-timeline-cell:hover .board-timeline-cell-add,
 .board-timeline-cell-add:focus-visible {
-  height: 1.75rem;
+  height: 2rem;
   opacity: 1;
-  background: color-mix(in srgb, var(--surface-card) 88%, transparent);
-  border-bottom-color: color-mix(in srgb, var(--border-neutral) 70%, transparent);
+  background: var(--accent-action-soft);
+  border-bottom-color: color-mix(in srgb, var(--accent-action) 42%, transparent);
+  color: var(--accent-action);
 }
 
 .board-timeline-cell-add:hover {
-  color: var(--text-primary);
-  background: var(--surface-card);
-  border-bottom-color: color-mix(in srgb, var(--border-neutral) 40%, var(--text-muted));
+  color: var(--accent-action-hover);
+  background: color-mix(in srgb, var(--accent-action-soft) 78%, var(--accent-action));
+  border-bottom-color: var(--accent-action);
 }
 
 .board-timeline-cell-add svg {
-  width: 0.85rem;
-  height: 0.85rem;
+  width: 1rem;
+  height: 1rem;
 }
 
 .board-timeline-cell-empty-trigger {
@@ -8912,6 +8932,7 @@ span.task-create-pill-btn {
 .board-cards--locked {
   flex: 0 0 auto;
   overflow: visible;
+  margin-top: 0.55rem !important;
 }
 
 .board-card {
@@ -12659,7 +12680,7 @@ span.task-create-pill-btn {
   .board-view-navigation {
     flex-direction: row;
     gap: 0;
-    margin-left: 0.55rem;
+    margin-left: 0;
     min-width: max-content;
   }
 
@@ -13140,6 +13161,7 @@ span.task-create-pill-btn {
 }
 
 [data-style='tactical'] .agent-chat-composer,
+[data-style='tactical'] .agent-editor-dialog,
 [data-style='tactical'] .board-search,
 [data-style='tactical'] .board-view-mode-option.active {
   border-radius: 0;
@@ -13990,7 +14012,7 @@ span.task-create-pill-btn {
   }
 
   .board-view-navigation {
-    margin-left: 0.55rem;
+    margin-left: 0;
     gap: 0;
   }
 
@@ -14117,19 +14139,7 @@ span.task-create-pill-btn {
     position: relative;
   }
 
-  .board-secondary-view-panel:has(.agent-workspace)::after {
-    position: absolute;
-    z-index: 1;
-    top: 3.35rem;
-    right: 0;
-    left: 0;
-    height: 1px;
-    background: var(--border-subtle);
-    content: '';
-    pointer-events: none;
-  }
-
-  .board-secondary-view-panel .agent-stage {
+.board-secondary-view-panel .agent-stage {
     padding: 0;
   }
 

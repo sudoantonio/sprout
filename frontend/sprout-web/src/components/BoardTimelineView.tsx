@@ -267,12 +267,6 @@ export const BoardTimelineView = ({
                     style={{ left: band.x, width: band.width }}
                   />
                 ))}
-              {nowX !== null ? (
-                <div
-                  className="board-timeline-today-line board-timeline-today-line--board"
-                  style={{ left: nowX }}
-                />
-              ) : null}
             </div>
             <div className="board-timeline-gantt-header">
               <div className="board-timeline-list-label board-timeline-list-label--corner">
@@ -337,7 +331,7 @@ export const BoardTimelineView = ({
                 <div
                   key={lane.listId}
                   className="board-timeline-gantt-row"
-                  style={{ minHeight: Math.max(96, lane.height) }}
+                  style={{ minHeight: Math.max(56, lane.height) }}
                 >
                   <TimelineListLabel list={list} />
                   <div
@@ -348,15 +342,24 @@ export const BoardTimelineView = ({
                       handleLaneCreate(lane.listId, event)
                     }
                   >
-                    {dayColumns.map((column) => (
-                      <TimelineLaneDayCell
-                        key={`${lane.listId}-${column.key}`}
-                        listId={lane.listId}
-                        column={column}
-                        window={window}
-                        onCreateTaskInDay={onCreateTaskInDay}
-                      />
-                    ))}
+                    {dayColumns.map((column) => {
+                      const columnStart = column.start.getTime()
+                      const columnEnd = columnStart + 24 * 60 * 60 * 1000
+                      const isOccupied = lane.tasks.some(
+                        (item) =>
+                          item.startMs < columnEnd && item.endMs > columnStart,
+                      )
+                      return (
+                        <TimelineLaneDayCell
+                          key={`${lane.listId}-${column.key}`}
+                          listId={lane.listId}
+                          column={column}
+                          window={window}
+                          occupied={isOccupied}
+                          onCreateTaskInDay={onCreateTaskInDay}
+                        />
+                      )
+                    })}
                     {lane.tasks.map((item) => (
                       <TimelineBar
                         key={item.task.wire.id}
@@ -382,6 +385,12 @@ export const BoardTimelineView = ({
                 </div>
               )
             })}
+            {nowX !== null ? (
+              <div
+                className="board-timeline-today-line board-timeline-today-line--board"
+                style={{ left: `calc(var(--timeline-list-col) + ${nowX}px)` }}
+              />
+            ) : null}
           </div>
         )}
       </div>
@@ -393,11 +402,13 @@ const TimelineLaneDayCell = ({
   listId,
   column,
   window,
+  occupied,
   onCreateTaskInDay,
 }: {
   listId: string
   column: TimelineDayColumn
   window: TimelineWindow
+  occupied: boolean
   onCreateTaskInDay?(
     listId: string,
     day: Date,
@@ -419,6 +430,7 @@ const TimelineLaneDayCell = ({
   const cellClass = [
     'board-timeline-cell',
     column.isToday ? 'is-today' : '',
+    occupied ? 'has-task' : '',
   ]
     .filter(Boolean)
     .join(' ')

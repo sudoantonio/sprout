@@ -646,6 +646,7 @@ export const AgentManagementPanel = ({
                     onClick={() => setAgentCapabilityMenuOpen((open) => !open)}
                   >
                     <PlusIcon aria-hidden />
+                    <span>Aggiungi</span>
                   </button>
                   {agentCapabilityMenuOpen && (
                     <div className="agent-editor-capability-menu">

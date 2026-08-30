@@ -5830,15 +5830,17 @@ export const TasksScreen = ({
                       void onCompleteTask(task)
                     }}
                   />
+                  {listLocked.length > 0 ? (
+                    <ul className="board-cards board-cards--locked">
+                      {listLocked.map((task) => (
+                        <li key={task.id} className="board-card locked">
+                          <LockIcon />
+                          <span>Locked task</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
                 </div>
-                <ul className="board-cards board-cards--locked">
-                  {listLocked.map((task) => (
-                    <li key={task.id} className="board-card locked">
-                      <LockIcon />
-                      <span>Locked task</span>
-                    </li>
-                  ))}
-                </ul>
 
               </section>
             )
