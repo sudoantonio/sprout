@@ -367,6 +367,17 @@ export const XIcon = (props: IconProps) => (
   </svg>
 )
 
+export const GripIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <circle cx="9" cy="6" r="0.75" fill="currentColor" stroke="none" />
+    <circle cx="15" cy="6" r="0.75" fill="currentColor" stroke="none" />
+    <circle cx="9" cy="12" r="0.75" fill="currentColor" stroke="none" />
+    <circle cx="15" cy="12" r="0.75" fill="currentColor" stroke="none" />
+    <circle cx="9" cy="18" r="0.75" fill="currentColor" stroke="none" />
+    <circle cx="15" cy="18" r="0.75" fill="currentColor" stroke="none" />
+  </svg>
+)
+
 export const CircleIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <circle cx="12" cy="12" r="9" />

@@ -268,6 +268,21 @@ const openSlashMenu = (editor: HTMLElement) => {
   fireEvent.keyDown(editor, { key: '/' })
 }
 
+const openSlashMenuBefore = (editor: HTMLElement, before: Element) => {
+  const emptyLine = document.createElement('p')
+  emptyLine.innerHTML = '<br>'
+  editor.insertBefore(emptyLine, before)
+
+  const range = document.createRange()
+  range.selectNodeContents(emptyLine)
+  range.collapse(true)
+  const selection = window.getSelection()
+  selection?.removeAllRanges()
+  selection?.addRange(range)
+
+  fireEvent.keyDown(editor, { key: '/' })
+}
+
 describe('board shell', () => {
   const sidebar = () =>
     within(screen.getByRole('complementary', { name: 'Board navigation' }))
@@ -529,7 +544,407 @@ describe('board shell', () => {
     expect(insertedHeading?.contains(window.getSelection()?.anchorNode ?? null)).toBe(true)
   })
 
-  it('supports interactive Overview tasks and separate attachment commands', async () => {
+  it('keeps exactly one empty trailing prompt while writing consecutive lines', async () => {
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{ id: crypto.randomUUID(), type: 'text', markdown: 'Prima' }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    const writeIntoPrompt = (text: string, outsideHelperSpan = false) => {
+      const prompt = editor.querySelector<HTMLElement>(':scope > [data-overview-prompt]')!
+      const content = prompt.querySelector<HTMLElement>('[data-task-text]') ?? prompt
+      if (outsideHelperSpan) prompt.append(document.createTextNode(text))
+      else content.textContent = text
+      fireEvent.input(editor)
+    }
+
+    writeIntoPrompt('Seconda', true)
+    expect(editor.querySelectorAll(':scope > [data-overview-prompt]')).toHaveLength(1)
+    expect(editor.querySelector('[data-overview-prompt]')?.textContent).toBe('')
+    writeIntoPrompt('Terza')
+    expect(editor.querySelectorAll(':scope > [data-overview-prompt]')).toHaveLength(1)
+    expect(editor.querySelector('[data-overview-prompt]')?.textContent).toBe('')
+
+    fireEvent.blur(editor)
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalled())
+    expect(onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks).toEqual([
+      expect.objectContaining({
+        type: 'text',
+        markdown: 'Prima\nSeconda\nTerza',
+      }),
+    ])
+  })
+
+  it('renders the text formatting toolbar above the document clipping layers', async () => {
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{ id: crypto.randomUUID(), type: 'text', markdown: 'Testo selezionato' }],
+      },
+    }
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    const text = editor.querySelector('[data-task-text]')?.firstChild
+    expect(text).toBeTruthy()
+    const range = document.createRange()
+    range.selectNodeContents(text!)
+    Object.defineProperty(range, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        x: 320, y: 240, top: 240, right: 440, bottom: 264, left: 320,
+        width: 120, height: 24, toJSON: () => ({}),
+      }),
+    })
+    const selection = window.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+    fireEvent.mouseUp(editor)
+
+    const toolbar = await screen.findByRole('toolbar', { name: 'Formattazione testo' })
+    expect(toolbar).toHaveClass('tasklist-info-text-format-toolbar--portal')
+    expect(screen.getByTestId('overview-block-flow')).not.toContainElement(toolbar)
+    expect(document.body).toContainElement(toolbar)
+  })
+
+  it('shows an editable writing prompt after a final attachment', async () => {
+    const firstTextId = crypto.randomUUID()
+    const pageId = crypto.randomUUID()
+    const imageId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [
+          { id: firstTextId, type: 'text', markdown: 'Prima del documento' },
+          { id: pageId, type: 'document', document_id: crypto.randomUUID(), title: 'Pagina' },
+          { id: imageId, type: 'file', blob_id: crypto.randomUUID(), file_name: 'foto.png', content_type: 'image/png', plaintext_size: 10 },
+        ],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const flow = await screen.findByTestId('overview-block-flow')
+    const prompts = flow.querySelectorAll('[data-overview-prompt]')
+    expect(prompts).toHaveLength(1)
+    const trailingTextBlock = prompts[0]?.closest<HTMLElement>('[data-block-id]')
+    expect(trailingTextBlock).toBeTruthy()
+    expect(prompts[0]?.getAttribute('data-placeholder')).toBe('Scrivi una nota o usa / per aggiungere contenuti')
+    expect(flow.querySelector(`[data-block-id="${firstTextId}"] [data-overview-prompt]`)).toBeNull()
+    expect(flow.querySelector(`[data-block-id="${firstTextId}"] [data-show-prompt]`)?.getAttribute('data-show-prompt')).toBe('false')
+    expect(Array.from(flow.children).map((element) => element.getAttribute('data-block-id'))).toEqual([
+      firstTextId,
+      pageId,
+      imageId,
+      trailingTextBlock?.getAttribute('data-block-id') ?? null,
+    ])
+
+    const editor = trailingTextBlock?.querySelector<HTMLElement>('[role="textbox"]')
+    const promptText = prompts[0]?.querySelector<HTMLElement>('[data-task-text]')
+    expect(editor).toBeTruthy()
+    expect(promptText).toBeTruthy()
+
+    const imageTrigger = await screen.findByRole('button', { name: 'Seleziona foto.png' })
+    fireEvent.click(imageTrigger)
+    const imageBlock = flow.querySelector<HTMLElement>(`[data-block-id="${imageId}"]`)
+    await waitFor(() => expect(imageBlock).toHaveClass('is-selected'))
+    expect(document.activeElement).toBe(imageBlock)
+    fireEvent.keyDown(imageBlock!, { key: 'Enter' })
+    await waitFor(() => expect(document.activeElement).toBe(editor))
+
+    promptText!.textContent = 'Dopo immagine'
+    fireEvent.input(editor!)
+    fireEvent.blur(editor!)
+
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalled())
+    expect(onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks.at(-1)).toMatchObject({
+      type: 'text',
+      markdown: 'Dopo immagine',
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Seleziona foto.png' }))
+    await waitFor(() => expect(imageBlock).toHaveClass('is-selected'))
+    fireEvent.keyDown(imageBlock!, { key: 'Delete' })
+    await waitFor(() => {
+      const blocks = onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks ?? []
+      expect(blocks.some((block) => block.id === imageId)).toBe(false)
+    })
+  })
+
+  it('hides the trailing writing prompt inside a closed collapse', async () => {
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [
+          { id: crypto.randomUUID(), type: 'text', markdown: ':::collapse[closed] Capitolo chiuso' },
+          { id: crypto.randomUUID(), type: 'file', blob_id: crypto.randomUUID(), file_name: 'nascosta.png', content_type: 'image/png', plaintext_size: 10 },
+        ],
+      },
+    }
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+      />,
+    )
+
+    const flow = await screen.findByTestId('overview-block-flow')
+    const prompt = flow.querySelector<HTMLElement>('[data-overview-prompt]')
+    expect(prompt).toBeTruthy()
+    expect(prompt?.closest('[data-block-id]')).toHaveAttribute('hidden')
+    expect(screen.queryByRole('button', { name: 'Seleziona nascosta.png' })).toBeNull()
+  })
+
+  it('inserts a new writing row immediately after a selected image', async () => {
+    const beforeId = crypto.randomUUID()
+    const imageId = crypto.randomUUID()
+    const afterId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [
+          { id: beforeId, type: 'text', markdown: 'Prima' },
+          { id: imageId, type: 'file', blob_id: crypto.randomUUID(), file_name: 'centrale.png', content_type: 'image/png', plaintext_size: 10 },
+          { id: afterId, type: 'text', markdown: 'Testo già presente dopo immagine' },
+        ],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const flow = await screen.findByTestId('overview-block-flow')
+    fireEvent.click(await screen.findByRole('button', { name: 'Seleziona centrale.png' }))
+    const imageBlock = flow.querySelector<HTMLElement>(`[data-block-id="${imageId}"]`)!
+    fireEvent.keyDown(imageBlock, { key: 'Enter' })
+
+    await waitFor(() => expect(flow.children).toHaveLength(4))
+    const insertedBlock = flow.children[2] as HTMLElement
+    expect(insertedBlock.getAttribute('data-block-id')).not.toBe(afterId)
+    const insertedEditor = insertedBlock.querySelector<HTMLElement>('[role="textbox"]')!
+    await waitFor(() => expect(document.activeElement).toBe(insertedEditor))
+
+    insertedEditor.innerHTML = '<p><span data-task-text>Riga subito sotto</span></p>'
+    fireEvent.input(insertedEditor)
+    fireEvent.blur(insertedEditor)
+
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalled())
+    expect(onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks.map((block) => (
+      block.type === 'text' ? block.markdown : block.id
+    ))).toEqual([
+      'Prima',
+      imageId,
+      'Riga subito sotto',
+      'Testo già presente dopo immagine',
+    ])
+  })
+
+  it('rolls back the prepared text split when an image upload fails', async () => {
+    const user = userEvent.setup()
+    const textId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{ id: textId, type: 'text', markdown: 'Prima\nDopo' }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+        onUploadInfoDocumentFile={vi.fn().mockRejectedValue(new Error('upload failed'))}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    openSlashMenuBefore(editor, editor.children[1]!)
+    await user.click(await screen.findByRole('menuitem', { name: 'Immagine' }))
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['test'], 'broken.png', { type: 'image/png' })] },
+    })
+
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(2))
+    expect(onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks).toEqual([
+      { id: textId, type: 'text', markdown: 'Prima\nDopo' },
+    ])
+    await waitFor(() => {
+      expect(screen.getAllByRole('textbox', { name: /Testo info in Markdown/ })).toHaveLength(1)
+    })
+  })
+
+  it('rolls back the prepared text split when the file picker is cancelled', async () => {
+    const user = userEvent.setup()
+    const textId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{ id: textId, type: 'text', markdown: 'Prima\nDopo' }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+    const onUploadInfoDocumentFile = vi.fn()
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+        onUploadInfoDocumentFile={onUploadInfoDocumentFile}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    openSlashMenuBefore(editor, editor.children[1]!)
+    await user.click(await screen.findByRole('menuitem', { name: 'File' }))
+    await waitFor(() => {
+      expect(screen.getAllByRole('textbox', { name: /Testo info in Markdown/ })).toHaveLength(2)
+    })
+    const splitEditors = screen.getAllByRole('textbox', { name: /Testo info in Markdown/ })
+    splitEditors[0]!.innerHTML = '<p>Prima modificata</p>'
+    fireEvent.input(splitEditors[0]!)
+    const currentSplitEditors = screen.getAllByRole('textbox', { name: /Testo info in Markdown/ })
+    currentSplitEditors[1]!.innerHTML = '<p>Dopo modificato</p>'
+    fireEvent.input(currentSplitEditors[1]!)
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!
+    fireEvent(fileInput, new Event('cancel', { bubbles: true }))
+
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(2))
+    expect(onUploadInfoDocumentFile).not.toHaveBeenCalled()
+    expect(onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks).toEqual([
+      { id: textId, type: 'text', markdown: 'Prima modificata\nDopo modificato' },
+    ])
+  })
+
+  it('supports interactive Overview blocks and separate attachment commands', async () => {
     const user = userEvent.setup()
     const projectRoot: DecryptedInfoDocument = {
       ...infoRoot,
@@ -544,7 +959,7 @@ describe('board shell', () => {
         blocks: [{
           id: crypto.randomUUID(),
           type: 'text',
-          markdown: '- [ ] Verifica allegati\n',
+          markdown: '- Verifica allegati',
         }],
       },
     }
@@ -575,17 +990,7 @@ describe('board shell', () => {
     )
 
     const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
-    const task = screen.getByRole('checkbox', { name: 'Completa task' })
-    await user.click(task)
-    fireEvent.blur(editor)
-    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalled())
-    expect(onUpdateInfoDocument.mock.calls.at(-1)?.[1]).toEqual(
-      expect.objectContaining({
-        blocks: expect.arrayContaining([
-          expect.objectContaining({ markdown: '- [x] Verifica allegati\n' }),
-        ]),
-      }),
-    )
+    expect(editor).toHaveTextContent('Verifica allegati')
 
     openSlashMenu(editor)
     expect(await screen.findByRole('menuitem', { name: 'Immagine' })).toBeTruthy()
@@ -600,12 +1005,8 @@ describe('board shell', () => {
     const resizeHandle = await screen.findByRole('separator', { name: 'Ridimensiona schema.png' })
     const imageFrame = resizeHandle.parentElement!
     const imageFigure = imageFrame.parentElement!
-    vi.spyOn(imageFrame, 'getBoundingClientRect').mockReturnValue({
-      width: 400,
-    } as DOMRect)
-    vi.spyOn(imageFigure, 'getBoundingClientRect').mockReturnValue({
-      width: 800,
-    } as DOMRect)
+    Object.defineProperty(imageFrame, 'offsetWidth', { configurable: true, value: 400 })
+    Object.defineProperty(imageFigure, 'clientWidth', { configurable: true, value: 800 })
     fireEvent.keyDown(resizeHandle, { key: 'ArrowRight' })
     await waitFor(() => {
       const payloads = onUpdateInfoDocument.mock.calls.map((call) => call[1])
@@ -615,7 +1016,9 @@ describe('board shell', () => {
     })
     expect(imageFrame).toHaveStyle({ width: '424px' })
 
-    const trailingEditor = await screen.findByRole('textbox', { name: 'Testo dopo gli allegati' })
+    const trailingEditor = (await screen.findAllByRole('textbox', {
+      name: /Testo info in Markdown/,
+    }))[1]!
     trailingEditor.innerHTML = '<p>Nota dopo immagine</p>'
     fireEvent.input(trailingEditor)
     fireEvent.blur(trailingEditor)
@@ -627,8 +1030,554 @@ describe('board shell', () => {
     })
 
     openSlashMenu(trailingEditor)
-    await user.click(await screen.findByRole('menuitem', { name: 'Documento' }))
-    expect(screen.getByRole('textbox', { name: 'Nome sotto-documento' })).toBeTruthy()
+    await user.click(await screen.findByRole('menuitem', { name: 'Pagina' }))
+    expect(screen.getByRole('textbox', { name: 'Nome sottopagina' })).toBeTruthy()
+  })
+
+  it('resizes an Overview image with pointer capture and persists on pointer up', async () => {
+    const imageId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [
+          { id: crypto.randomUUID(), type: 'text', markdown: 'Prima' },
+          {
+            id: imageId,
+            type: 'file',
+            blob_id: crypto.randomUUID(),
+            file_name: 'schema.png',
+            content_type: 'image/png',
+            plaintext_size: 4,
+            display_width: 400,
+          },
+          { id: crypto.randomUUID(), type: 'text', markdown: 'Dopo' },
+        ],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const resizeHandle = await screen.findByRole('separator', { name: 'Ridimensiona schema.png' })
+    const imageFrame = resizeHandle.parentElement!
+    const imageFigure = imageFrame.parentElement!
+    Object.defineProperty(imageFrame, 'offsetWidth', { configurable: true, value: 400 })
+    Object.defineProperty(imageFigure, 'clientWidth', { configurable: true, value: 800 })
+    vi.spyOn(imageFrame, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 0,
+      top: 0,
+      right: 400,
+      bottom: 300,
+      left: 0,
+      width: 400,
+      height: 300,
+      toJSON: () => ({}),
+    })
+    let capturedPointer: number | undefined
+    Object.defineProperties(resizeHandle, {
+      setPointerCapture: {
+        configurable: true,
+        value: vi.fn((pointerId: number) => { capturedPointer = pointerId }),
+      },
+      hasPointerCapture: {
+        configurable: true,
+        value: vi.fn((pointerId: number) => capturedPointer === pointerId),
+      },
+      releasePointerCapture: {
+        configurable: true,
+        value: vi.fn((pointerId: number) => {
+          if (capturedPointer === pointerId) capturedPointer = undefined
+        }),
+      },
+    })
+
+    fireEvent.pointerDown(resizeHandle, {
+      pointerId: 7,
+      clientX: 400,
+      buttons: 1,
+    })
+    expect(resizeHandle.setPointerCapture).toHaveBeenCalledWith(7)
+    expect(document.body.style.userSelect).toBe('none')
+    expect(document.body.style.cursor).toBe('nwse-resize')
+    fireEvent.pointerMove(resizeHandle, {
+      pointerId: 7,
+      clientX: 520,
+      buttons: 1,
+    })
+    await waitFor(() => expect(imageFrame).toHaveStyle({ width: '520px' }))
+    expect(onUpdateInfoDocument).not.toHaveBeenCalled()
+
+    fireEvent.pointerUp(resizeHandle, {
+      pointerId: 7,
+      clientX: 520,
+      buttons: 0,
+    })
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(1))
+    expect(onUpdateInfoDocument.mock.calls[0]?.[1].blocks.find(
+      (block) => block.id === imageId,
+    )).toMatchObject({
+      type: 'file',
+      display_width: 520,
+    })
+    expect(resizeHandle.releasePointerCapture).toHaveBeenCalledWith(7)
+    expect(document.body.style.userSelect).toBe('')
+    expect(document.body.style.cursor).toBe('')
+  })
+
+  it('renders text, files and pages in their exact persisted block order', async () => {
+    const textBeforeId = crypto.randomUUID()
+    const fileId = crypto.randomUUID()
+    const textMiddleId = crypto.randomUUID()
+    const pageId = crypto.randomUUID()
+    const textAfterId = crypto.randomUUID()
+    const childId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [
+          { id: textBeforeId, type: 'text', markdown: 'Prima' },
+          {
+            id: fileId,
+            type: 'file',
+            blob_id: crypto.randomUUID(),
+            file_name: 'intermedio.pdf',
+            content_type: 'application/pdf',
+            plaintext_size: 4,
+          },
+          { id: textMiddleId, type: 'text', markdown: 'In mezzo' },
+          { id: pageId, type: 'document', document_id: childId, title: 'Pagina interna' },
+          { id: textAfterId, type: 'text', markdown: 'Dopo' },
+        ],
+      },
+    }
+    const child: DecryptedInfoDocument = {
+      ...projectRoot,
+      wire: { ...projectRoot.wire, id: childId, parent_document_id: projectRoot.wire.id },
+      document: { schema: 1, title: 'Pagina interna', blocks: [] },
+    }
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot, child])}
+      />,
+    )
+
+    const flow = await screen.findByTestId('overview-block-flow')
+    expect(Array.from(flow.children).map((element) => (
+      (element as HTMLElement).dataset.blockId
+    ))).toEqual([textBeforeId, fileId, textMiddleId, pageId, textAfterId])
+    expect(screen.getByRole('button', { name: 'Sposta Pagina interna' })).toHaveAttribute('draggable', 'true')
+  })
+
+  it('writes inside an open Collapse and restores its persisted closed state', async () => {
+    const textId = crypto.randomUUID()
+    let persisted: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{
+          id: textId,
+          type: 'text',
+          markdown: ':::collapse Sezione\nContenuto',
+        }],
+      },
+    }
+    const onLoadProjectInfo = vi.fn(async () => [persisted])
+    let delayClosedSave = false
+    let releaseClosedSave: (() => void) | undefined
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, content: InfoDocumentContent) => {
+        const closesChapter = content.blocks.some((block) => (
+          block.type === 'text' && block.markdown.includes(':::collapse[closed] Sezione')
+        ))
+        if (delayClosedSave && closesChapter) {
+          await new Promise<void>((resolve) => { releaseClosedSave = resolve })
+        }
+        persisted = {
+          ...current,
+          wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+          document: content,
+        }
+        return persisted
+      },
+    )
+    const props = {
+      ...baseProps,
+      boardFocus: { type: 'generali' as const },
+      onLoadProjectInfo,
+      onUpdateInfoDocument,
+    }
+    const view = render(<TasksScreen {...props} boardViewMode="overview" />)
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    const headingText = editor.querySelector<HTMLElement>(
+      '[data-md-kind="collapse"] [data-task-text]',
+    )
+    const textNode = headingText?.firstChild
+    expect(textNode?.nodeType).toBe(Node.TEXT_NODE)
+    const range = document.createRange()
+    range.setStart(textNode!, textNode!.textContent?.length ?? 0)
+    range.collapse(true)
+    window.getSelection()?.removeAllRanges()
+    window.getSelection()?.addRange(range)
+
+    fireEvent.keyDown(editor, { key: 'Enter' })
+
+    expect(editor.querySelectorAll('[data-md-kind="collapse"]')).toHaveLength(1)
+    expect(editor.querySelector('[data-md-kind="collapse"]')?.nextElementSibling?.tagName).toBe('P')
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalled())
+
+    delayClosedSave = true
+    fireEvent.click(screen.getByRole('button', { name: 'Comprimi capitolo' }))
+    await waitFor(() => {
+      expect(onUpdateInfoDocument.mock.calls.some((call) => call[1].blocks.some(
+        (block) => block.type === 'text' && block.markdown.includes(':::collapse[closed] Sezione'),
+      ))).toBe(true)
+    })
+
+    window.sessionStorage.clear()
+    view.rerender(<TasksScreen {...props} boardViewMode="board" />)
+    view.rerender(<TasksScreen {...props} boardViewMode="overview" />)
+
+    expect(await screen.findByRole('button', { name: 'Espandi capitolo' })).toBeTruthy()
+    releaseClosedSave?.()
+    await waitFor(() => {
+      const text = persisted.document.blocks.find(
+        (block) => block.id === textId && block.type === 'text',
+      )
+      expect(text).toMatchObject({
+        type: 'text',
+        markdown: expect.stringContaining(':::collapse[closed] Sezione'),
+      })
+    })
+  })
+
+  it('creates a page at the selected line instead of appending it after the document', async () => {
+    const user = userEvent.setup()
+    const textId = crypto.randomUUID()
+    const childId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{ id: textId, type: 'text', markdown: 'Prima\nDopo' }],
+      },
+    }
+    const child: DecryptedInfoDocument = {
+      ...projectRoot,
+      wire: {
+        ...projectRoot.wire,
+        id: childId,
+        parent_document_id: projectRoot.wire.id,
+      },
+      document: { schema: 1, title: 'Pagina centrale', blocks: [] },
+    }
+    let version = projectRoot.wire.payload_version
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: ++version },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onCreateProjectInfoDocument={vi.fn().mockResolvedValue(child)}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    expect(editor.children.length).toBeGreaterThanOrEqual(2)
+    openSlashMenuBefore(editor, editor.children[1]!)
+    await user.click(await screen.findByRole('menuitem', { name: 'Pagina' }))
+    await user.type(screen.getByRole('textbox', { name: 'Nome sottopagina' }), 'Pagina centrale')
+    await user.click(screen.getByRole('button', { name: 'Crea' }))
+
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(2))
+    const lastContent = onUpdateInfoDocument.mock.calls.at(-1)?.[1]
+    expect(lastContent?.blocks.map((block) => block.type)).toEqual([
+      'text', 'document', 'text',
+    ])
+    expect(lastContent?.blocks[0]).toMatchObject({ id: textId, markdown: 'Prima' })
+    expect(lastContent?.blocks[1]).toMatchObject({
+      type: 'document',
+      document_id: childId,
+      title: 'Pagina centrale',
+    })
+    expect(lastContent?.blocks[2]).toMatchObject({ type: 'text', markdown: 'Dopo' })
+  })
+
+  it('keeps edits from multiple text blocks around a page in the same saved snapshot', async () => {
+    const firstId = crypto.randomUUID()
+    const pageId = crypto.randomUUID()
+    const secondId = crypto.randomUUID()
+    const childId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [
+          { id: firstId, type: 'text', markdown: 'Prima' },
+          { id: pageId, type: 'document', document_id: childId, title: 'Pagina' },
+          { id: secondId, type: 'text', markdown: 'Dopo' },
+        ],
+      },
+    }
+    const child: DecryptedInfoDocument = {
+      ...projectRoot,
+      wire: { ...projectRoot.wire, id: childId, parent_document_id: projectRoot.wire.id },
+      document: { schema: 1, title: 'Pagina', blocks: [] },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot, child])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const editors = await screen.findAllByRole('textbox', { name: /Testo info in Markdown/ })
+    editors[0]!.innerHTML = '<p>Prima modificata</p>'
+    fireEvent.input(editors[0]!)
+    fireEvent.blur(editors[0]!)
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(1))
+
+    const currentEditors = screen.getAllByRole('textbox', { name: /Testo info in Markdown/ })
+    currentEditors[1]!.innerHTML = '<p>Dopo modificato</p>'
+    fireEvent.input(currentEditors[1]!)
+    fireEvent.blur(currentEditors[1]!)
+
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(2))
+    expect(onUpdateInfoDocument.mock.calls[1]?.[1].blocks).toEqual([
+      { id: firstId, type: 'text', markdown: 'Prima modificata' },
+      { id: pageId, type: 'document', document_id: childId, title: 'Pagina' },
+      { id: secondId, type: 'text', markdown: 'Dopo modificato' },
+    ])
+  })
+
+  it('chains simultaneous Overview saves from the latest returned payload version', async () => {
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+        payload_version: 1,
+      },
+      document: {
+        schema: 1,
+        title: 'Titolo iniziale',
+        blocks: [{ id: crypto.randomUUID(), type: 'text', markdown: 'Prima' }],
+      },
+    }
+    const releases: Array<() => void> = []
+    const onUpdateInfoDocument = vi.fn(
+      (current: DecryptedInfoDocument, document: InfoDocumentContent) => (
+        new Promise<DecryptedInfoDocument>((resolve) => {
+          releases.push(() => resolve({
+            ...current,
+            wire: {
+              ...current.wire,
+              payload_version: current.wire.payload_version + 1,
+            },
+            document,
+          }))
+        })
+      ),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    editor.innerHTML = '<p>Autosave</p>'
+    fireEvent.input(editor)
+    fireEvent.blur(editor)
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(1))
+
+    const title = screen.getByRole('textbox', { name: 'Titolo Overview' })
+    fireEvent.change(title, { target: { value: 'Titolo simultaneo' } })
+    fireEvent.blur(title)
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+    expect(onUpdateInfoDocument).toHaveBeenCalledTimes(1)
+
+    releases[0]!()
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(2))
+    expect(onUpdateInfoDocument.mock.calls[1]?.[0].wire.payload_version).toBe(2)
+    releases[1]!()
+    await waitFor(() => {
+      expect(onUpdateInfoDocument.mock.calls[1]?.[1]).toEqual(expect.objectContaining({
+        title: 'Titolo simultaneo',
+      }))
+    })
+  })
+
+  it('preserves the latest content through queued autosave, upload link and resize', async () => {
+    const uploadedFileId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+        payload_version: 1,
+      },
+      document: {
+        schema: 1,
+        blocks: [{ id: crypto.randomUUID(), type: 'text', markdown: 'Prima' }],
+      },
+    }
+    const releases: Array<() => void> = []
+    const onUpdateInfoDocument = vi.fn(
+      (current: DecryptedInfoDocument, document: InfoDocumentContent) => (
+        new Promise<DecryptedInfoDocument>((resolve) => {
+          releases.push(() => resolve({
+            ...current,
+            wire: {
+              ...current.wire,
+              payload_version: current.wire.payload_version + 1,
+            },
+            document,
+          }))
+        })
+      ),
+    )
+    const onUploadInfoDocumentFile = vi.fn().mockResolvedValue({
+      id: uploadedFileId,
+      type: 'file',
+      blob_id: crypto.randomUUID(),
+      file_name: 'schema.png',
+      content_type: 'image/png',
+      plaintext_size: 4,
+    })
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+        onUploadInfoDocumentFile={onUploadInfoDocumentFile}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    editor.innerHTML = '<p>Autosave più recente</p>'
+    fireEvent.input(editor)
+    fireEvent.blur(editor)
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(1))
+
+    openSlashMenu(editor)
+    fireEvent.pointerDown(await screen.findByRole('menuitem', { name: 'Immagine' }))
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')
+    fireEvent.change(fileInput!, {
+      target: { files: [new File(['test'], 'schema.png', { type: 'image/png' })] },
+    })
+    await waitFor(() => expect(onUploadInfoDocumentFile).toHaveBeenCalledTimes(1))
+
+    const resizeHandle = await screen.findByRole('separator', { name: 'Ridimensiona schema.png' })
+    const imageFrame = resizeHandle.parentElement!
+    const imageFigure = imageFrame.parentElement!
+    Object.defineProperty(imageFrame, 'offsetWidth', { configurable: true, value: 400 })
+    Object.defineProperty(imageFigure, 'clientWidth', { configurable: true, value: 800 })
+    fireEvent.mouseEnter(imageFrame)
+    expect(screen.getByRole('separator', { name: 'Ridimensiona schema.png' })).toBe(resizeHandle)
+    fireEvent.keyDown(resizeHandle, { key: 'ArrowRight' })
+    expect(imageFrame).toHaveStyle({ width: '424px' })
+
+    for (let callIndex = 0; callIndex < 4; callIndex += 1) {
+      await waitFor(() => expect(releases.length).toBe(callIndex + 1))
+      releases[callIndex]!()
+    }
+    await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalledTimes(4))
+
+    expect(onUpdateInfoDocument.mock.calls.map((call) => call[0].wire.payload_version))
+      .toEqual([1, 2, 3, 4])
+    const lastContent = onUpdateInfoDocument.mock.calls.at(-1)?.[1]
+    expect(lastContent?.blocks.some((block) => (
+      block.type === 'text' && block.markdown === 'Autosave più recente'
+    ))).toBe(true)
+    expect(lastContent?.blocks.find((block) => block.id === uploadedFileId)).toMatchObject({
+      type: 'file',
+      file_name: 'schema.png',
+      display_width: 424,
+    })
   })
 
   it('uses the document path to return from an Overview child document', async () => {
@@ -676,9 +1625,10 @@ describe('board shell', () => {
 
     const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
     openSlashMenu(editor)
-    await user.click(await screen.findByRole('menuitem', { name: 'Documento' }))
-    await user.type(screen.getByRole('textbox', { name: 'Nome sotto-documento' }), 'Specifica')
+    await user.click(await screen.findByRole('menuitem', { name: 'Pagina' }))
+    await user.type(screen.getByRole('textbox', { name: 'Nome sottopagina' }), 'Specifica')
     await user.click(screen.getByRole('button', { name: 'Crea' }))
+    await user.click(await screen.findByRole('button', { name: 'Specifica' }))
 
     const path = await screen.findByRole('navigation', { name: 'Percorso documenti' })
     expect(within(path).getByRole('button', { name: 'Specifica' })).toBeDisabled()

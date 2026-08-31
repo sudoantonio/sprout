@@ -1321,63 +1321,79 @@ const App = ({ apiClient, initialSession }: AppProps) => {
 
   const retryDevKeyRestore = async () => {
     if (!services || !state.session) return
-    const identityId = state.session.identity_id
-    services.auth.vault.ensureIdentityId(identityId)
-    const purged = purgeZeroDevResourceKeys()
-    const restored = await restoreAllDevResourceKeys(services.auth.vault)
-    persistDevVault(state.session, services.auth.vault)
-    const projects = await api.listProjects()
-    const hydrated = await Promise.all(
-      projects.map((project) =>
-        hydrateServerProject(api, services, project, identityId),
-      ),
-    )
-    dispatch({ type: 'set-projects', projects: hydrated })
-
-    // Decrypt topics immediately with the restored keys (don't wait on effects).
-    if (state.selectedProjectId) {
-      const { topics } = await api.listTopics(state.selectedProjectId)
-      const topicItems: TopicItem[] = []
-      for (const topic of topics) {
-        await putRestRecord(services.database, topicRecord(topic))
-        try {
-          topicItems.push({
-            wire: topic,
-            document: await decryptTopic(topic, services.auth.vault),
-          })
-        } catch (error) {
-          topicItems.push({ wire: topic, lockedReason: asLockedReason(error) })
-        }
-      }
-      dispatch({ type: 'set-topics', topics: topicItems })
-      const coverage = countBackupHitsForResources(
-        topicItems.map((topic) => ({
-          resourceId: topic.wire.resource_node_id,
-          epoch: topic.wire.key_epoch,
-          needsBody: topic.wire.payload != null,
-        })),
+    try {
+      const identityId = state.session.identity_id
+      services.auth.vault.ensureIdentityId(identityId)
+      const purged = purgeZeroDevResourceKeys()
+      const restored = await restoreAllDevResourceKeys(services.auth.vault)
+      persistDevVault(state.session, services.auth.vault)
+      const projects = await api.listProjects()
+      const hydrated = await Promise.all(
+        projects.map((project) =>
+          hydrateServerProject(api, services, project, identityId),
+        ),
       )
-      const stillLocked = topicItems.filter((topic) => !topic.document).length
-      const firstReason = topicItems.find((topic) => topic.lockedReason)
-        ?.lockedReason
-      dispatch({
-        type: 'set-notice',
-        message:
-          `Purged=${purged}, restored=${restored}, exact-hits=${coverage.hits}/${topicItems.length} (epochMiss=${coverage.epochMiss}, purposeMiss=${coverage.purposeMiss}), locked=${stillLocked}.` +
-          (firstReason ? ` Errore: ${firstReason}` : '') +
-          (stillLocked === 0
-            ? ' Board sbloccata: gli slot recuperati sono stati salvati automaticamente.'
-            : ' Nessuna chiave locale disponibile ha autenticato questi ciphertext; serve il vault del device originale o una recovery envelope valida.'),
-      })
-    } else {
-      dispatch({
-        type: 'set-notice',
-        message: hasDevResourceKeyBackup(identityId)
-          ? `Purged=${purged}, ripristinate ${restored} chiavi vive. Nessun progetto selezionato.`
-          : `Purged=${purged}. Nessun backup chiavi vive in questo browser.`,
-      })
+      dispatch({ type: 'set-projects', projects: hydrated })
+
+      // Decrypt topics immediately with the restored keys (don't wait on effects).
+      if (state.selectedProjectId) {
+        const { topics } = await api.listTopics(state.selectedProjectId)
+        const topicItems: TopicItem[] = []
+        for (const topic of topics) {
+          await putRestRecord(services.database, topicRecord(topic))
+          try {
+            topicItems.push({
+              wire: topic,
+              document: await decryptTopic(topic, services.auth.vault),
+            })
+          } catch (error) {
+            topicItems.push({ wire: topic, lockedReason: asLockedReason(error) })
+          }
+        }
+        dispatch({ type: 'set-topics', topics: topicItems })
+        const coverage = countBackupHitsForResources(
+          topicItems.map((topic) => ({
+            resourceId: topic.wire.resource_node_id,
+            epoch: topic.wire.key_epoch,
+            needsBody: topic.wire.payload != null,
+          })),
+        )
+        const stillLocked = topicItems.filter((topic) => !topic.document).length
+        const firstReason = topicItems.find((topic) => topic.lockedReason)
+          ?.lockedReason
+        dispatch({
+          type: 'set-notice',
+          message:
+            `Purged=${purged}, restored=${restored}, exact-hits=${coverage.hits}/${topicItems.length} (epochMiss=${coverage.epochMiss}, purposeMiss=${coverage.purposeMiss}), locked=${stillLocked}.` +
+            (firstReason ? ` Errore: ${firstReason}` : '') +
+            (stillLocked === 0
+              ? ' Board sbloccata: gli slot recuperati sono stati salvati automaticamente.'
+              : ' Nessuna chiave locale disponibile ha autenticato questi ciphertext; serve il vault del device originale o una recovery envelope valida.'),
+        })
+      } else {
+        dispatch({
+          type: 'set-notice',
+          message: hasDevResourceKeyBackup(identityId)
+            ? `Purged=${purged}, ripristinate ${restored} chiavi vive. Nessun progetto selezionato.`
+            : `Purged=${purged}. Nessun backup chiavi vive in questo browser.`,
+        })
+      }
+      setBoardReloadToken((token) => token + 1)
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        clearDevSession()
+        services.wake.stop()
+        services.sync.clearMemory()
+        services.auth.logout()
+        dispatch({ type: 'logout' })
+        dispatch({
+          type: 'set-notice',
+          message: 'Sessione server scaduta. Accedi di nuovo prima di ripristinare le chiavi.',
+        })
+        return
+      }
+      dispatch({ type: 'set-error', message: errorMessage(error) })
     }
-    setBoardReloadToken((token) => token + 1)
   }
 
   const lockedBoardReason = useMemo(() => {

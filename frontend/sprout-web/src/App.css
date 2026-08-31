@@ -1149,10 +1149,12 @@ span.agent-stage-avatar.member-stage-avatar {
 .board-ai-badge {
   position: fixed;
   z-index: 90;
-  right: 0;
-  bottom: 0;
+  top: auto;
+  right: 1.3rem;
+  bottom: 2.3rem;
   display: flex;
   width: min(34rem, calc(100vw - 2.5rem));
+  max-height: calc(100vh - 1.5rem);
   min-height: 17rem;
   flex-direction: column;
   border: 1px solid var(--border-neutral);
@@ -1418,8 +1420,9 @@ span.agent-stage-avatar.member-stage-avatar {
 
 @media (max-width: 850px) {
   .board-ai-badge {
-    right: 0.75rem;
-    bottom: 0.75rem;
+    top: auto;
+    right: 1.3rem;
+    bottom: 2.3rem;
     width: calc(100vw - 1.5rem);
     min-height: 14rem;
   }
@@ -6550,14 +6553,108 @@ span.task-create-pill-btn {
 }
 
 .board-overview .tasklist-info-panel--overview {
+  position: relative;
+  z-index: 20;
+  isolation: isolate;
   gap: 0;
   width: min(100%, 48rem);
   max-width: 48rem;
   margin: 0 auto;
   padding: 0;
+  overflow: visible;
+}
+
+.board-overview .tasklist-info-panel--overview > :not(.tasklist-info-overview-checkpoints) {
+  position: relative;
+  z-index: 1;
+}
+
+.board-secondary-view-panel:has(> .tasklist-info-overview-checkpoints),
+.board-overview-document:has(> .tasklist-info-overview-checkpoints) {
+  position: relative;
+}
+
+.tasklist-info-overview-checkpoints {
+  position: absolute;
+  z-index: 100;
+  top: 50%;
+  left: 0.75rem;
+  width: 0;
+  height: 0;
+  margin: 0;
+  overflow: visible;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.tasklist-info-overview-checkpoints > div {
+  display: flex;
+  width: 2rem;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+  pointer-events: auto;
+}
+
+.tasklist-info-overview-checkpoints button {
+  position: relative;
+  width: 0.65rem;
+  height: 2px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--text-primary) 44%, transparent);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.14s ease;
+}
+
+.tasklist-info-overview-checkpoints button::after {
+  position: absolute;
+  content: '';
+  inset: -0.45rem;
+}
+
+.tasklist-info-overview-checkpoints button::before {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  left: calc(100% + 0.75rem);
+  content: attr(data-label);
+  opacity: 0;
+  border: 1px solid var(--border-neutral);
+  border-radius: 0.55rem;
+  background: var(--surface-card);
+  box-shadow: var(--shadow-soft);
+  color: var(--text-primary);
+  padding: 0.48rem 0.72rem;
+  font-size: 0.875rem;
+  font-weight: 550;
+  line-height: 1.2;
+  pointer-events: none;
+  transform: translateY(-50%) translateX(-0.2rem);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  white-space: nowrap;
+}
+
+.tasklist-info-overview-checkpoints button:hover::before,
+.tasklist-info-overview-checkpoints button:focus-visible::before {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
+
+.tasklist-info-overview-checkpoints button:hover,
+.tasklist-info-overview-checkpoints button:focus-visible {
+  background: color-mix(in srgb, var(--text-primary) 58%, transparent);
+  outline: 0;
+}
+
+.tasklist-info-overview-checkpoints button.is-active {
+  background: color-mix(in srgb, var(--text-primary) 88%, transparent);
 }
 
 .tasklist-info-overview-title {
+  scroll-margin-top: 5rem;
   width: 100%;
   min-height: 0;
   margin: 0 0 1rem;
@@ -6611,6 +6708,27 @@ span.task-create-pill-btn {
   padding-left: var(--tasklist-info-block-gutter);
 }
 
+.tasklist-info-flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  width: 100%;
+  min-width: 0;
+}
+
+.tasklist-info-flow > .tasklist-info-content-block,
+.tasklist-info-flow > .tasklist-info-flow-text {
+  width: 100%;
+  min-width: 0;
+}
+
+.tasklist-info-flow > [hidden] {
+  display: none;
+}
+
+.tasklist-info-flow-text {
+  min-height: 2.2rem;
+}
+
 .board-overview .tasklist-info-overview-editor {
   position: relative;
   min-height: 2.2rem;
@@ -6635,15 +6753,23 @@ span.task-create-pill-btn {
   box-shadow: none;
 }
 
-.board-overview .tasklist-info-overview-editor:empty::before,
-.board-overview .tasklist-info-overview-editor:has(> p:only-child > br:only-child)::before {
+.board-overview .tasklist-info-overview-editor:not([data-show-prompt='false']):empty::before,
+.board-overview .tasklist-info-overview-editor > [data-overview-prompt='true']::before {
   content: attr(data-placeholder);
-  position: absolute;
-  top: 0.25rem;
-  left: 0;
   color: var(--text-muted);
   opacity: 0.72;
   pointer-events: none;
+}
+
+.board-overview .tasklist-info-overview-editor:not([data-show-prompt='false']):empty::before {
+  position: absolute;
+  top: 0.25rem;
+  left: 0;
+}
+
+.board-overview .tasklist-info-overview-editor > [data-overview-prompt='true']::before {
+  display: inline;
+  font-weight: 650;
 }
 
 .board-overview .tasklist-info-overview-editor > :first-child {
@@ -6655,9 +6781,71 @@ span.task-create-pill-btn {
   margin: 0 0 0.35rem;
 }
 
+.tasklist-info-text-drop-line {
+  position: absolute;
+  z-index: 6;
+  right: 0;
+  left: var(--tasklist-info-block-gutter);
+  height: 2px;
+  background: var(--accent-action);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-action) 20%, transparent);
+  pointer-events: none;
+}
+
+.tasklist-info-text-format-toolbar {
+  position: absolute;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  gap: 0.12rem;
+  width: max-content;
+  min-height: 2.75rem;
+  border: 1px solid var(--border-neutral);
+  border-radius: var(--radius-card);
+  background: var(--surface-card);
+  box-shadow: 0 8px 22px rgb(15 23 42 / 16%);
+  padding: 0.28rem 0.4rem;
+  transform: translateX(-50%);
+}
+
+.tasklist-info-text-format-toolbar--portal {
+  position: fixed;
+  z-index: 10020;
+  max-width: calc(100vw - 1.5rem);
+}
+
+.tasklist-info-text-format-toolbar button {
+  display: grid;
+  min-width: 2.15rem;
+  height: 2.15rem;
+  place-items: center;
+  border: 0;
+  border-radius: 0.42rem;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 1.05rem;
+  padding: 0 0.45rem;
+}
+
+.tasklist-info-text-format-toolbar button:hover,
+.tasklist-info-text-format-toolbar button:focus-visible {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+  outline: 0;
+}
+
+.tasklist-info-text-format-toolbar strong,
+.tasklist-info-text-format-toolbar em,
+.tasklist-info-text-format-toolbar s,
+.tasklist-info-text-format-toolbar u {
+  font-size: 1.28rem;
+}
+
 .board-overview
   .tasklist-info-overview-editor
-  > p:last-child:not(:only-child):has(> br:only-child)::before,
+  > p:last-child:not(:only-child):has(> [data-task-text] > br:only-child)::before,
 .board-overview
   .tasklist-info-overview-editor
   > p:last-child:not(:only-child):empty::before {
@@ -6675,6 +6863,27 @@ span.task-create-pill-btn {
 .board-overview .tasklist-info-overview-editor h3 {
   color: var(--text-primary);
   letter-spacing: -0.025em;
+}
+
+.board-overview .tasklist-info-overview-editor blockquote {
+  margin: 0.45rem 0;
+  border-left: 3px solid var(--border-neutral);
+  padding-left: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.board-overview .tasklist-info-overview-editor pre,
+.board-overview .tasklist-info-overview-editor code {
+  max-width: 100%;
+  white-space: break-spaces;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.board-overview .tasklist-info-overview-editor pre {
+  width: 100%;
+  margin: 0.4rem 0;
+  overflow: hidden;
 }
 
 .board-overview .tasklist-info-overview-editor h1 {
@@ -6699,6 +6908,53 @@ span.task-create-pill-btn {
   position: relative;
   margin: 0.1rem 0;
   padding-left: 1.75rem;
+}
+
+.tasklist-info-overview-collapse {
+  position: relative;
+  scroll-margin-top: 5rem;
+  margin: 0.55rem 0 0.3rem;
+  color: var(--text-primary);
+  font-weight: 650;
+}
+
+.tasklist-info-overview-collapse-toggle {
+  position: absolute;
+  top: 50%;
+  left: -1.6rem;
+  display: grid;
+  width: 1.35rem;
+  height: 1.35rem;
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+  padding: 0;
+  transform: translateY(-50%);
+}
+
+.tasklist-info-overview-collapse-toggle:hover,
+.tasklist-info-overview-collapse-toggle:focus-visible,
+.tasklist-info-overview-collapse[data-collapsed='true']
+  > .tasklist-info-overview-collapse-toggle {
+  background: transparent;
+  color: var(--accent-action);
+  outline: 0;
+}
+
+.tasklist-info-overview-editor > .is-collapsed-by-chapter {
+  display: none;
+}
+
+.tasklist-info-block-icon--collapse {
+  font-size: 1.05rem;
+  font-weight: 750;
 }
 
 .tasklist-info-overview-bullet::before {
@@ -6766,6 +7022,10 @@ span.task-create-pill-btn {
     var(--shadow-popover);
   padding: 0.4rem;
   transform: translateY(calc(-100% - 0.35rem));
+}
+
+.tasklist-info-block-inserter.is-below .tasklist-info-block-menu {
+  transform: translateY(2rem);
 }
 
 .tasklist-info-block-menu button {
@@ -9727,31 +9987,41 @@ span.task-create-pill-btn {
 }
 
 .tasklist-info-markdown code {
+  max-width: 100%;
   border-radius: 0.3rem;
   background: var(--surface-hover);
   padding: 0.12rem 0.32rem;
   color: var(--text-board);
   font-family: var(--mono);
   font-size: 0.88em;
+  white-space: break-spaces;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .tasklist-info-markdown pre {
-  overflow: auto;
+  max-width: 100%;
+  overflow: hidden;
   border: 1px solid var(--border-neutral);
   border-radius: var(--radius-card);
   background: color-mix(in srgb, var(--surface-hover) 72%, var(--surface-card));
   padding: 0.9rem 1rem;
   tab-size: 2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .tasklist-info-markdown pre code {
   display: block;
-  min-width: max-content;
+  width: 100%;
+  min-width: 0;
   border-radius: 0;
   background: transparent;
   padding: 0;
   font-size: 0.84rem;
   line-height: 1.55;
+  white-space: inherit;
 }
 
 .tasklist-info-markdown .hljs-comment,
@@ -9860,8 +10130,19 @@ span.task-create-pill-btn {
   gap: 0.55rem;
 }
 
+.tasklist-info-content-block {
+  position: relative;
+  min-width: 0;
+}
+
+.tasklist-info-content-block.is-selected .tasklist-info-image-frame {
+  outline: 2px solid var(--accent-action);
+  outline-offset: 2px;
+}
+
 .tasklist-info-file,
-.tasklist-info-documents button {
+.tasklist-info-documents button,
+.tasklist-info-document-link {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
@@ -9879,12 +10160,116 @@ span.task-create-pill-btn {
 .tasklist-info-file {
   position: relative;
   display: flex;
+  min-height: 1.9rem;
   align-items: center;
   gap: 0.45rem;
   border: 0;
   border-radius: 0;
   background: transparent;
+  padding: 0 2rem;
+}
+
+.tasklist-info-document-row {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.tasklist-info-document-link {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-color: color-mix(in srgb, var(--text-primary) 12%, var(--border-neutral));
+  background: color-mix(in srgb, var(--text-primary) 4%, var(--surface-card));
+  box-shadow: 0 2px 6px rgb(15 23 42 / 7%);
+  padding-right: 4.6rem;
+  padding-left: 2.8rem;
+  cursor: pointer;
+}
+
+.tasklist-info-document-drag-handle {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  left: 0.55rem;
+  opacity: 0;
+  transform: translateY(-50%);
+}
+
+.tasklist-info-document-row:hover .tasklist-info-document-drag-handle,
+.tasklist-info-document-drag-handle:focus-visible {
+  opacity: 1;
+}
+
+.tasklist-info-document-actions {
+  position: absolute;
+  top: 50%;
+  right: 0.55rem;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: opacity 0.15s ease;
+}
+
+.tasklist-info-document-row:hover .tasklist-info-document-actions,
+.tasklist-info-document-row:focus-within .tasklist-info-document-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.tasklist-info-document-action,
+.tasklist-info-document-actions .tasklist-info-block-remove {
+  display: inline-grid;
+  width: 1.6rem;
+  height: 1.6rem;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--surface-card) 90%, transparent);
+  box-shadow: 0 1px 4px rgb(15 23 42 / 14%);
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 1;
   padding: 0;
+}
+
+.tasklist-info-document-action:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.tasklist-info-document-action svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+
+.tasklist-info-document-rename {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.55rem;
+  border: 1px solid color-mix(in srgb, var(--accent-action) 42%, var(--border-neutral));
+  border-radius: var(--radius-button);
+  background: color-mix(in srgb, var(--text-primary) 4%, var(--surface-card));
+  box-shadow: 0 2px 6px rgb(15 23 42 / 7%);
+  padding: 0.7rem 4.6rem 0.7rem 2.8rem;
+}
+
+.tasklist-info-document-rename input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
 }
 
 .tasklist-info-file svg {
@@ -9928,6 +10313,7 @@ span.task-create-pill-btn {
 }
 
 .tasklist-info-image {
+  position: relative;
   display: grid;
   width: 100%;
   gap: 0.45rem;
@@ -9944,6 +10330,15 @@ span.task-create-pill-btn {
   min-width: 8rem;
   max-width: 100%;
   overflow: hidden;
+}
+
+.tasklist-info-image-preview-trigger {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  cursor: zoom-in;
+  padding: 0;
 }
 
 .tasklist-info-block-remove {
@@ -9964,6 +10359,43 @@ span.task-create-pill-btn {
     color 0.15s ease;
 }
 
+.tasklist-info-block-drag-handle {
+  display: inline-grid;
+  width: 1.6rem;
+  height: 1.6rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--surface-card) 86%, transparent);
+  box-shadow: 0 1px 4px rgb(15 23 42 / 18%);
+  color: var(--text-muted);
+  cursor: grab;
+  opacity: 0;
+  touch-action: none;
+  transition:
+    opacity 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.tasklist-info-block-drag-handle:active {
+  cursor: grabbing;
+}
+
+.tasklist-info-block-drag-handle:hover,
+.tasklist-info-block-drag-handle:focus-visible {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+  opacity: 1;
+  outline: 0;
+}
+
+.tasklist-info-block-drag-handle svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+
 .tasklist-info-block-remove svg {
   width: 0.85rem;
   height: 0.85rem;
@@ -9976,18 +10408,36 @@ span.task-create-pill-btn {
 
 .tasklist-info-image-remove {
   position: absolute;
-  top: 0.45rem;
-  right: 0.45rem;
+  top: 0;
+  right: 0;
+}
+
+.tasklist-info-image-drag-handle {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  left: 0;
+}
+
+.tasklist-info-file > .tasklist-info-block-drag-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
 }
 
 .tasklist-info-image-frame:hover .tasklist-info-image-remove,
+.tasklist-info-image:hover > .tasklist-info-image-drag-handle,
 .tasklist-info-block-remove:focus-visible,
-.tasklist-info-file:hover .tasklist-info-file-remove {
+.tasklist-info-file:hover .tasklist-info-file-remove,
+.tasklist-info-file:hover .tasklist-info-block-drag-handle,
+.tasklist-info-block-drag-handle:focus-visible {
   opacity: 1;
 }
 
 .tasklist-info-file-remove {
-  flex: 0 0 auto;
+  position: absolute;
+  top: 0;
+  right: 0;
 }
 
 .tasklist-info-image-frame img {
@@ -10024,6 +10474,62 @@ span.task-create-pill-btn {
   object-fit: contain;
   object-position: left top;
   background: transparent;
+}
+
+.tasklist-info-image-lightbox {
+  position: fixed;
+  z-index: 10000;
+  inset: 0;
+  display: grid;
+  box-sizing: border-box;
+  place-items: center;
+  overflow: hidden;
+  background: rgb(8 12 20 / 92%);
+  padding: 4.5rem 1.5rem 1.5rem;
+}
+
+.tasklist-info-image-lightbox > img {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  user-select: none;
+}
+
+.tasklist-info-image-lightbox-toolbar {
+  position: absolute;
+  z-index: 1;
+  top: 1rem;
+  right: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.tasklist-info-image-lightbox-toolbar button {
+  display: inline-flex;
+  min-height: 2.5rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: var(--radius-control);
+  background: rgb(255 255 255 / 11%);
+  color: #fff;
+  cursor: pointer;
+  padding: 0.55rem 0.8rem;
+}
+
+.tasklist-info-image-lightbox-toolbar button:hover,
+.tasklist-info-image-lightbox-toolbar button:focus-visible {
+  background: rgb(255 255 255 / 18%);
+  outline: 0;
+}
+
+.tasklist-info-image-lightbox-toolbar svg {
+  width: 1rem;
+  height: 1rem;
 }
 
 .tasklist-info-image-placeholder {
@@ -14424,4 +14930,8 @@ span.task-create-pill-btn {
 /* Agent editor opens the shared task-list picker above its modal layer. */
 .task-list-icon-panel {
   z-index: 140;
+}
+::selection {
+  background: color-mix(in srgb, var(--accent-action) 28%, transparent);
+  color: inherit;
 }

@@ -38,7 +38,7 @@ if (typeof HTMLElement !== 'undefined') {
 afterEach(() => {
   cleanup()
   if (typeof window !== 'undefined') {
-    window.localStorage.clear()
-    window.sessionStorage.clear()
+    if (typeof window.localStorage?.clear === 'function') window.localStorage.clear()
+    if (typeof window.sessionStorage?.clear === 'function') window.sessionStorage.clear()
   }
 })
