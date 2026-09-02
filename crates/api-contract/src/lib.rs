@@ -574,6 +574,13 @@ pub struct CreateTaskRequest {
 pub struct UpdateTaskRequest {
     pub expected_payload_version: u64,
     pub key_epoch: u32,
+    #[serde(default)]
+    pub update_task_metadata: bool,
+    #[serde(default)]
+    pub task_kind: Option<TaskKindDto>,
+    pub questionnaire_version_id: Option<Uuid>,
+    pub recurrence_series_id: Option<Uuid>,
+    pub occurrence_number: Option<u64>,
     pub payload: EncryptedPayloadDto,
     pub selected_value_snapshot: EncryptedPayloadDto,
     pub idempotency_key: Uuid,
@@ -696,6 +703,12 @@ pub struct PresetDto {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct CreatePresetRequest {
     pub id: Uuid,
+    pub payload: EncryptedPayloadDto,
+    pub idempotency_key: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct UpdatePresetRequest {
     pub payload: EncryptedPayloadDto,
     pub idempotency_key: Uuid,
 }

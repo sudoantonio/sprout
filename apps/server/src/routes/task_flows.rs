@@ -22,7 +22,7 @@ use sprout_api_contract::{
     PretaskDto, RecurrenceSeriesDto, RecurrenceSeriesResponse, RecurrenceStateDto,
     ResourceEpochInputDto, ResourceKeyEnvelopeDto, TaskDto, TaskKindDto, TaskListDto,
     TaskListResponse, TaskResponse, TaskStateDto, TopicDto, TopicResponse,
-    UpdateEncryptedResourceRequest, UpdateTaskRequest,
+    UpdateEncryptedResourceRequest, UpdatePresetRequest, UpdateTaskRequest,
 };
 use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
@@ -706,7 +706,33 @@ pub async fn update_task(
     .await?;
     let payload = opaque_payload(&request.payload)?;
     let selected = opaque_payload(&request.selected_value_snapshot)?;
+    let (task_kind, questionnaire_version_id, recurrence_series_id, occurrence_number) =
+        if request.update_task_metadata {
+            (
+                request.task_kind.ok_or(AppError::BadRequest(
+                    "task kind is required when updating task metadata",
+                ))?,
+                request.questionnaire_version_id,
+                request.recurrence_series_id,
+                request.occurrence_number,
+            )
+        } else {
+            (
+                parse_task_kind(&current.task_kind)?,
+                current.questionnaire_version_id,
+                current.recurrence_series_id,
+                current.occurrence_number.map(i64_to_u64).transpose()?,
+            )
+        };
+    validate_task_kind_shape(task_kind, recurrence_series_id, occurrence_number)?;
     let mut transaction = begin(&state, actor, project_id).await?;
+    validate_series(
+        &mut transaction,
+        project_id,
+        current.task_list_id,
+        recurrence_series_id,
+    )
+    .await?;
     let query = format!(
         r#"
         UPDATE tasks
@@ -714,6 +740,10 @@ pub async fn update_task(
             encrypted_payload = $3,
             encrypted_value_snapshot = $4,
             key_epoch = $6,
+            task_kind = $7,
+            questionnaire_version_id = $8,
+            recurrence_series_id = $9,
+            occurrence_number = $10,
             payload_version = payload_version + 1
         WHERE project_id = $1 AND id = $2
           AND state = 'open' AND deleted_at IS NULL
@@ -738,6 +768,10 @@ pub async fn update_task(
             i32::try_from(request.key_epoch)
                 .map_err(|_| AppError::BadRequest("invalid key epoch"))?,
         )
+        .bind(task_kind_str(task_kind))
+        .bind(questionnaire_version_id)
+        .bind(recurrence_series_id)
+        .bind(occurrence_number.map(to_i64).transpose()?)
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(AppError::Conflict)?;
@@ -1420,6 +1454,45 @@ pub async fn get_preset(
     .fetch_optional(&mut *transaction)
     .await?
     .ok_or(AppError::NotFound)?;
+    transaction.commit().await?;
+    Ok(Json(PresetResponse {
+        preset: row.try_into()?,
+    }))
+}
+
+pub async fn update_preset(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, preset_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdatePresetRequest>,
+) -> Result<Json<PresetResponse>, AppError> {
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    let payload = opaque_payload(&request.payload)?;
+    let mut transaction = begin(&state, actor, project_id).await?;
+    let row = sqlx::query_as::<_, PresetRow>(
+        r#"
+        UPDATE presets
+        SET encrypted_metadata = $3
+        WHERE project_id = $1 AND id = $2 AND state = 'active'
+        RETURNING id, project_id, encrypted_metadata, created_at, deleted_at
+        "#,
+    )
+    .bind(project_id)
+    .bind(preset_id)
+    .bind(&payload)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    insert_outbox(
+        &mut transaction,
+        project_id,
+        "preset",
+        preset_id,
+        "updated",
+        request.idempotency_key,
+        &payload,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(Json(PresetResponse {
         preset: row.try_into()?,

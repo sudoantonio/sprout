@@ -46,10 +46,12 @@ import {
   resolveTaskListIconColorFromStored,
   TASK_LIST_ICON_COLORS,
   type DecryptedTask,
+  type DecryptedPreset,
   type DecryptedInfoDocument,
   type InfoDocumentContent,
   type InfoFileBlock,
   type TaskCreationInput,
+  type PresetTaskTemplate,
   type TaskDocument,
   type TaskFilter,
   type TaskListColumnColor,
@@ -86,17 +88,20 @@ import {
   FlagIcon,
   LayoutGridIcon,
   LockIcon,
+  MoreVerticalIcon,
   SidebarHomeIcon,
   SidebarUserIcon,
   FolderIcon,
   PaperclipIcon,
   PlusIcon,
+  PresetIcon,
   RepeatIcon,
   UsersIcon,
   SearchIcon,
   SidebarAgentIcon,
   StarIcon,
   TimeHistoryIcon,
+  TrashIcon,
   XIcon,
 } from './icons'
 import {
@@ -133,6 +138,7 @@ export interface TasksScreenProps {
     id: Uuid
     label: string
   }>
+  presets?: DecryptedPreset[]
   filter: TaskFilter
   loading: boolean
   onSelectFocus(focus: BoardFocus): void
@@ -188,6 +194,17 @@ export interface TasksScreenProps {
     file: InfoFileBlock,
   ): Promise<void>
   onCreateTask(input: TaskCreationInput, listId: Uuid): Promise<void>
+  onCreatePreset?(
+    name: string,
+    tasks: PresetTaskTemplate[],
+  ): Promise<DecryptedPreset>
+  onApplyPreset?(preset: DecryptedPreset, listId: Uuid): Promise<void>
+  onUpdatePreset?(
+    preset: DecryptedPreset,
+    name: string,
+    tasks: PresetTaskTemplate[],
+  ): Promise<DecryptedPreset>
+  onDeletePreset?(preset: DecryptedPreset): Promise<void>
   onUpdateTask(
     task: DecryptedTask,
     input: TaskUpdateInput,
@@ -385,6 +402,141 @@ const BoardTaskCard = ({
   )
 }
 
+const PresetLinkCard = ({
+  preset,
+  boardMemberById,
+  onOpen,
+}: {
+  preset: DecryptedPreset
+  boardMemberById: Map<Uuid, BoardMember>
+  onOpen(): void
+}) => {
+  const assignedMembers = [...new Set(
+    (preset.document.tasks ?? [])
+      .map((task) => task.assigneeIdentityId)
+      .filter((identityId): identityId is Uuid => Boolean(identityId)),
+  )]
+    .map((identityId) => boardMemberById.get(identityId))
+    .filter((member): member is BoardMember => Boolean(member))
+
+  return (
+    <article className="board-card board-preset-link-card">
+      <button
+        type="button"
+        className="board-preset-link-main"
+        aria-label={`Apri preset ${preset.document.name}`}
+        onClick={onOpen}
+      >
+        <span className="board-preset-link-icon" aria-hidden>
+          <PresetIcon />
+        </span>
+        <strong>{preset.document.name}</strong>
+      </button>
+      {assignedMembers.length > 0 && (
+        <div className="board-preset-link-assignees">
+          <BoardCardAssignee users={assignedMembers} />
+        </div>
+      )}
+    </article>
+  )
+}
+
+const PresetLinkCards = ({
+  presets,
+  grouped,
+  boardMemberById,
+  onOpen,
+}: {
+  presets: DecryptedPreset[]
+  grouped: boolean
+  boardMemberById: Map<Uuid, BoardMember>
+  onOpen(preset: DecryptedPreset): void
+}) => {
+  if (presets.length === 0) return null
+  const cards = (
+    <ul className="board-cards board-preset-link-cards">
+      {presets.map((preset) => (
+        <li key={preset.wire.id}>
+          <PresetLinkCard
+            preset={preset}
+            boardMemberById={boardMemberById}
+            onOpen={() => onOpen(preset)}
+          />
+        </li>
+      ))}
+    </ul>
+  )
+
+  if (!grouped) return cards
+  return (
+    <div className="board-card-groups board-preset-card-groups">
+      <section className="board-card-group">
+        <div className="board-card-group-heading">
+          <span className="tasklist-history-day-label tasklist-history-day-label--info">
+            Preset
+          </span>
+        </div>
+        {cards}
+      </section>
+    </div>
+  )
+}
+
+const PresetTaskListPage = ({
+  preset,
+  listName,
+  onBack,
+}: {
+  preset: DecryptedPreset
+  listName: string
+  onBack(): void
+}) => (
+  <section className="board-preset-page" aria-label={`Preset ${preset.document.name}`}>
+    <header className="board-preset-page-header">
+      <button
+        type="button"
+        aria-label={`Torna alle task di ${listName}`}
+        onClick={onBack}
+      >
+        <ChevronIcon aria-hidden />
+      </button>
+      <strong>{preset.document.name}</strong>
+    </header>
+    <ul className="board-cards board-preset-task-cards">
+      {(preset.document.tasks ?? []).map((task, index) => (
+        <li key={`${task.title}-${index}`}>
+          <article className="board-card board-preset-task-card">
+            <div className="board-card-top">
+              <span className="board-task-check board-task-check--default" aria-hidden>
+                <span className="board-task-check-dot" />
+              </span>
+              <div className="board-card-content">
+                <div className="board-card-header">
+                  <strong>{task.title}</strong>
+                </div>
+                {task.notes && <span className="board-card-notes">{task.notes}</span>}
+                {(task.taskKind === 'deadline' || task.taskKind === 'recurring') && (
+                  <div className="board-card-footer">
+                    <div className="board-card-footer-start">
+                      <span className="board-card-due">
+                        <ClockIcon className="board-card-due-icon" aria-hidden />
+                        {formatTaskCardDueDate(task.dueAt)}
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </article>
+        </li>
+      ))}
+    </ul>
+    {(preset.document.tasks?.length ?? 0) === 0 && (
+      <p className="inline-empty">Questo preset non contiene task.</p>
+    )}
+  </section>
+)
+
 const TOPIC_ICON_COLORS = TASK_LIST_ICON_COLORS
 
 const memberAvatarColorClass = (identityId: Uuid): string =>
@@ -538,7 +690,7 @@ const BoardColumnHeader = ({
   onCommitEdit(): void
   onToggleIconPicker(): void
   onOpenHistory(): void
-  onAddTask(): void
+  onAddTask(anchor: HTMLButtonElement): void
 }) => {
   const renameInputRef = useRef<HTMLInputElement>(null)
   const listNameLabel = list.document?.name ?? 'Locked list'
@@ -655,7 +807,7 @@ const BoardColumnHeader = ({
         <button
           type="button"
           className="board-add-task"
-          onClick={onAddTask}
+          onClick={(event) => onAddTask(event.currentTarget)}
         >
           <PlusIcon />
           Aggiungi
@@ -692,7 +844,7 @@ const AgentColumnHeader = ({
   onAddTask,
 }: {
   agent: AgentDirectoryItemDto
-  onAddTask(): void
+  onAddTask(anchor: HTMLButtonElement): void
 }) => (
   <header className="board-column-header board-column-header--member">
     <div className="board-column-identity">
@@ -707,7 +859,7 @@ const AgentColumnHeader = ({
       </div>
     </div>
     <div className="board-column-actions">
-      <button type="button" className="board-add-task" onClick={onAddTask}>
+      <button type="button" className="board-add-task" onClick={(event) => onAddTask(event.currentTarget)}>
         <PlusIcon />
         Aggiungi
       </button>
@@ -715,7 +867,7 @@ const AgentColumnHeader = ({
   </header>
 )
 
-const AgentTaskListHeader = ({ onAddTask }: { onAddTask(): void }) => (
+const AgentTaskListHeader = ({ onAddTask }: { onAddTask(anchor: HTMLButtonElement): void }) => (
   <header className="board-column-header board-column-header--member">
     <div className="board-column-identity">
       <span className="board-avatar column member column-sky" aria-hidden>
@@ -726,7 +878,7 @@ const AgentTaskListHeader = ({ onAddTask }: { onAddTask(): void }) => (
       </div>
     </div>
     <div className="board-column-actions">
-      <button type="button" className="board-add-task" onClick={onAddTask}>
+      <button type="button" className="board-add-task" onClick={(event) => onAddTask(event.currentTarget)}>
         <PlusIcon />
         Aggiungi
       </button>
@@ -734,7 +886,7 @@ const AgentTaskListHeader = ({ onAddTask }: { onAddTask(): void }) => (
   </header>
 )
 
-type TaskTypeFilter = 'priority' | 'deadline' | 'recurring'
+type TaskTypeFilter = 'priority' | 'deadline' | 'recurring' | 'preset'
 type TaskStateFilter = 'open' | 'completed'
 type TaskDateFilter = 'overdue' | 'today' | 'upcoming' | 'none'
 
@@ -748,7 +900,9 @@ interface AdvancedTaskFilters {
 
 type TaskFilterGroup = keyof AdvancedTaskFilters
 
-const taskTypeFor = (task: DecryptedTask): TaskTypeFilter =>
+const taskTypeFor = (
+  task: DecryptedTask,
+): Exclude<TaskTypeFilter, 'preset'> =>
   task.document.recurrence
     ? 'recurring'
     : task.document.due_at
@@ -950,6 +1104,7 @@ const BoardColumnFilterBadges = ({
     priority: { label: 'Priorità', tone: 'warning' },
     deadline: { label: 'Scadenza', tone: 'orange' },
     recurring: { label: 'Ricorsività', tone: 'violet' },
+    preset: { label: 'Preset', tone: 'info' },
   }
   const stateMeta: Record<TaskStateFilter, { label: string; tone: string }> = {
     open: { label: 'Da completare', tone: 'info' },
@@ -2259,9 +2414,9 @@ const BoardFilterDropdown = ({
     (count, values) => count + values.length,
     0,
   )
-  const groupingCount =
-    groupBy.length === 1 && groupBy[0] === 'dates' ? 0 : groupBy.length
-  const activeCount = detailedFilterCount + groupingCount
+  // Grouping changes presentation only; it must not inflate the number of
+  // filters that actually exclude tasks.
+  const activeCount = detailedFilterCount
   const requestReset = () => {
     setOpen(false)
     setActiveSection(null)
@@ -2330,6 +2485,7 @@ const BoardFilterDropdown = ({
         ['priority', 'Priorità'],
         ['deadline', 'Scadenza'],
         ['recurring', 'Ricorsività'],
+        ['preset', 'Preset'],
       ],
     },
     {
@@ -2464,7 +2620,9 @@ const BoardFilterDropdown = ({
                               ? 'warning'
                               : value === 'deadline'
                                 ? 'orange'
-                                : 'violet'
+                                : value === 'recurring'
+                                  ? 'violet'
+                                  : 'info'
                             : section.key === 'states'
                               ? value === 'completed'
                                 ? 'success'
@@ -2831,11 +2989,14 @@ const TASK_STATE_LABELS = {
 
 export type TaskUpdateInput = {
   title: string
+  taskKind: TaskKind
   notes?: string
   priority?: TaskDocument['priority']
-  start_at?: string
-  due_at?: string
+  startAt?: string
+  dueAt?: string
   recurrence?: TaskDocument['recurrence']
+  questionnaireVersionId?: Uuid
+  attachmentFiles?: File[]
 }
 
 const toDatetimeLocalValue = (iso?: string): string => {
@@ -3531,6 +3692,7 @@ const TaskDetailPanel = ({
     task.wire.questionnaire_version_id ?? '',
   )
   const [attachmentFiles, setAttachmentFiles] = useState<File[]>([])
+  const [submitting, setSubmitting] = useState(false)
   const taskAttachments = useMemo(
     () =>
       savedAttachments.filter(
@@ -3555,6 +3717,7 @@ const TaskDetailPanel = ({
     (taskKind === 'recurring' &&
       (recurrenceFrequency !== savedRecurrenceFrequency ||
         recurrenceInterval !== savedRecurrenceInterval)) ||
+    questionnaireVersionId !== (task.wire.questionnaire_version_id ?? '') ||
     attachmentFiles.length > 0
   const isOpen = task.wire.state.state === 'open'
   const dueAt = task.document.due_at
@@ -3575,15 +3738,20 @@ const TaskDetailPanel = ({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
+    if (submitting) return
     const input: TaskUpdateInput = {
       title,
+      taskKind,
       notes: notes.trim() || undefined,
+      questionnaireVersionId: questionnaireVersionId || undefined,
+      attachmentFiles:
+        attachmentFiles.length > 0 ? attachmentFiles : undefined,
     }
     if (taskKind === 'priority') {
       input.priority = taskPriority
     }
     if (taskKind === 'deadline' || taskKind === 'recurring') {
-      input.due_at = taskDueAt
+      input.dueAt = taskDueAt
         ? new Date(taskDueAt).toISOString()
         : undefined
     }
@@ -3593,7 +3761,15 @@ const TaskDetailPanel = ({
         interval: Number(recurrenceInterval),
       }
     }
-    await onUpdate(task, input)
+    setSubmitting(true)
+    try {
+      await onUpdate(task, input)
+      setAttachmentFiles([])
+    } catch {
+      // The parent exposes the actionable error in the global notice area.
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   useLayoutEffect(() => {
@@ -3813,8 +3989,12 @@ const TaskDetailPanel = ({
               ) : null}
             </div>
             {isDirty ? (
-              <button type="submit" className="task-create-submit">
-                Salva
+              <button
+                type="submit"
+                className="task-create-submit"
+                disabled={submitting}
+              >
+                {submitting ? 'Salvataggio…' : 'Salva'}
               </button>
             ) : isOpen ? (
               <button
@@ -3843,48 +4023,425 @@ const TaskDetailPanel = ({
   )
 }
 
+const AddContentMenu = ({
+  anchorRect,
+  onTask,
+  onPreset,
+  onClose,
+}: {
+  anchorRect: DOMRect
+  onTask(): void
+  onPreset(): void
+  onClose(): void
+}) => {
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', close)
+    return () => document.removeEventListener('keydown', close)
+  }, [onClose])
+
+  const style: CSSProperties = {
+    left: Math.min(anchorRect.left, window.innerWidth - 228),
+    top: Math.min(anchorRect.bottom + 8, window.innerHeight - 150),
+  }
+  return createPortal(
+    <div className="board-add-menu-layer" onClick={onClose}>
+      <div
+        className="board-add-menu"
+        style={style}
+        role="menu"
+        aria-label="Scegli cosa aggiungere"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <button type="button" role="menuitem" onClick={onTask}>
+          <CircleIcon aria-hidden />
+          <span>Task</span>
+        </button>
+        <button type="button" role="menuitem" onClick={onPreset}>
+          <PresetIcon aria-hidden />
+          <span>Preset</span>
+        </button>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+const toDateTimeLocalValue = (value?: string): string => {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+    .toISOString()
+    .slice(0, 16)
+}
+
+const PresetLibraryPanel = ({
+  presets = [],
+  onSelect,
+  onEdit,
+  onDelete,
+  onCreate,
+  onClose,
+}: {
+  presets: DecryptedPreset[]
+  onSelect(preset: DecryptedPreset): Promise<void>
+  onEdit(preset: DecryptedPreset): void
+  onDelete(preset: DecryptedPreset): Promise<void>
+  onCreate(): void
+  onClose(): void
+}) => {
+  const [applyingId, setApplyingId] = useState<Uuid>()
+  const [deletingId, setDeletingId] = useState<Uuid>()
+  const [favoriteIds, setFavoriteIds] = useState<Set<Uuid>>(() => {
+    try {
+      const stored = window.localStorage.getItem('sprout:preset-favorites')
+      return new Set<Uuid>(stored ? JSON.parse(stored) : [])
+    } catch {
+      return new Set<Uuid>()
+    }
+  })
+  const orderedPresets = useMemo(
+    () => [...presets].sort((left, right) =>
+      Number(favoriteIds.has(right.wire.id)) - Number(favoriteIds.has(left.wire.id))),
+    [favoriteIds, presets],
+  )
+
+  const toggleFavorite = (presetId: Uuid) => {
+    setFavoriteIds((current) => {
+      const next = new Set(current)
+      if (next.has(presetId)) next.delete(presetId)
+      else next.add(presetId)
+      window.localStorage.setItem(
+        'sprout:preset-favorites',
+        JSON.stringify([...next]),
+      )
+      return next
+    })
+  }
+
+  return createPortal(
+    <div className="task-create-overlay" onClick={onClose}>
+      <div className="task-create-backdrop" aria-hidden="true" />
+      <section
+        className="task-create-panel preset-library-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Scegli preset"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="preset-panel-header">
+          <h2>Preset</h2>
+          <button type="button" className="task-create-close" aria-label="Chiudi" onClick={onClose}>×</button>
+        </header>
+        <div className="preset-library-board">
+          <button type="button" className="preset-new-row" onClick={onCreate}>
+            <PlusIcon aria-hidden />
+            <span>Crea preset</span>
+          </button>
+          {orderedPresets.map((preset) => (
+            <div
+              key={preset.wire.id}
+              className={`preset-library-row${favoriteIds.has(preset.wire.id) ? ' is-favorite' : ''}`}
+            >
+              <div className="preset-library-row-actions preset-library-row-actions--leading">
+                <button
+                  type="button"
+                  className="preset-library-action preset-library-favorite"
+                  aria-label={favoriteIds.has(preset.wire.id)
+                    ? `Rimuovi ${preset.document.name} dai preferiti`
+                    : `Aggiungi ${preset.document.name} ai preferiti`}
+                  title={favoriteIds.has(preset.wire.id)
+                    ? 'Rimuovi dai preferiti'
+                    : 'Aggiungi ai preferiti'}
+                  disabled={Boolean(applyingId || deletingId)}
+                  onClick={() => toggleFavorite(preset.wire.id)}
+                >
+                  <StarIcon aria-hidden />
+                </button>
+              </div>
+              <button
+                type="button"
+                className="preset-library-row-main"
+                disabled={Boolean(applyingId || deletingId)}
+                aria-busy={applyingId === preset.wire.id}
+                onClick={() => {
+                  setApplyingId(preset.wire.id)
+                  void onSelect(preset).catch(() => setApplyingId(undefined))
+                }}
+              >
+                <strong>{preset.document.name}</strong>
+              </button>
+              <div className="preset-library-row-actions preset-library-row-actions--trailing">
+                <button
+                  type="button"
+                  className="preset-library-action preset-library-edit"
+                  aria-label={`Modifica ${preset.document.name}`}
+                  title="Modifica preset"
+                  disabled={Boolean(applyingId || deletingId)}
+                  onClick={() => onEdit(preset)}
+                >
+                  <MoreVerticalIcon aria-hidden />
+                </button>
+                <button
+                  type="button"
+                  className="preset-library-action preset-library-delete"
+                  aria-label={`Elimina ${preset.document.name}`}
+                  title="Elimina preset"
+                  disabled={Boolean(applyingId || deletingId)}
+                  onClick={() => {
+                    setDeletingId(preset.wire.id)
+                    void onDelete(preset).finally(() => setDeletingId(undefined))
+                  }}
+                >
+                  <TrashIcon aria-hidden />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>,
+    document.body,
+  )
+}
+
+const PresetEditorPanel = ({
+  list,
+  initialPreset,
+  boardMembers,
+  publishedQuestionnaireVersions,
+  onSave,
+  onBack,
+  onClose,
+}: {
+  list: TaskListItem
+  initialPreset?: DecryptedPreset
+  boardMembers: BoardMember[]
+  publishedQuestionnaireVersions: Array<{ id: Uuid; label: string }>
+  onSave(name: string, tasks: PresetTaskTemplate[]): Promise<void>
+  onBack(): void
+  onClose(): void
+}) => {
+  const [name, setName] = useState(initialPreset?.document.name ?? '')
+  const [tasks, setTasks] = useState<PresetTaskTemplate[]>(
+    () => initialPreset?.document.tasks ?? [],
+  )
+  const [editingTaskIndex, setEditingTaskIndex] = useState<number>()
+  const [taskDraftKey, setTaskDraftKey] = useState(0)
+  const [saving, setSaving] = useState(false)
+
+  const addTemplateTask = async (input: TaskCreationInput) => {
+    const common = {
+      title: input.title,
+      notes: input.notes,
+      questionnaireVersionId: input.questionnaireVersionId,
+      assigneeIdentityId: input.assigneeIdentityId,
+    }
+    const template: PresetTaskTemplate =
+      input.taskKind === 'priority'
+        ? { ...common, taskKind: input.taskKind, priority: input.priority }
+        : input.taskKind === 'deadline'
+          ? { ...common, taskKind: input.taskKind, dueAt: input.dueAt }
+          : {
+              ...common,
+              taskKind: input.taskKind,
+              dueAt: input.dueAt,
+              frequency: input.frequency,
+              interval: input.interval,
+            }
+    setTasks((current) =>
+      editingTaskIndex === undefined
+        ? [...current, template]
+        : current.map((task, index) =>
+            index === editingTaskIndex ? template : task,
+          ),
+    )
+    setEditingTaskIndex(undefined)
+  }
+
+  const editingTask =
+    editingTaskIndex === undefined ? undefined : tasks[editingTaskIndex]
+
+  return createPortal(
+        <div className="task-create-overlay" onClick={onClose}>
+          <div className="task-create-backdrop" aria-hidden="true" />
+          <section className="task-create-panel preset-editor-panel" role="dialog" aria-modal="true" aria-label={initialPreset ? 'Modifica preset' : 'Crea preset'} onClick={(event) => event.stopPropagation()}>
+            <header className="preset-panel-header">
+              <button type="button" className="preset-back-button" aria-label="Torna ai preset" onClick={onBack}>
+                <ChevronIcon aria-hidden />
+              </button>
+              <input className="preset-name-input" value={name} onChange={(event) => setName(event.target.value)} placeholder="Nome preset" aria-label="Nome preset" autoFocus />
+            </header>
+            <div className="preset-editor-board">
+              <CreateTaskPanel
+                key={taskDraftKey}
+                list={list}
+                anchorRect={new DOMRect()}
+                boardMembers={boardMembers}
+                publishedQuestionnaireVersions={publishedQuestionnaireVersions}
+                onCreateTask={addTemplateTask}
+                onDelete={
+                  editingTaskIndex === undefined
+                    ? undefined
+                    : () => {
+                        setTasks((current) =>
+                          current.filter((_, index) => index !== editingTaskIndex),
+                        )
+                        setEditingTaskIndex(undefined)
+                        setTaskDraftKey((current) => current + 1)
+                      }
+                }
+                onCancel={() => {
+                  setEditingTaskIndex(undefined)
+                  setTaskDraftKey((current) => current + 1)
+                }}
+                initialTitle={editingTask?.title}
+                initialNotes={editingTask?.notes}
+                initialTaskKind={editingTask?.taskKind}
+                initialDueAt={
+                  editingTask?.taskKind === 'deadline' ||
+                  editingTask?.taskKind === 'recurring'
+                    ? toDateTimeLocalValue(editingTask.dueAt)
+                    : ''
+                }
+                initialTaskPriority={
+                  editingTask?.taskKind === 'priority'
+                    ? editingTask.priority
+                    : 'normal'
+                }
+                initialRecurrenceFrequency={
+                  editingTask?.taskKind === 'recurring'
+                    ? editingTask.frequency
+                    : 'daily'
+                }
+                initialRecurrenceInterval={
+                  editingTask?.taskKind === 'recurring'
+                    ? String(editingTask.interval)
+                    : '1'
+                }
+                initialQuestionnaireVersionId={editingTask?.questionnaireVersionId}
+                initialAssigneeIdentityId={editingTask?.assigneeIdentityId}
+                submitLabel={editingTask ? 'Salva' : 'Aggiungi'}
+                embedded
+              />
+            </div>
+            <footer className="preset-editor-actions">
+              {tasks.length > 0 ? (
+                <div className="preset-created-task-dots" role="list" aria-label="Task aggiunte al preset">
+                  {tasks.map((task, index) => (
+                    <span className="preset-task-dot-item" role="listitem" key={`${task.title}-${index}`}>
+                      <button
+                        type="button"
+                        className={`board-task-check board-task-check--default${editingTaskIndex === index ? ' is-selected' : ''}`}
+                        aria-label={`${index + 1}. ${task.title}`}
+                        aria-current={editingTaskIndex === index ? 'true' : undefined}
+                        aria-describedby={`preset-task-tooltip-${index}`}
+                        onClick={() => {
+                          setEditingTaskIndex(index)
+                          setTaskDraftKey((current) => current + 1)
+                        }}
+                      >
+                        <span className="board-task-check-dot" />
+                        <span className="preset-task-dot-tooltip" id={`preset-task-tooltip-${index}`} role="tooltip">
+                          {task.title}
+                        </span>
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              ) : <span />}
+              <button type="button" className="task-create-submit preset-create-submit" disabled={saving || !name.trim() || tasks.length === 0} onClick={() => { setSaving(true); void onSave(name, tasks).catch(() => setSaving(false)) }}>{saving ? 'Salvataggio…' : initialPreset ? 'Salva preset' : 'Crea preset'}</button>
+            </footer>
+          </section>
+        </div>,
+        document.body,
+  )
+}
+
+
 const CreateTaskPanel = ({
   list,
   anchorRect: _anchorRect,
   boardMembers,
   publishedQuestionnaireVersions,
   onCreateTask,
+  onDelete,
   onCancel,
   initialTaskKind = 'priority',
   initialDueAt = '',
+  initialTitle = '',
+  initialNotes = '',
+  initialTaskPriority = 'normal',
+  initialRecurrenceFrequency = 'daily',
+  initialRecurrenceInterval = '1',
+  initialQuestionnaireVersionId = '',
   initialAssigneeIdentityId,
+  variant = 'task',
+  submitLabel,
+  embedded = false,
 }: {
   list: TaskListItem
   anchorRect: DOMRect
   boardMembers: BoardMember[]
   publishedQuestionnaireVersions: Array<{ id: Uuid; label: string }>
   onCreateTask(input: TaskCreationInput, listId: Uuid): Promise<void>
+  onDelete?(): void
   onCancel(): void
   initialTaskKind?: 'priority' | 'deadline' | 'recurring'
   initialDueAt?: string
+  initialTitle?: string
+  initialNotes?: string
+  initialTaskPriority?: 'low' | 'normal' | 'high'
+  initialRecurrenceFrequency?: RecurrenceFrequency
+  initialRecurrenceInterval?: string
+  initialQuestionnaireVersionId?: string
   initialAssigneeIdentityId?: Uuid
+  variant?: 'task' | 'preset'
+  submitLabel?: string
+  embedded?: boolean
 }) => {
   const panelRef = useRef<HTMLElement>(null)
   const titleInputRef = useRef<HTMLInputElement>(null)
   const commentInputRef = useRef<HTMLTextAreaElement>(null)
   const ignoreOverlayClickRef = useRef(false)
-  const [taskTitle, setTaskTitle] = useState('')
-  const [taskNotes, setTaskNotes] = useState('')
+  const [taskTitle, setTaskTitle] = useState(initialTitle)
+  const [taskNotes, setTaskNotes] = useState(initialNotes)
   const [taskDueAt, setTaskDueAt] = useState(initialDueAt)
   const [taskKind, setTaskKind] = useState<
     'priority' | 'deadline' | 'recurring'
   >(initialTaskKind)
   const [taskPriority, setTaskPriority] = useState<'low' | 'normal' | 'high'>(
-    'normal',
+    initialTaskPriority,
   )
   const [recurrenceFrequency, setRecurrenceFrequency] =
-    useState<RecurrenceFrequency>('daily')
-  const [recurrenceInterval, setRecurrenceInterval] = useState('1')
-  const [questionnaireVersionId, setQuestionnaireVersionId] = useState('')
+    useState<RecurrenceFrequency>(initialRecurrenceFrequency)
+  const [recurrenceInterval, setRecurrenceInterval] = useState(
+    initialRecurrenceInterval,
+  )
+  const [questionnaireVersionId, setQuestionnaireVersionId] = useState(
+    initialQuestionnaireVersionId,
+  )
   const [attachmentFiles, setAttachmentFiles] = useState<File[]>([])
   const [assigneeIdentityId, setAssigneeIdentityId] = useState<
     Uuid | undefined
   >(initialAssigneeIdentityId)
+  const [submitting, setSubmitting] = useState(false)
+
+  const hasTaskChanges =
+    taskTitle !== initialTitle ||
+    taskNotes !== initialNotes ||
+    taskDueAt !== initialDueAt ||
+    taskKind !== initialTaskKind ||
+    taskPriority !== initialTaskPriority ||
+    recurrenceFrequency !== initialRecurrenceFrequency ||
+    recurrenceInterval !== initialRecurrenceInterval ||
+    questionnaireVersionId !== initialQuestionnaireVersionId ||
+    assigneeIdentityId !== initialAssigneeIdentityId ||
+    attachmentFiles.length > 0
+  const showDeleteAction = Boolean(onDelete) && !hasTaskChanges
 
   const handleTaskKindChange = (
     kind: 'priority' | 'deadline' | 'recurring',
@@ -3939,6 +4496,13 @@ const CreateTaskPanel = ({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
+    if (submitting) return
+    if (!taskTitle.trim()) return
+    if (taskKind === 'deadline' && !taskDueAt) return
+    if (taskKind === 'recurring') {
+      const interval = Number(recurrenceInterval)
+      if (!Number.isInteger(interval) || interval < 1) return
+    }
     const common = {
       title: taskTitle,
       notes: taskNotes.trim() || undefined,
@@ -3965,31 +4529,33 @@ const CreateTaskPanel = ({
               frequency: recurrenceFrequency,
               interval: Number(recurrenceInterval),
             }
-    await onCreateTask(input, list.wire.id)
-    onCancel()
+    setSubmitting(true)
+    try {
+      await onCreateTask(input, list.wire.id)
+      onCancel()
+    } catch {
+      // Keep the draft open; the parent exposes the actionable error.
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   const panelStyle: CSSProperties = {
     maxHeight: 'calc(100vh - 3rem)',
   }
 
-  return createPortal(
-    <div
-      className="task-create-overlay"
-      onClick={() => {
-        if (ignoreOverlayClickRef.current) return
-        onCancel()
-      }}
-      aria-hidden={false}
-    >
-      <div className="task-create-backdrop" aria-hidden="true" />
-      <section
+  const panel = (
+    <section
         ref={panelRef}
-        className="task-create-panel"
+        className={[
+          'task-create-panel',
+          variant === 'preset' ? 'task-create-panel--preset-draft' : '',
+          embedded ? 'task-create-panel--embedded' : '',
+        ].filter(Boolean).join(' ')}
         style={panelStyle}
         role="dialog"
-        aria-modal="true"
-        aria-label="Nuovo task"
+        aria-modal={embedded ? undefined : true}
+        aria-label={variant === 'preset' ? 'Nuova task del preset' : 'Nuovo task'}
         onClick={(event) => event.stopPropagation()}
       >
         <form className="task-create-form" onSubmit={(event) => void submit(event)}>
@@ -3998,7 +4564,7 @@ const CreateTaskPanel = ({
               ref={titleInputRef}
               className="board-column-rename-input"
               required
-              placeholder="Titolo del task"
+              placeholder={variant === 'preset' ? 'Titolo task del preset' : 'Titolo del task'}
               value={taskTitle}
               onChange={(event) => setTaskTitle(event.target.value)}
               aria-label="Titolo"
@@ -4109,12 +4675,42 @@ const CreateTaskPanel = ({
                 onRecurrenceIntervalChange={setRecurrenceInterval}
               />
             </div>
-            <button type="submit" className="task-create-submit">
-              Crea
+            <button
+              type={showDeleteAction ? 'button' : 'submit'}
+              className={`task-create-submit${showDeleteAction ? ' task-create-submit--delete' : ''}`}
+              onClick={showDeleteAction ? onDelete : undefined}
+              disabled={
+                showDeleteAction
+                  ? false
+                  : submitting ||
+                    !taskTitle.trim() ||
+                    (taskKind === 'deadline' && !taskDueAt)
+              }
+            >
+              {showDeleteAction
+                ? 'Elimina'
+                : submitting
+                  ? submitLabel === 'Aggiungi' ? 'Aggiunta…' : 'Creazione…'
+                  : submitLabel ?? (variant === 'preset' ? 'Aggiungi' : 'Crea')}
             </button>
           </div>
         </form>
-      </section>
+    </section>
+  )
+
+  if (embedded) return panel
+
+  return createPortal(
+    <div
+      className="task-create-overlay"
+      onClick={() => {
+        if (ignoreOverlayClickRef.current) return
+        onCancel()
+      }}
+      aria-hidden={false}
+    >
+      <div className="task-create-backdrop" aria-hidden="true" />
+      {panel}
     </div>,
     document.body,
   )
@@ -4134,6 +4730,7 @@ export const TasksScreen = ({
   selectedTaskId,
   currentUserLabel: _currentUserLabel,
   publishedQuestionnaireVersions,
+  presets = [],
   filter,
   loading,
   onSelectFocus,
@@ -4158,6 +4755,18 @@ export const TasksScreen = ({
   onReadInfoDocumentFile,
   onDownloadInfoDocumentFile,
   onCreateTask,
+  onCreatePreset = async () => {
+    throw new Error('Preset creation is unavailable')
+  },
+  onApplyPreset = async () => {
+    throw new Error('Preset application is unavailable')
+  },
+  onUpdatePreset = async () => {
+    throw new Error('Preset updating is unavailable')
+  },
+  onDeletePreset = async () => {
+    throw new Error('Preset deletion is unavailable')
+  },
   onUpdateTask,
   onAssignTask,
   onCompleteTask,
@@ -4226,7 +4835,15 @@ export const TasksScreen = ({
       ? lastAgentDetail.agentId
       : undefined
 
+  const previousProjectIdRef = useRef(project?.wire.id)
   useEffect(() => {
+    if (previousProjectIdRef.current !== project?.wire.id) {
+      setSearchQuery('')
+      setAgentActivityFilter('all')
+      setAdvancedTaskFilters(initialAdvancedTaskFilters(filter))
+      setTaskFilterGroups(['dates'])
+      previousProjectIdRef.current = project?.wire.id
+    }
     setAgentWorkspace(undefined)
     setLastAgentDetail(readAgentDetailSession(project?.wire.id))
   }, [project?.wire.id])
@@ -4249,6 +4866,15 @@ export const TasksScreen = ({
   const mobileSearchInputRef = useRef<HTMLInputElement>(null)
   const mobileToolbarSearchInputRef = useRef<HTMLInputElement>(null)
   const [creatingInListId, setCreatingInListId] = useState<Uuid | undefined>()
+  const [addMenu, setAddMenu] = useState<{
+    listId: Uuid
+    columnKey: Uuid
+    anchorRect: DOMRect
+  }>()
+  const [presetListId, setPresetListId] = useState<Uuid>()
+  const [presetEditorOpen, setPresetEditorOpen] = useState(false)
+  const [editingPreset, setEditingPreset] = useState<DecryptedPreset>()
+  const [activePresetPages, setActivePresetPages] = useState<Record<Uuid, Uuid | undefined>>({})
   const [createAnchorColumnKey, setCreateAnchorColumnKey] = useState<
     Uuid | undefined
   >()
@@ -4641,6 +5267,14 @@ export const TasksScreen = ({
     )
   }, [creatingInListId, searched.lists, taskLists])
 
+  const presetTargetList = useMemo(() => {
+    if (!presetListId) return undefined
+    return (
+      searched.lists.find((item) => item.wire.id === presetListId) ??
+      taskLists.find((item) => item.wire.id === presetListId)
+    )
+  }, [presetListId, searched.lists, taskLists])
+
   const createInitialAssigneeId = useMemo(() => {
     if (!createAnchorColumnKey) return undefined
     const isMember = boardMembers.some(
@@ -4736,6 +5370,19 @@ export const TasksScreen = ({
     createAnchorElRef.current = null
     setCreateInitialTaskKind('priority')
     setCreateInitialDueAt('')
+  }
+
+  const openAddMenuInList = (
+    listId: Uuid,
+    columnKey: Uuid,
+    anchor: HTMLElement,
+  ) => {
+    onSelectList(listId)
+    setAddMenu({
+      listId,
+      columnKey,
+      anchorRect: anchor.getBoundingClientRect(),
+    })
   }
 
   const openCreateTaskInList = (listId: Uuid, columnKey: Uuid) => {
@@ -4916,6 +5563,7 @@ export const TasksScreen = ({
   }
 
   const handleIslandViewModeChange = (mode: BoardViewMode) => {
+    onSelectTask(undefined)
     closeListHistory()
     onBoardViewModeChange(mode)
   }
@@ -5244,7 +5892,7 @@ export const TasksScreen = ({
             ) : (
               <BoardViewNavigation
                 mode={boardViewMode}
-                onChange={onBoardViewModeChange}
+                onChange={handleIslandViewModeChange}
                 scopeKey={boardViewTabScopeKey}
                 compact={isAgentBoard}
               />
@@ -5648,8 +6296,8 @@ export const TasksScreen = ({
                   aria-label="Tasklist agenti"
                 >
                   <AgentTaskListHeader
-                    onAddTask={() =>
-                      openCreateTaskInList(taskLists[0].wire.id, taskLists[0].wire.id)
+                    onAddTask={(anchor) =>
+                      openAddMenuInList(taskLists[0].wire.id, taskLists[0].wire.id, anchor)
                     }
                   />
                   <ul className="board-cards">
@@ -5700,11 +6348,12 @@ export const TasksScreen = ({
                   >
                     <AgentColumnHeader
                       agent={agent}
-                      onAddTask={() => {
+                      onAddTask={(anchor) => {
                         if (!taskList) return
-                        openCreateTaskInList(
+                        openAddMenuInList(
                           taskList.wire.id,
                           agent.principal_identity_id,
+                          anchor,
                         )
                       }}
                     />
@@ -5843,9 +6492,10 @@ export const TasksScreen = ({
               onResizeTask={(task, range) => {
                 void onUpdateTask(task, {
                   title: task.document.title,
+                  taskKind: task.wire.task_kind,
                   notes: task.document.notes,
-                  start_at: range.start_at,
-                  due_at: range.due_at,
+                  startAt: range.start_at,
+                  dueAt: range.due_at,
                   ...(task.document.priority !== undefined
                     ? { priority: task.document.priority }
                     : {}),
@@ -5866,6 +6516,35 @@ export const TasksScreen = ({
             )
             const listLocked = lockedTasks.filter(
               (task) => task.list_id === list.wire.id,
+            )
+            const listPresets = (list.document?.presetIds ?? [])
+              .map((presetId) => presets.find((preset) => preset.wire.id === presetId))
+              .filter((preset): preset is DecryptedPreset => Boolean(preset))
+            const visibleListPresets = listPresets.filter((preset) => {
+              if (
+                advancedTaskFilters.listIds.length > 0 &&
+                !advancedTaskFilters.listIds.includes(list.wire.id)
+              ) return false
+              if (
+                advancedTaskFilters.types.length > 0 &&
+                !advancedTaskFilters.types.includes('preset')
+              ) return false
+              if (
+                advancedTaskFilters.states.length > 0 &&
+                !advancedTaskFilters.states.includes('open')
+              ) return false
+              if (
+                advancedTaskFilters.memberIds.length > 0 &&
+                !(preset.document.tasks ?? []).some((task) =>
+                  task.assigneeIdentityId
+                    ? advancedTaskFilters.memberIds.includes(task.assigneeIdentityId)
+                    : false,
+                )
+              ) return false
+              return true
+            })
+            const activePreset = listPresets.find(
+              (preset) => activePresetPages[list.wire.id] === preset.wire.id,
             )
             const listNameLabel = list.document?.name ?? 'Locked list'
             const isEditingList = editingListId === list.wire.id
@@ -5911,8 +6590,8 @@ export const TasksScreen = ({
                     })
                   }}
                   onOpenHistory={() => openListHistory(list.wire.id)}
-                  onAddTask={() => {
-                    openCreateTaskInList(list.wire.id, list.wire.id)
+                  onAddTask={(anchor) => {
+                    openAddMenuInList(list.wire.id, list.wire.id, anchor)
                   }}
                 />
 
@@ -5923,35 +6602,57 @@ export const TasksScreen = ({
                 />
 
                 <div className="board-column-card-content">
-                  <BoardGroupedTaskCards
-                    tasks={listTasks}
-                    groups={taskFilterGroups.filter(
-                      (group) =>
-                        group !== 'listIds' &&
-                        !(
-                          group === 'dates' &&
-                          taskFilterGroups.length === 1 &&
-                          advancedTaskFilters.dates.length === 0
-                        ),
-                    )}
-                    members={boardMembers}
-                    selectedTaskId={selectedTaskId}
-                    boardMemberById={boardMemberById}
-                    onSelectTask={onSelectTask}
-                    onCompleteTask={(task) => {
-                      void onCompleteTask(task)
-                    }}
-                  />
-                  {listLocked.length > 0 ? (
-                    <ul className="board-cards board-cards--locked">
-                      {listLocked.map((task) => (
-                        <li key={task.id} className="board-card locked">
-                          <LockIcon />
-                          <span>Locked task</span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : null}
+                  {activePreset ? (
+                    <PresetTaskListPage
+                      preset={activePreset}
+                      listName={listNameLabel}
+                      onBack={() => setActivePresetPages((current) => ({
+                        ...current,
+                        [list.wire.id]: undefined,
+                      }))}
+                    />
+                  ) : (
+                    <>
+                      <BoardGroupedTaskCards
+                        tasks={listTasks}
+                        groups={taskFilterGroups.filter(
+                          (group) =>
+                            group !== 'listIds' &&
+                            !(
+                              group === 'dates' &&
+                              taskFilterGroups.length === 1 &&
+                              advancedTaskFilters.dates.length === 0
+                            ),
+                        )}
+                        members={boardMembers}
+                        selectedTaskId={selectedTaskId}
+                        boardMemberById={boardMemberById}
+                        onSelectTask={onSelectTask}
+                        onCompleteTask={(task) => {
+                          void onCompleteTask(task)
+                        }}
+                      />
+                      <PresetLinkCards
+                        presets={visibleListPresets}
+                        grouped={taskFilterGroups.includes('types')}
+                        boardMemberById={boardMemberById}
+                        onOpen={(preset) => setActivePresetPages((current) => ({
+                          ...current,
+                          [list.wire.id]: preset.wire.id,
+                        }))}
+                      />
+                      {listLocked.length > 0 ? (
+                        <ul className="board-cards board-cards--locked">
+                          {listLocked.map((task) => (
+                            <li key={task.id} className="board-card locked">
+                              <LockIcon />
+                              <span>Locked task</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </>
+                  )}
                 </div>
 
               </section>
@@ -6103,12 +6804,17 @@ export const TasksScreen = ({
                 onClick={() => {
                   if (boardFocus.type === 'topic') {
                     setListTopicId(boardFocus.topicId)
+                  } else if (topics.length === 0) {
+                    setShowNewTopic(true)
+                    return
                   }
                   setShowNewList(true)
                 }}
               >
                 <PlusIcon />
-                Nuova task list
+                {topics.length === 0 && boardFocus.type !== 'topic'
+                  ? 'Crea prima una categoria'
+                  : 'Nuova task list'}
               </button>
             )}
           </section>
@@ -6209,6 +6915,74 @@ export const TasksScreen = ({
           onClose={() => {
             setListIconPickerOpen(false)
             setListIconPickerAnchorRect(null)
+          }}
+        />
+      )}
+
+      {addMenu && (
+        <AddContentMenu
+          anchorRect={addMenu.anchorRect}
+          onTask={() => {
+            const target = addMenu
+            setAddMenu(undefined)
+            openCreateTaskInList(target.listId, target.columnKey)
+          }}
+          onPreset={() => {
+            setPresetListId(addMenu.listId)
+            setPresetEditorOpen(false)
+            setAddMenu(undefined)
+          }}
+          onClose={() => setAddMenu(undefined)}
+        />
+      )}
+
+      {presetTargetList && !presetEditorOpen && (
+        <PresetLibraryPanel
+          presets={presets}
+          onSelect={async (preset) => {
+            await onApplyPreset(preset, presetTargetList.wire.id)
+            setPresetListId(undefined)
+          }}
+          onEdit={(preset) => {
+            setEditingPreset(preset)
+            setPresetEditorOpen(true)
+          }}
+          onDelete={onDeletePreset}
+          onCreate={() => {
+            setEditingPreset(undefined)
+            setPresetEditorOpen(true)
+          }}
+          onClose={() => setPresetListId(undefined)}
+        />
+      )}
+
+      {presetTargetList && presetEditorOpen && (
+        <PresetEditorPanel
+          key={editingPreset?.wire.id ?? 'new-preset'}
+          list={presetTargetList}
+          initialPreset={editingPreset}
+          boardMembers={boardMembers}
+          publishedQuestionnaireVersions={publishedQuestionnaireVersions}
+          onSave={async (name, presetTasks) => {
+            if (editingPreset) {
+              await onUpdatePreset(editingPreset, name, presetTasks)
+              setEditingPreset(undefined)
+              setPresetEditorOpen(false)
+              return
+            }
+            const preset = await onCreatePreset(name, presetTasks)
+            await onApplyPreset(preset, presetTargetList.wire.id)
+            setPresetEditorOpen(false)
+            setPresetListId(undefined)
+          }}
+          onBack={() => {
+            setEditingPreset(undefined)
+            setPresetEditorOpen(false)
+          }}
+          onClose={() => {
+            setEditingPreset(undefined)
+            setPresetEditorOpen(false)
+            setPresetListId(undefined)
           }}
         />
       )}

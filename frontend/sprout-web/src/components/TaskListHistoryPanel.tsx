@@ -283,9 +283,18 @@ const TaskHistoryRow = ({
     <button
       type="button"
       className={selected ? 'tasklist-history-row selected' : 'tasklist-history-row'}
+      aria-label={`${task.document.title}: ${status.label}`}
       onClick={onSelect}
     >
-      <span className={`board-task-check board-task-check--${status.variant}`} aria-hidden>
+      <span
+        className={`board-task-check board-task-check--${status.variant}`}
+        style={
+          status.dueProgress === undefined
+            ? undefined
+            : ({ '--task-due-progress': status.dueProgress } as CSSProperties)
+        }
+        aria-hidden
+      >
         <span className="board-task-check-dot" />
       </span>
       <span className="tasklist-history-row-content">

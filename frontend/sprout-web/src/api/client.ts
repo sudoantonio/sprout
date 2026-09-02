@@ -738,6 +738,23 @@ export class ApiClient {
     })
   }
 
+  updatePreset(
+    projectId: Uuid,
+    presetId: Uuid,
+    payload: EncryptedPayloadDto,
+  ): Promise<PresetResponse> {
+    return this.request(`/v1/projects/${projectId}/presets/${presetId}`, {
+      method: 'PUT',
+      body: { payload, idempotency_key: crypto.randomUUID() },
+    })
+  }
+
+  deletePreset(projectId: Uuid, presetId: Uuid): Promise<void> {
+    return this.request(`/v1/projects/${projectId}/presets/${presetId}`, {
+      method: 'DELETE',
+    })
+  }
+
   createPresetVersion(
     projectId: Uuid,
     presetId: Uuid,

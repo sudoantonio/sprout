@@ -188,6 +188,20 @@ export const LayoutGridIcon = (props: IconProps) => (
   </svg>
 )
 
+export const PresetIcon = (props: IconProps) => (
+  <svg {...iconProps} fill="currentColor" stroke="none" {...props}>
+    <circle cx="5" cy="5" r="2" />
+    <circle cx="12" cy="5" r="2" />
+    <circle cx="19" cy="5" r="2" />
+    <circle cx="5" cy="12" r="2" />
+    <circle cx="12" cy="12" r="2" />
+    <circle cx="19" cy="12" r="2" />
+    <circle cx="5" cy="19" r="2" />
+    <circle cx="12" cy="19" r="2" />
+    <circle cx="19" cy="19" r="2" />
+  </svg>
+)
+
 export const UsersIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
@@ -364,6 +378,24 @@ export const XIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
     <path d="M18 6 6 18" />
     <path d="m6 6 12 12" />
+  </svg>
+)
+
+export const TrashIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <path d="M3 6h18" />
+    <path d="M8 6V4h8v2" />
+    <path d="m19 6-1 15H6L5 6" />
+    <path d="M10 11v5" />
+    <path d="M14 11v5" />
+  </svg>
+)
+
+export const MoreVerticalIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <circle cx="12" cy="5" r="1" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="19" r="1" fill="currentColor" stroke="none" />
   </svg>
 )
 

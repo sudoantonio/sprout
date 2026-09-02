@@ -362,6 +362,11 @@ export interface PresetVersionResponse {
   version: PresetVersionDto
 }
 
+export interface UpdatePresetRequest {
+  payload: EncryptedPayloadDto
+  idempotency_key: Uuid
+}
+
 export interface PretaskSelectionDto {
   pretask_id: Uuid
   task_kind: TaskKindDto

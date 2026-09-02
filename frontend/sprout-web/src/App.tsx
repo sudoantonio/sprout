@@ -59,7 +59,7 @@ import {
   QuestionnaireScreen,
   type QuestionnaireAnswerValue,
 } from './components/QuestionnaireScreen'
-import { TasksScreen } from './components/TasksScreen'
+import { TasksScreen, type TaskUpdateInput } from './components/TasksScreen'
 import { WorkspaceUserMenu } from './components/WorkspaceUserMenu'
 import { AiGenerationScreen } from './components/AiGenerationScreen'
 import { useTheme } from './hooks/useTheme'
@@ -71,6 +71,7 @@ import {
   createEncryptedResource,
   createEncryptedResourceHeader,
   decodePayloadContainer,
+  decryptPreset,
   decryptProject,
   decryptInfoDocument,
   decryptTask,
@@ -86,8 +87,10 @@ import {
 import type {
   DecryptedTask,
   DecryptedInfoDocument,
+  DecryptedPreset,
   EncryptedLocalRecord,
   PresetDocument,
+  PresetTaskTemplate,
   ProjectDocument,
   QuestionnaireDocument,
   AttachmentDocument,
@@ -439,6 +442,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     locked?: boolean
     detail?: string
   }>()
+  const [boardPresets, setBoardPresets] = useState<DecryptedPreset[]>([])
   const [questionnaires, setQuestionnaires] = useState<QuestionnaireItem[]>([])
   const [questionnaireVersions, setQuestionnaireVersions] = useState<
     DecryptedQuestionnaireVersion[]
@@ -479,6 +483,26 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   const deviceId = useMemo(getOrCreateDeviceId, [])
   const sessionRef = useRef(state.session)
   sessionRef.current = state.session
+  const stateRef = useRef(state)
+  stateRef.current = state
+  const taskMutationQueuesRef = useRef(new Map<Uuid, Promise<void>>())
+  const enqueueTaskMutation = (
+    taskId: Uuid,
+    operation: () => Promise<void>,
+  ): Promise<void> => {
+    const previous = taskMutationQueuesRef.current.get(taskId)
+    const next = (previous ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(operation)
+    taskMutationQueuesRef.current.set(taskId, next)
+    const release = () => {
+      if (taskMutationQueuesRef.current.get(taskId) === next) {
+        taskMutationQueuesRef.current.delete(taskId)
+      }
+    }
+    void next.then(release, release)
+    return next
+  }
   const attachmentRefreshInFlight = useRef(new Map<Uuid, Promise<void>>())
   const [boardReloadToken, setBoardReloadToken] = useState(0)
 
@@ -1015,6 +1039,47 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     state.session,
     state.taskLists,
   ])
+
+  useEffect(() => {
+    if (!services || !state.selectedProjectId || !state.session) {
+      setBoardPresets([])
+      return
+    }
+    let active = true
+    const projectId = state.selectedProjectId
+    void (async () => {
+      try {
+        const wires = []
+        let cursor: string | undefined
+        do {
+          const page = await api.listPresets(projectId, cursor)
+          wires.push(...page.presets)
+          cursor = page.next_cursor ?? undefined
+        } while (cursor)
+        const decrypted = (
+          await Promise.all(
+            wires
+              .filter((preset) => preset.deleted_at === null)
+              .map(async (preset) => {
+                try {
+                  return await decryptPreset(preset, services.auth.vault)
+                } catch {
+                  return undefined
+                }
+              }),
+          )
+        ).filter((preset): preset is DecryptedPreset => Boolean(preset))
+        if (active) setBoardPresets(decrypted)
+      } catch (error) {
+        if (active) {
+          dispatch({ type: 'set-error', message: errorMessage(error) })
+        }
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [api, dispatch, services, state.selectedProjectId, state.session])
 
   useEffect(() => {
     if (!services || !state.selectedProjectId || !state.session) {
@@ -2726,11 +2791,12 @@ const App = ({ apiClient, initialSession }: AppProps) => {
 
   const createTask = async (input: TaskCreationInput, listId: Uuid) => {
     if (!state.session || !state.selectedProjectId || !listId) {
+      const error = new Error('Server sign-in is required to create a task.')
       dispatch({
         type: 'set-error',
-        message: 'Server sign-in is required to create a task.',
+        message: error.message,
       })
-      return
+      throw error
     }
     try {
       const current = requireServices()
@@ -3051,31 +3117,27 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       }
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
+      throw error
     }
   }
 
-  const updateTask = async (
+  const updateTaskNow = async (
     task: DecryptedTask,
-    input: {
-      title: string
-      notes?: string
-      priority?: TaskDocument['priority']
-      start_at?: string
-      due_at?: string
-      recurrence?: TaskDocument['recurrence']
-    },
+    input: TaskUpdateInput,
   ) => {
     const actorIdentityId =
       state.session?.identity_id ?? state.localAccess?.identityId
     const actorDeviceId =
       state.session?.device_id ?? state.localAccess?.deviceId
     if (!actorIdentityId || !actorDeviceId) {
+      const error = new Error(
+        'This local vault predates offline signing metadata; reauthenticate or recover it on an authorized device.',
+      )
       dispatch({
         type: 'set-error',
-        message:
-          'This local vault predates offline signing metadata; reauthenticate or recover it on an authorized device.',
+        message: error.message,
       })
-      return
+      throw error
     }
     try {
       const current = requireServices()
@@ -3083,15 +3145,60 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         ...task.document,
         title: input.title,
         notes: input.notes,
-        ...(input.priority !== undefined ? { priority: input.priority } : {}),
-        ...(input.start_at !== undefined ? { start_at: input.start_at } : {}),
-        ...(input.due_at !== undefined ? { due_at: input.due_at } : {}),
-        ...(input.recurrence !== undefined
-          ? { recurrence: input.recurrence }
-          : {}),
       }
-      if (document.due_at === undefined) {
-        delete document.start_at
+      delete document.priority
+      delete document.start_at
+      delete document.due_at
+      delete document.recurrence
+      if (input.taskKind === 'priority') {
+        document.priority = input.priority ?? 'normal'
+      } else if (input.taskKind === 'deadline') {
+        if (input.startAt) document.start_at = input.startAt
+        if (input.dueAt) document.due_at = input.dueAt
+      } else {
+        if (input.startAt) document.start_at = input.startAt
+        if (input.dueAt) document.due_at = input.dueAt
+        document.recurrence = input.recurrence ?? {
+          frequency: 'daily',
+          interval: 1,
+        }
+      }
+      let recurrenceSeriesId =
+        input.taskKind === 'recurring' && task.wire.task_kind === 'recurring'
+          ? task.wire.recurrence_series_id
+          : null
+      let occurrenceNumber =
+        input.taskKind === 'recurring' && task.wire.task_kind === 'recurring'
+          ? task.wire.occurrence_number
+          : null
+      if (input.taskKind === 'recurring' && !recurrenceSeriesId) {
+        if (!state.online || !state.session) {
+          throw new Error(
+            'Server sign-in is required to convert a task to recurring.',
+          )
+        }
+        recurrenceSeriesId = crypto.randomUUID()
+        occurrenceNumber = 1
+        const encryptedRule = await createEncryptedResource(
+          current.auth.vault,
+          {
+            projectId: task.wire.project_id,
+            resourceId: recurrenceSeriesId,
+            kind: 'recurrence',
+            aggregateVersion: INITIAL_PAYLOAD_VERSION,
+            document: {
+              schema: 1,
+              starts_at: document.due_at ?? new Date().toISOString(),
+              ...document.recurrence,
+            },
+          },
+        )
+        await api.createRecurrence(task.wire.project_id, {
+          id: recurrenceSeriesId,
+          list_id: task.wire.list_id,
+          encrypted_rule: encryptedRule,
+          idempotency_key: crypto.randomUUID(),
+        })
       }
       const activeKey = state.session
         ? await ensureActiveResourceKey(
@@ -3140,6 +3247,11 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       const body = {
         expected_payload_version: task.wire.payload_version,
         key_epoch: activeKey.epoch,
+        update_task_metadata: true,
+        task_kind: input.taskKind,
+        questionnaire_version_id: input.questionnaireVersionId ?? null,
+        recurrence_series_id: recurrenceSeriesId,
+        occurrence_number: occurrenceNumber,
         payload,
         selected_value_snapshot: selectedValueSnapshot,
         idempotency_key: crypto.randomUUID(),
@@ -3173,6 +3285,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           ...task.wire,
           payload,
           payload_version: task.wire.payload_version + 1,
+          task_kind: input.taskKind,
+          questionnaire_version_id: input.questionnaireVersionId ?? null,
+          recurrence_series_id: recurrenceSeriesId,
+          occurrence_number: occurrenceNumber,
         }
         await createSignedQueueItem(current.database, current.auth.vault, {
           projectId: task.wire.project_id,
@@ -3197,23 +3313,106 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         ...taskRecord(wire),
         aggregateVersion: nextSyncVersion,
       })
-      dispatch({
-        type: 'set-tasks',
-        tasks: state.tasks.map((item) =>
-          item.wire.id === task.wire.id
-            ? { wire, document }
-            : item,
-        ),
-        lockedTasks: state.lockedTasks,
-      })
+      dispatch({ type: 'upsert-task', task: { wire, document } })
       dispatch({
         type: 'set-queue-count',
         count: await current.database.queueCount(),
       })
+      if (input.attachmentFiles?.length) {
+        if (!state.online || !state.session) {
+          throw new Error('Server sign-in is required to add task attachments.')
+        }
+        const attachmentResourceKey = current.auth.vault.getResourceKey(
+          wire.resource_node_id,
+          wire.key_epoch,
+        )
+        if (!attachmentResourceKey) {
+          throw new Error('The task key is unavailable for attachments')
+        }
+        for (const file of input.attachmentFiles) {
+          const attachmentId = crypto.randomUUID()
+          const blobId = crypto.randomUUID()
+          const ciphertext = await encryptAttachment(
+            file,
+            attachmentResourceKey,
+            {
+              projectId: wire.project_id,
+              resourceId: wire.resource_node_id,
+              blobId,
+              keyEpoch: wire.key_epoch,
+            },
+          )
+          await writeEncryptedAttachment(blobId, ciphertext)
+          const [ciphertextSha256, encryptedBlobMetadata, encryptedMetadata] =
+            await Promise.all([
+              attachmentCiphertextSha256(ciphertext),
+              encryptExistingResource(current.auth.vault, {
+                projectId: wire.project_id,
+                resourceId: wire.resource_node_id,
+                kind: 'attachment',
+                aggregateVersion: 0,
+                keyEpoch: wire.key_epoch,
+                document: {
+                  schema: 1,
+                  format: 'sprout-attachment-v1',
+                  plaintext_size: file.size,
+                },
+              }),
+              encryptExistingResource(current.auth.vault, {
+                projectId: wire.project_id,
+                resourceId: wire.resource_node_id,
+                kind: 'attachment',
+                aggregateVersion: 0,
+                keyEpoch: wire.key_epoch,
+                document: {
+                  schema: 1,
+                  file_name: file.name,
+                  content_type: file.type || 'application/octet-stream',
+                } satisfies AttachmentDocument,
+              }),
+            ])
+          const declaration = await api.declareTaskRequiredAttachment(
+            wire.project_id,
+            wire.id,
+            {
+              id: attachmentId,
+              source_template_attachment_id: null,
+              blob: {
+                blob_id: blobId,
+                resource_node_id: wire.resource_node_id,
+                ciphertext_size: ciphertext.size,
+                ciphertext_sha256: ciphertextSha256,
+                key_epoch: wire.key_epoch,
+                encrypted_blob_metadata: encryptedBlobMetadata,
+                encrypted_attachment_metadata: encryptedMetadata,
+              },
+              idempotency_key: crypto.randomUUID(),
+            },
+          )
+          await api.uploadAttachmentCiphertext(
+            wire.project_id,
+            blobId,
+            await readEncryptedAttachment(blobId),
+            declaration.upload_url,
+          )
+          await api.finalizeAttachment(wire.project_id, blobId)
+        }
+        await refreshTaskAttachments(wire.id)
+      }
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
+      throw error
     }
   }
+
+  const updateTask = (task: DecryptedTask, input: TaskUpdateInput) =>
+    enqueueTaskMutation(task.wire.id, () => {
+      const latestTask =
+        stateRef.current.tasks.find(
+          (candidate) => candidate.wire.id === task.wire.id,
+        ) ?? task
+      return updateTaskNow(latestTask, input)
+    })
 
   const assignTask = async (
     task: DecryptedTask,
@@ -3669,10 +3868,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   }
 
   const copyTask = async (task: DecryptedTask) => {
-    if (!state.session || !state.selectedListId) {
+    if (!state.session) {
       dispatch({
         type: 'set-error',
-        message: 'Select a destination list and authenticate before copying.',
+        message: 'Authenticate before copying a task.',
       })
       return
     }
@@ -3741,7 +3940,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         task.wire.project_id,
         task.wire.id,
         {
-          destination_list_id: state.selectedListId,
+          destination_list_id: task.wire.list_id,
           new_task_id: newTaskId,
           new_resource_node_id: newResourceId,
           assignment_id: assignmentId,
@@ -3766,6 +3965,178 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       dispatch({ type: 'set-notice', message: 'Task copied with a new identity.' })
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
+    }
+  }
+
+  const createBoardPreset = async (
+    name: string,
+    tasks: PresetTaskTemplate[],
+  ): Promise<DecryptedPreset> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to create a preset.')
+    }
+    const trimmedName = name.trim()
+    if (!trimmedName) throw new Error('Il nome del preset è obbligatorio.')
+    if (tasks.length === 0) {
+      throw new Error('Aggiungi almeno una task al preset.')
+    }
+    const current = requireServices()
+    const presetId = crypto.randomUUID()
+    const versionId = crypto.randomUUID()
+    const document: PresetDocument = {
+      schema: 1,
+      name: trimmedName,
+      tasks,
+    }
+    try {
+      const payload = await createEncryptedResource(current.auth.vault, {
+        projectId: state.selectedProjectId,
+        resourceId: presetId,
+        kind: 'preset',
+        aggregateVersion: 0,
+        document,
+      })
+      const { preset } = await api.createPreset(
+        state.selectedProjectId,
+        presetId,
+        payload,
+      )
+      const versionPayload = await createEncryptedResource(
+        current.auth.vault,
+        {
+          projectId: state.selectedProjectId,
+          resourceId: versionId,
+          kind: 'preset',
+          aggregateVersion: INITIAL_PAYLOAD_VERSION,
+          document: { schema: 1, name: trimmedName },
+        },
+      )
+      const pretasks = await Promise.all(
+        tasks.map(async (task) => {
+          const id = crypto.randomUUID()
+          return {
+            id,
+            task_kind: task.taskKind,
+            payload: await createEncryptedResource(current.auth.vault, {
+              projectId: state.selectedProjectId as Uuid,
+              resourceId: id,
+              kind: 'preset',
+              aggregateVersion: INITIAL_PAYLOAD_VERSION,
+              document: { schema: 1, title: task.title.trim() },
+            }),
+          }
+        }),
+      )
+      const contentBytes = new TextEncoder().encode(JSON.stringify(pretasks))
+      const contentHash = (await loadCrypto()).hash(contentBytes)
+      try {
+        await api.createPresetVersion(state.selectedProjectId, presetId, {
+          id: versionId,
+          payload: versionPayload,
+          content_hash_b64: bytesToBase64(contentHash),
+          pretasks,
+          idempotency_key: crypto.randomUUID(),
+        })
+      } finally {
+        zeroBytes(contentBytes, contentHash)
+      }
+      if (import.meta.env.DEV) {
+        persistDevVault(state.session, current.auth.vault)
+      }
+      const created = { wire: preset, document }
+      setBoardPresets((currentPresets) => [created, ...currentPresets])
+      dispatch({ type: 'set-notice', message: `Preset “${trimmedName}” creato.` })
+      return created
+    } catch (error) {
+      dispatch({ type: 'set-error', message: errorMessage(error) })
+      throw error
+    }
+  }
+
+  const applyBoardPreset = async (
+    preset: DecryptedPreset,
+    listId: Uuid,
+  ): Promise<void> => {
+    const list = state.taskLists.find((item) => item.wire.id === listId)
+    if (!list?.document) {
+      throw new Error('Questa tasklist non può essere aggiornata su questo dispositivo.')
+    }
+    const currentPresetIds = list.document.presetIds ?? []
+    if (currentPresetIds.includes(preset.wire.id)) {
+      dispatch({
+        type: 'set-notice',
+        message: `Il preset “${preset.document.name}” è già nella tasklist.`,
+      })
+      return
+    }
+    await updateTaskListDocument(list, {
+      ...list.document,
+      presetIds: [...currentPresetIds, preset.wire.id],
+    })
+    dispatch({
+      type: 'set-notice',
+      message: `Pagina preset “${preset.document.name}” aggiunta alla tasklist.`,
+    })
+  }
+
+  const updateBoardPreset = async (
+    preset: DecryptedPreset,
+    name: string,
+    tasks: PresetTaskTemplate[],
+  ): Promise<DecryptedPreset> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to update a preset.')
+    }
+    const current = requireServices()
+    const document: PresetDocument = {
+      ...preset.document,
+      name: name.trim(),
+      tasks,
+    }
+    if (!document.name) throw new Error('Il nome del preset è obbligatorio.')
+    try {
+      const payload = await encryptExistingResource(current.auth.vault, {
+        projectId: state.selectedProjectId,
+        resourceId: preset.wire.id,
+        kind: 'preset',
+        aggregateVersion: 0,
+        document,
+      })
+      const { preset: wire } = await api.updatePreset(
+        state.selectedProjectId,
+        preset.wire.id,
+        payload,
+      )
+      const updated = { wire, document }
+      setBoardPresets((currentPresets) =>
+        currentPresets.map((item) =>
+          item.wire.id === preset.wire.id ? updated : item,
+        ),
+      )
+      dispatch({ type: 'set-notice', message: `Preset “${document.name}” aggiornato.` })
+      return updated
+    } catch (error) {
+      dispatch({ type: 'set-error', message: errorMessage(error) })
+      throw error
+    }
+  }
+
+  const deleteBoardPreset = async (preset: DecryptedPreset): Promise<void> => {
+    if (!state.session || !state.selectedProjectId) {
+      throw new Error('Server sign-in is required to delete a preset.')
+    }
+    try {
+      await api.deletePreset(state.selectedProjectId, preset.wire.id)
+      setBoardPresets((currentPresets) =>
+        currentPresets.filter((item) => item.wire.id !== preset.wire.id),
+      )
+      dispatch({
+        type: 'set-notice',
+        message: `Preset “${preset.document.name}” eliminato.`,
+      })
+    } catch (error) {
+      dispatch({ type: 'set-error', message: errorMessage(error) })
+      throw error
     }
   }
 
@@ -5755,6 +6126,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             selectedTaskId={state.selectedTaskId}
             currentUserLabel={userLabel}
             publishedQuestionnaireVersions={publishedQuestionnaireVersions}
+            presets={boardPresets}
             filter={state.taskFilter}
             loading={state.loading}
             userMenu={userMenuProps}
@@ -5790,6 +6162,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             onReadInfoDocumentFile={readInfoDocumentFile}
             onDownloadInfoDocumentFile={downloadInfoDocumentFile}
             onCreateTask={createTask}
+            onCreatePreset={createBoardPreset}
+            onApplyPreset={applyBoardPreset}
+            onUpdatePreset={updateBoardPreset}
+            onDeletePreset={deleteBoardPreset}
             onUpdateTask={updateTask}
             onAssignTask={assignTask}
             onCompleteTask={completeTask}

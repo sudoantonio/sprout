@@ -189,6 +189,7 @@ export interface TaskListDocument {
   name: string
   color?: TaskListColumnColor
   icon?: TaskListIcon
+  presetIds?: Uuid[]
 }
 
 export interface InfoTextBlock {
@@ -286,6 +287,37 @@ export interface PresetDocument {
   schema: 1
   name: string
   description?: string
+  tasks?: PresetTaskTemplate[]
+}
+
+interface PresetTaskTemplateBase {
+  title: string
+  notes?: string
+  questionnaireVersionId?: Uuid
+  assigneeIdentityId?: Uuid
+}
+
+export type PresetTaskTemplate = PresetTaskTemplateBase &
+  (
+    | {
+      taskKind: 'priority'
+      priority: 'low' | 'normal' | 'high'
+      }
+    | {
+      taskKind: 'deadline'
+      dueAt: string
+      }
+    | {
+      taskKind: 'recurring'
+      dueAt: string
+      frequency: 'minutes' | 'daily' | 'weekly' | 'monthly'
+      interval: number
+      }
+  )
+
+export interface DecryptedPreset {
+  wire: PresetDto
+  document: PresetDocument
 }
 
 export interface PresetVersionDocument {

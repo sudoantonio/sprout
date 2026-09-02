@@ -167,6 +167,7 @@ export type AppAction =
       tasks: DecryptedTask[]
       lockedTasks: TaskDto[]
     }
+  | { type: 'upsert-task'; task: DecryptedTask }
   | { type: 'select-task'; taskId?: Uuid }
   | { type: 'set-task-filter'; filter: TaskFilter }
   | { type: 'set-recovery'; status?: ProjectRecoveryStatus }
@@ -345,6 +346,19 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
             : undefined,
         loading: false,
       }
+    case 'upsert-task': {
+      const exists = state.tasks.some(
+        (task) => task.wire.id === action.task.wire.id,
+      )
+      return {
+        ...state,
+        tasks: exists
+          ? state.tasks.map((task) =>
+              task.wire.id === action.task.wire.id ? action.task : task,
+            )
+          : [...state.tasks, action.task],
+      }
+    }
     case 'select-task':
       return { ...state, selectedTaskId: action.taskId }
     case 'set-task-filter':

@@ -1,6 +1,7 @@
 import type {
   EncryptedPayloadDto,
   InfoDocumentDto,
+  PresetDto,
   ProjectView,
   TaskDto,
   TaskListDto,
@@ -19,8 +20,10 @@ import {
 import type {
   DecryptedTask,
   DecryptedInfoDocument,
+  DecryptedPreset,
   InfoDocumentContent,
   ProjectDocument,
+  PresetDocument,
   ResourceKind,
   TaskDocument,
   TaskListDocument,
@@ -343,6 +346,27 @@ export const decryptTask = async (
     keyEpoch: task.key_epoch,
   }),
 })
+
+export const decryptPreset = async (
+  preset: PresetDto,
+  vault: KeyVault,
+): Promise<DecryptedPreset> => {
+  const resolved = resolveActiveResourceKey(vault, preset.id, 1)
+  if (!resolved) {
+    throw new Error('This preset key is not available on this device')
+  }
+  return {
+    wire: preset,
+    document: await decryptDocument<PresetDocument>(preset.payload, {
+      projectId: preset.project_id,
+      resourceId: preset.id,
+      kind: 'preset',
+      aggregateVersion: 0,
+      keyEpoch: resolved.epoch,
+      resourceKey: resolved.key,
+    }),
+  }
+}
 
 export const decryptInfoDocument = async (
   document: InfoDocumentDto,

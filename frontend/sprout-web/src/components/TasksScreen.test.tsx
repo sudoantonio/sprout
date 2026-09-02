@@ -10,6 +10,7 @@ import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import type {
   DecryptedInfoDocument,
+  DecryptedPreset,
   DecryptedTask,
   InfoDocumentContent,
 } from '../domain/models'
@@ -1692,6 +1693,26 @@ describe('board shell', () => {
     ).toBeTruthy()
   })
 
+  it('shows task due progress in History', () => {
+    const dueAt = new Date(Date.now() + 2 * 86_400_000).toISOString()
+    const task = makeTask('Task in avanzamento', listId, memberId, {
+      kind: 'deadline',
+      dueAt,
+    })
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'topic', topicId }}
+        boardViewMode="history"
+        tasks={[task]}
+      />,
+    )
+
+    const row = screen.getByRole('button', { name: /Task in avanzamento/i })
+    const indicator = row.querySelector<HTMLElement>('.board-task-check')
+    expect(indicator?.style.getPropertyValue('--task-due-progress')).not.toBe('')
+  })
+
   it('switches to timeline view and hides kanban columns', async () => {
     const user = userEvent.setup()
     const onBoardViewModeChange = vi.fn()
@@ -1894,6 +1915,7 @@ describe('board shell', () => {
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
 
     const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
     await user.type(within(dialog).getByLabelText('Titolo'), 'New board task')
@@ -1920,12 +1942,210 @@ describe('board shell', () => {
     )
   })
 
+  it('opens the unified add menu and creates a preset with internal tasks', async () => {
+    const user = userEvent.setup()
+    const createdPreset: DecryptedPreset = {
+      wire: {
+        id: crypto.randomUUID(),
+        project_id: projectId,
+        payload: {
+          version: 1,
+          algorithm: 'sprout-protocol-v1',
+          key_id: crypto.randomUUID(),
+          nonce_b64: 'AQ==',
+          ciphertext_b64: 'Ag==',
+        },
+        created_at: '2026-08-31T12:00:00.000Z',
+        deleted_at: null,
+      },
+      document: {
+        schema: 1,
+        name: 'Apertura locale',
+        tasks: [
+          {
+            taskKind: 'priority',
+            title: 'Controlla sala',
+            priority: 'normal',
+          },
+        ],
+      },
+    }
+    const onCreatePreset = vi.fn().mockResolvedValue(createdPreset)
+    const onApplyPreset = vi.fn().mockResolvedValue(undefined)
+    render(
+      <TasksScreen
+        {...baseProps}
+        onCreatePreset={onCreatePreset}
+        onApplyPreset={onApplyPreset}
+      />,
+    )
+
+    const column = screen.getByRole('listitem', { name: 'Elena Russo' })
+    await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    expect(screen.getByRole('menuitem', { name: /Task/i })).toBeTruthy()
+    await user.click(screen.getByRole('menuitem', { name: /Preset/i }))
+
+    const library = screen.getByRole('dialog', { name: 'Scegli preset' })
+    await user.click(within(library).getByRole('button', { name: /Crea preset/i }))
+    const editor = screen.getByRole('dialog', { name: 'Crea preset' })
+    await user.type(within(editor).getByLabelText('Nome preset'), 'Apertura locale')
+    const taskEditor = screen.getByRole('dialog', { name: 'Nuovo task' })
+    await user.type(within(taskEditor).getByLabelText('Titolo'), 'Controlla sala')
+    const addTaskButton = taskEditor.querySelector<HTMLButtonElement>(
+      '.task-create-submit',
+    )
+    expect(addTaskButton?.textContent).toMatch(/^Aggiungi$/i)
+    await user.click(addTaskButton!)
+    const taskDot = within(editor).getByRole('listitem')
+    expect(taskDot).toBeTruthy()
+    const taskDotButton = within(taskDot).getByRole('button', {
+      name: /Controlla sala/i,
+    })
+    await user.hover(taskDotButton)
+    expect(within(taskDot).getByRole('tooltip')).toHaveTextContent(
+      'Controlla sala',
+    )
+    await user.click(taskDotButton)
+    const reopenedTaskEditor = screen.getByRole('dialog', {
+      name: 'Nuovo task',
+    })
+    expect(within(reopenedTaskEditor).getByLabelText('Titolo')).toHaveValue(
+      'Controlla sala',
+    )
+    expect(within(reopenedTaskEditor).getByRole('button', { name: /^Elimina$/i })).toBeTruthy()
+    await user.type(
+      within(reopenedTaskEditor).getByLabelText('Commento'),
+      ' aggiornata',
+    )
+    expect(within(reopenedTaskEditor).getByRole('button', { name: /^Salva$/i })).toBeTruthy()
+    await user.click(within(editor).getByRole('button', { name: /^Crea preset$/i }))
+
+    await waitFor(() => {
+      expect(onCreatePreset).toHaveBeenCalledWith(
+        'Apertura locale',
+        [expect.objectContaining({ title: 'Controlla sala', taskKind: 'priority' })],
+      )
+      expect(onApplyPreset).toHaveBeenCalledWith(createdPreset, listId)
+    })
+  })
+
+  it('opens a linked preset as an internal tasklist page', async () => {
+    const user = userEvent.setup()
+    const presetId = crypto.randomUUID()
+    const linkedPreset: DecryptedPreset = {
+      wire: {
+        id: presetId,
+        project_id: projectId,
+        payload: {
+          version: 1,
+          algorithm: 'sprout-protocol-v1',
+          key_id: crypto.randomUUID(),
+          nonce_b64: 'AQ==',
+          ciphertext_b64: 'Ag==',
+        },
+        created_at: '2026-09-02T12:00:00.000Z',
+        deleted_at: null,
+      },
+      document: {
+        schema: 1,
+        name: 'Apertura locale',
+        tasks: [
+          {
+            taskKind: 'priority',
+            title: 'Controlla sala',
+            priority: 'normal',
+          },
+        ],
+      },
+    }
+    const linkedList = {
+      ...taskList,
+      document: { ...taskList.document!, presetIds: [presetId] },
+    }
+    render(
+      <TasksScreen
+        {...baseProps}
+        taskLists={[linkedList, otherList]}
+        presets={[linkedPreset]}
+      />,
+    )
+
+    const column = screen.getByRole('listitem', { name: 'Elena Russo' })
+    await user.click(
+      within(column).getByRole('button', { name: 'Apri preset Apertura locale' }),
+    )
+
+    expect(within(column).getByRole('region', { name: 'Preset Apertura locale' })).toBeTruthy()
+    expect(within(column).getByText('Controlla sala')).toBeTruthy()
+    await user.click(
+      within(column).getByRole('button', { name: 'Torna alle task di Elena Russo' }),
+    )
+    expect(within(column).queryByRole('region', { name: 'Preset Apertura locale' })).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: /Filtra task/ }))
+    await user.click(screen.getByRole('button', { name: 'Apri filtri Tipologia' }))
+    await user.click(screen.getByRole('menuitemcheckbox', { name: 'Preset' }))
+
+    expect(
+      within(column).getByText('Preset', {
+        selector: '.board-card-group-heading span',
+      }),
+    ).toBeTruthy()
+    expect(within(column).getByRole('button', { name: 'Apri preset Apertura locale' })).toBeTruthy()
+    expect(within(column).queryByText('Color test')).toBeNull()
+  })
+
+  it('opens an existing preset in the editor from the vertical menu button', async () => {
+    const user = userEvent.setup()
+    const existingPreset: DecryptedPreset = {
+      wire: {
+        id: crypto.randomUUID(),
+        project_id: projectId,
+        payload: {
+          version: 1,
+          algorithm: 'sprout-protocol-v1',
+          key_id: crypto.randomUUID(),
+          nonce_b64: 'AQ==',
+          ciphertext_b64: 'Ag==',
+        },
+        created_at: '2026-09-02T12:00:00.000Z',
+        deleted_at: null,
+      },
+      document: {
+        schema: 1,
+        name: 'Preset modificabile',
+        tasks: [
+          {
+            taskKind: 'priority',
+            title: 'Task esistente',
+            priority: 'high',
+          },
+        ],
+      },
+    }
+    render(<TasksScreen {...baseProps} presets={[existingPreset]} />)
+
+    const column = screen.getByRole('listitem', { name: 'Elena Russo' })
+    await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Preset/i }))
+    const library = screen.getByRole('dialog', { name: 'Scegli preset' })
+    await user.click(
+      within(library).getByRole('button', { name: 'Modifica Preset modificabile' }),
+    )
+
+    const editor = screen.getByRole('dialog', { name: 'Modifica preset' })
+    expect(within(editor).getByLabelText('Nome preset')).toHaveValue('Preset modificabile')
+    expect(within(editor).getByRole('button', { name: '1. Task esistente' })).toBeTruthy()
+    expect(within(editor).getByRole('button', { name: 'Salva preset' })).toBeTruthy()
+  })
+
   it('shows recurrence controls without a date field for recurring tasks', async () => {
     const user = userEvent.setup()
     render(<TasksScreen {...baseProps} onCreateTask={vi.fn()} />)
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
 
     const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
     await user.click(within(dialog).getByRole('button', { name: 'Priorità' }))
@@ -1952,6 +2172,7 @@ describe('board shell', () => {
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
 
     const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
     await user.type(within(dialog).getByLabelText('Titolo'), 'Task con commento')
@@ -1987,6 +2208,7 @@ describe('board shell', () => {
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
 
     const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
     await user.type(within(dialog).getByLabelText('Titolo'), 'Task con extra')
@@ -2017,6 +2239,7 @@ describe('board shell', () => {
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
     expect(screen.getByRole('dialog', { name: 'Nuovo task' })).toBeTruthy()
 
     await user.click(
@@ -2163,6 +2386,7 @@ describe('board shell', () => {
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
 
     const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
     const attachmentInput = dialog.querySelector<HTMLInputElement>(
@@ -2191,6 +2415,7 @@ describe('board shell', () => {
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
     await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
 
     const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
     await user.type(within(dialog).getByLabelText('Titolo'), 'Task assegnato')
@@ -2573,5 +2798,318 @@ describe('board shell', () => {
     await user.click(screen.getByRole('button', { name: 'Salva' }))
 
     await waitFor(() => expect(onUpdateInfoDocument).toHaveBeenCalled())
+  })
+
+  it('keeps every selected property when creating a richly configured task', async () => {
+    const user = userEvent.setup()
+    const onCreateTask = vi.fn().mockResolvedValue(undefined)
+    const questionnaireVersionId = crypto.randomUUID()
+    const file = new File(['brief'], 'specifiche.pdf', {
+      type: 'application/pdf',
+    })
+    render(
+      <TasksScreen
+        {...baseProps}
+        publishedQuestionnaireVersions={[
+          { id: questionnaireVersionId, label: 'Verifica qualità · v3' },
+        ]}
+        onCreateTask={onCreateTask}
+      />,
+    )
+
+    const column = screen.getByRole('listitem', { name: 'Elena Russo' })
+    await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
+    const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
+
+    await user.type(within(dialog).getByLabelText('Titolo'), 'Controllo completo')
+    await user.type(within(dialog).getByLabelText('Commento'), 'Note combinate')
+    await user.click(within(dialog).getByRole('button', { name: 'Aggiungi' }))
+    await user.click(
+      within(dialog).getByRole('menuitemradio', {
+        name: 'Verifica qualità · v3',
+      }),
+    )
+    await user.click(within(dialog).getByRole('button', { name: 'Assegna' }))
+    await user.click(
+      within(dialog).getByRole('menuitemradio', { name: 'Lucia Bianchi' }),
+    )
+    await user.upload(
+      dialog.querySelector<HTMLInputElement>('input[type="file"]')!,
+      file,
+    )
+    await user.click(within(dialog).getByRole('button', { name: 'Priorità' }))
+    const kindMenu = await screen.findByRole('dialog', {
+      name: 'Priorità e scadenza',
+    })
+    await user.click(within(kindMenu).getByRole('menuitem', { name: 'Priorità' }))
+    await user.click(within(kindMenu).getByRole('menuitemradio', { name: 'Alta' }))
+    await user.click(within(dialog).getByRole('button', { name: /^Crea$/i }))
+
+    expect(onCreateTask).toHaveBeenCalledWith(
+      {
+        taskKind: 'priority',
+        title: 'Controllo completo',
+        notes: 'Note combinate',
+        priority: 'high',
+        questionnaireVersionId,
+        requiredAttachments: [file],
+        assigneeIdentityId: otherMemberId,
+      },
+      listId,
+    )
+  })
+
+  it('submits only recurrence properties after changing task kind repeatedly', async () => {
+    const user = userEvent.setup()
+    const onCreateTask = vi.fn().mockResolvedValue(undefined)
+    render(<TasksScreen {...baseProps} onCreateTask={onCreateTask} />)
+
+    const column = screen.getByRole('listitem', { name: 'Elena Russo' })
+    await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
+    const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
+    await user.type(within(dialog).getByLabelText('Titolo'), 'Cambio proprietà')
+
+    await user.click(within(dialog).getByRole('button', { name: 'Priorità' }))
+    let kindMenu = await screen.findByRole('dialog', {
+      name: 'Priorità e scadenza',
+    })
+    await user.click(within(kindMenu).getByRole('menuitemradio', { name: 'Alta' }))
+
+    await user.click(within(dialog).getByRole('button', { name: 'Priorità' }))
+    kindMenu = await screen.findByRole('dialog', {
+      name: 'Priorità e scadenza',
+    })
+    await user.click(within(kindMenu).getByRole('menuitem', { name: 'Ricorrente' }))
+    const interval = within(kindMenu).getByRole('spinbutton', {
+      name: 'Intervallo ricorrenza',
+    })
+    await user.clear(interval)
+    await user.type(interval, '3')
+    await user.click(within(kindMenu).getByRole('radio', { name: 'Mese' }))
+    fireEvent.mouseDown(within(dialog).getByLabelText('Titolo'))
+    await user.click(within(dialog).getByRole('button', { name: /^Crea$/i }))
+
+    expect(onCreateTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskKind: 'recurring',
+        frequency: 'monthly',
+        interval: 3,
+      }),
+      listId,
+    )
+    const submitted = onCreateTask.mock.calls[0][0]
+    expect(submitted).not.toHaveProperty('priority')
+  })
+
+  it('persists the selected task kind when saving task details', async () => {
+    const user = userEvent.setup()
+    const onUpdateTask = vi.fn().mockResolvedValue(undefined)
+    const task = makeTask('Converti tipo', listId, memberId)
+    render(
+      <TasksScreen
+        {...baseProps}
+        tasks={[task]}
+        selectedTaskId={task.wire.id}
+        onUpdateTask={onUpdateTask}
+      />,
+    )
+
+    const drawer = screen.getByRole('dialog', { name: 'Task detail' })
+    await user.click(within(drawer).getByRole('button', { name: 'Priorità' }))
+    const kindMenu = await screen.findByRole('dialog', {
+      name: 'Priorità e scadenza',
+    })
+    await user.click(within(kindMenu).getByRole('menuitem', { name: 'Ricorrente' }))
+    const interval = within(kindMenu).getByRole('spinbutton', {
+      name: 'Intervallo ricorrenza',
+    })
+    await user.clear(interval)
+    await user.type(interval, '2')
+    fireEvent.mouseDown(within(drawer).getByLabelText('Titolo'))
+    await user.click(within(drawer).getByRole('button', { name: 'Salva' }))
+
+    expect(onUpdateTask).toHaveBeenCalledWith(
+      task,
+      expect.objectContaining({
+        taskKind: 'recurring',
+        recurrence: { frequency: 'daily', interval: 2 },
+      }),
+    )
+  })
+
+  it('persists questionnaire and new attachments when saving task details', async () => {
+    const user = userEvent.setup()
+    const onUpdateTask = vi.fn().mockResolvedValue(undefined)
+    const questionnaireVersionId = crypto.randomUUID()
+    const task = makeTask('Extra dettaglio', listId, memberId)
+    const file = new File(['foto'], 'evidenza.png', { type: 'image/png' })
+    render(
+      <TasksScreen
+        {...baseProps}
+        tasks={[task]}
+        selectedTaskId={task.wire.id}
+        publishedQuestionnaireVersions={[
+          { id: questionnaireVersionId, label: 'Checklist finale · v2' },
+        ]}
+        onUpdateTask={onUpdateTask}
+      />,
+    )
+
+    const drawer = screen.getByRole('dialog', { name: 'Task detail' })
+    await user.click(within(drawer).getByRole('button', { name: 'Aggiungi' }))
+    await user.click(
+      within(drawer).getByRole('menuitemradio', {
+        name: 'Checklist finale · v2',
+      }),
+    )
+    await user.upload(
+      drawer.querySelector<HTMLInputElement>('input[type="file"]')!,
+      file,
+    )
+    await user.click(within(drawer).getByRole('button', { name: 'Salva' }))
+
+    expect(onUpdateTask).toHaveBeenCalledWith(
+      task,
+      expect.objectContaining({
+        questionnaireVersionId,
+        attachmentFiles: [file],
+      }),
+    )
+  })
+
+  it('clears deadline and recurrence fields when task detail changes to priority', async () => {
+    const user = userEvent.setup()
+    const onUpdateTask = vi.fn().mockResolvedValue(undefined)
+    const task: DecryptedTask = {
+      ...makeTask('Rimuovi scadenza', listId, memberId, {
+        kind: 'recurring',
+        dueAt: '2026-09-15T10:00:00.000Z',
+      }),
+      document: {
+        schema: 1,
+        title: 'Rimuovi scadenza',
+        due_at: '2026-09-15T10:00:00.000Z',
+        recurrence: { frequency: 'monthly', interval: 2 },
+      },
+    }
+    render(
+      <TasksScreen
+        {...baseProps}
+        tasks={[task]}
+        selectedTaskId={task.wire.id}
+        onUpdateTask={onUpdateTask}
+      />,
+    )
+
+    const drawer = screen.getByRole('dialog', { name: 'Task detail' })
+    await user.click(within(drawer).getByRole('button', { name: 'Priorità' }))
+    const kindMenu = await screen.findByRole('dialog', {
+      name: 'Priorità e scadenza',
+    })
+    await user.click(
+      within(kindMenu).getByRole('menuitem', { name: 'Priorità' }),
+    )
+    await user.click(within(kindMenu).getByRole('menuitemradio', { name: 'Alta' }))
+    await user.click(within(drawer).getByRole('button', { name: 'Salva' }))
+
+    expect(onUpdateTask).toHaveBeenCalledWith(
+      task,
+      expect.objectContaining({
+        taskKind: 'priority',
+        priority: 'high',
+      }),
+    )
+    const submitted = onUpdateTask.mock.calls[0][1]
+    expect(submitted).not.toHaveProperty('dueAt')
+    expect(submitted).not.toHaveProperty('recurrence')
+  })
+
+  it('prevents duplicate create submissions while the first request is pending', async () => {
+    const user = userEvent.setup()
+    let resolveCreate!: () => void
+    const onCreateTask = vi.fn(
+      () => new Promise<void>((resolve) => {
+        resolveCreate = resolve
+      }),
+    )
+    render(<TasksScreen {...baseProps} onCreateTask={onCreateTask} />)
+
+    const column = screen.getByRole('listitem', { name: 'Elena Russo' })
+    await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    await user.click(screen.getByRole('menuitem', { name: /Task/i }))
+    const dialog = screen.getByRole('dialog', { name: 'Nuovo task' })
+    await user.type(within(dialog).getByLabelText('Titolo'), 'Una volta sola')
+    const submit = within(dialog).getByRole('button', { name: /^Crea$/i })
+
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+    expect(onCreateTask).toHaveBeenCalledTimes(1)
+    expect(submit).toBeDisabled()
+
+    resolveCreate()
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Nuovo task' })).toBeNull()
+    })
+  })
+
+  it('resets search and advanced filters when the selected project changes', async () => {
+    const user = userEvent.setup()
+    const { rerender } = render(<TasksScreen {...baseProps} />)
+
+    const search = screen.getByLabelText('Cerca task e tasklist')
+    await user.type(search, 'Color')
+    await user.click(screen.getByRole('button', { name: /^Filtra task/ }))
+    await user.click(screen.getByRole('button', { name: 'Apri filtri Stato' }))
+    await user.click(screen.getByRole('menuitemcheckbox', { name: 'Completati' }))
+    await user.click(screen.getByRole('menuitemcheckbox', { name: 'Da completare' }))
+    expect(screen.queryByText('Color test')).toBeNull()
+
+    const nextProjectId = crypto.randomUUID()
+    const nextListId = crypto.randomUUID()
+    const nextProject: ProjectItem = {
+      ...project,
+      wire: {
+        ...project.wire,
+        id: nextProjectId,
+        root_resource_id: crypto.randomUUID(),
+      },
+      document: { schema: 1, name: 'Second project' },
+    }
+    const nextList: TaskListItem = {
+      ...taskList,
+      wire: {
+        ...taskList.wire,
+        id: nextListId,
+        project_id: nextProjectId,
+        resource_node_id: crypto.randomUUID(),
+      },
+      document: { schema: 1, name: 'Nuova board' },
+    }
+    const nextTask = {
+      ...makeTask('Visibile nel nuovo progetto', nextListId, memberId),
+      wire: {
+        ...makeTask('Visibile nel nuovo progetto', nextListId, memberId).wire,
+        project_id: nextProjectId,
+        list_id: nextListId,
+      },
+    }
+    rerender(
+      <TasksScreen
+        {...baseProps}
+        project={nextProject}
+        taskLists={[nextList]}
+        tasks={[nextTask]}
+        selectedListId={nextListId}
+      />,
+    )
+
+    expect(screen.getByLabelText('Cerca task e tasklist')).toHaveValue('')
+    expect(
+      screen.getByRole('button', { name: 'Filtra task: 1 filtri attivi' }),
+    ).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Da completare' })).toBeTruthy()
+    expect(screen.getByText('Visibile nel nuovo progetto')).toBeTruthy()
   })
 })

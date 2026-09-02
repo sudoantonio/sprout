@@ -468,7 +468,9 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         )
         .route(
             "/v1/projects/{project_id}/presets/{preset_id}",
-            get(task_flows::get_preset).delete(task_flows::delete_preset),
+            get(task_flows::get_preset)
+                .put(task_flows::update_preset)
+                .delete(task_flows::delete_preset),
         )
         .route(
             "/v1/projects/{project_id}/presets/{preset_id}/versions",

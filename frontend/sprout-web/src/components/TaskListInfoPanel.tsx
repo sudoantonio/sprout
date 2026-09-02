@@ -1316,7 +1316,22 @@ const OverviewFlowEditor = ({
                 ? 'Testo info in Markdown'
                 : `Testo info in Markdown ${blockIndex + 1}`}
               data-placeholder="Scrivi una nota o usa / per aggiungere contenuti"
-              onPointerDown={() => setSelectedBlockId(undefined)}
+              onPointerDown={(event) => {
+                setSelectedBlockId(undefined)
+                const prompt = event.target instanceof Element
+                  ? event.target.closest<HTMLElement>('[data-overview-prompt]')
+                  : null
+                if (!prompt || !event.currentTarget.contains(prompt)) return
+                event.preventDefault()
+                const target = prompt.querySelector<HTMLElement>('[data-task-text]') ?? prompt
+                const range = window.document.createRange()
+                range.selectNodeContents(target)
+                range.collapse(true)
+                event.currentTarget.focus()
+                const selection = window.getSelection()
+                selection?.removeAllRanges()
+                selection?.addRange(range)
+              }}
               onKeyDown={(event) => handleKeyDown(block.id, event)}
               onInput={(event) => {
                 ensureOverviewTrailingPromptLine(
@@ -3266,7 +3281,7 @@ export function InfoDocumentPanel<T extends InfoDocumentContainer>({
                 const input = fileInputRef.current
                 if (!input) return
                 input.accept = accept
-                try { input.showPicker() } catch { input.click() }
+                input.click()
               }}
               onRequestPage={(anchor) => {
                 pendingFlowInsertionRef.current = prepareFlowInsertion(anchor)
