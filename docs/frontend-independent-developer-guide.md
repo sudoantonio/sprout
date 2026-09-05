@@ -57,19 +57,28 @@ vincoli:
 - grant/revoke dei tool e capability witness;
 - tool execution e terminal observations.
 
-### Richiede un runtime nativo esterno al browser
+### Esecuzione dei provider sul dispositivo
 
-- model discovery reale;
-- chiamate a Ollama, DS4 o provider commerciali con credential;
 - `web.read` e `document.local.read` user-owned;
 - installazione/rilevamento Ollama;
-- esecuzione dei provider e firma delle observation.
+- firma delle observation per le invocazioni governate degli agenti.
 
-Il pulsante **Rileva modelli dal dispositivo** fallisce nel browser per design:
-`inferenceExecutionEnvironment()` restituisce `browser_control_plane` e
-`browserDirectInferenceAllowed()` restituisce sempre `false`. Serve
-un'implementazione nativa di `LocalEdgeInferenceBridge`; non aggirare questo
-confine con fetch browser dirette o proxy backend.
+Le modalità esplicite `commercial_api` e `lan_inference` consentono discovery e
+generazione direttamente dal dispositivo tramite gli adapter HTTP. Quando è
+presente, `LocalEdgeInferenceBridge` resta il percorso preferito. Le modalità
+`private_remote` e `commercial_privacy` richiedono il runtime dedicato. Il
+backend Sprout non riceve le credenziali del provider.
+
+Durante lo sviluppo, l'adapter DeepSeek usa il relay same-origin Vite
+`/__sprout-ai/deepseek`. Il relay ha un target fisso
+`https://api.deepseek.com`, non accetta URL arbitrari e non coinvolge il backend
+Sprout. Dopo una modifica a `vite.config.ts`, riavviare il server Vite.
+
+Per DeepSeek usare un modello restituito da `GET /v1/models`, attualmente
+`deepseek-v4-flash` o `deepseek-v4-pro`. Gli alias `deepseek-chat` e
+`deepseek-reasoner` sono dismessi e il client li blocca prima del trasporto. Gli
+errori HTTP 400/404/422 includono nel pannello il dettaglio breve restituito dal
+provider, con credenziali e token rimossi.
 
 ## 3. Mappa del repository
 

@@ -3,6 +3,7 @@ import type { ProviderGenerationRequest } from './contracts'
 import { PROVIDER_PROTOCOL_SEMANTIC_HEADERS } from './contracts'
 import {
   AnthropicCompatibleProvider,
+  DeepSeekProvider,
   Ds4Provider,
   OllamaProvider,
   OpenAiCompatibleProvider,
@@ -228,9 +229,64 @@ describe('client-owned provider contracts', () => {
     const auth = await adapter.generateStructured(request).catch((error: unknown) => error as ProviderFailure)
     expect(malformed).toMatchObject({ code: 'invalid_output', retryable: true })
     expect(auth).toMatchObject({ code: 'unavailable', retryable: false })
+    expect((auth as ProviderFailure).message).toContain('verifica la chiave API')
     expect(malformed.wireWitness?.body).toContain('selected-model')
     expect(auth.wireWitness?.body).toBe(malformed.wireWitness?.body)
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('shows a bounded provider diagnostic for rejected requests without exposing credentials', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        error: {
+          message: 'Model deepseek-chat is unavailable for key sk-secret-value',
+        },
+      }), { status: 400, headers: { 'content-type': 'application/json' } }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const failure = await new OpenAiCompatibleProvider(
+      'https://provider.example',
+      'sk-secret-value',
+      false,
+    ).generateStructured(request).catch((error: unknown) => error as ProviderFailure)
+
+    expect(failure).toMatchObject({ code: 'unavailable', retryable: false })
+    expect((failure as ProviderFailure).message).toContain('Model deepseek-chat is unavailable')
+    expect((failure as ProviderFailure).message).not.toContain('sk-secret-value')
+    expect(failure.wireWitness).toMatchObject({ selectedModel: request.model })
+  })
+
+  it('rejects retired DeepSeek aliases locally while keeping model discovery available', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: [{ id: 'deepseek-v4-flash' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const adapter = new DeepSeekProvider('https://api.deepseek.com', 'secret')
+
+    expect(await adapter.discoverModels()).toEqual([{ id: 'deepseek-v4-flash' }])
+    await expect(adapter.generateStructured({ ...request, model: 'deepseek-chat' }))
+      .rejects.toThrow('non è più supportato')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('includes an explicit JSON example for DeepSeek JSON Output', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(JSON.stringify({ choices: [{ message: { content: '{"answer":"ok"}' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    await new DeepSeekProvider('https://api.deepseek.com', 'secret')
+      .generateStructured({ ...request, model: 'deepseek-v4-flash' })
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as {
+      messages: Array<{ role: string; content: string }>
+    }
+    expect(body.messages[0].content).toContain('Example JSON output: {"answer":"..."}')
   })
 
   it('makes request and output commitments over the actual structured bytes', async () => {

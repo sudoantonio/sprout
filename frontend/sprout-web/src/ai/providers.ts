@@ -1,6 +1,7 @@
 import type {
   CommercialProfile,
   LanProfile,
+  LocalAiProfile,
   ProviderAdapter,
   ProviderCapabilities,
   ProviderGenerationRequest,
@@ -33,12 +34,61 @@ const cleanBaseUrl = (baseUrl: string): string => baseUrl.replace(/\/+$/, '')
 const normalizeOpenAiCompatibleBaseUrl = (baseUrl: string): string =>
   cleanBaseUrl(baseUrl).replace(/\/v1$/i, '')
 
+const providerErrorDetail = async (response: Response): Promise<string | undefined> => {
+  let raw: string
+  try {
+    raw = (await response.text()).slice(0, 4_096)
+  } catch {
+    return undefined
+  }
+  if (!raw.trim()) return undefined
+
+  let detail = raw
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const body = parsed as Record<string, unknown>
+      const nestedError = body.error && typeof body.error === 'object' && !Array.isArray(body.error)
+        ? body.error as Record<string, unknown>
+        : undefined
+      const candidate = nestedError?.message ?? body.message ?? body.detail
+      if (typeof candidate === 'string') detail = candidate
+    }
+  } catch {
+    // Some compatible providers return a short plain-text diagnostic.
+  }
+
+  const printableDetail = Array.from(detail, (character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint <= 31 || codePoint === 127 ? ' ' : character
+  }).join('')
+  const sanitized = printableDetail
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}\b/g, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 320)
+  return sanitized || undefined
+}
+
 const ensureHttpSuccess = async (response: Response): Promise<Response> => {
   if (response.ok) return response
   const retryable = response.status === 408 || response.status === 429 || response.status >= 500
+  const detail = response.status === 400 || response.status === 404 || response.status === 422
+    ? await providerErrorDetail(response)
+    : undefined
+  const message = response.status === 401
+    ? 'Autenticazione provider non riuscita (401): verifica la chiave API.'
+    : response.status === 402
+      ? 'Credito provider insufficiente (402).'
+      : response.status === 403
+        ? 'Il provider ha rifiutato la richiesta (403).'
+        : detail
+          ? `Richiesta rifiutata dal provider (${response.status}): ${detail}`
+          : `Provider request failed (${response.status})`
   throw new ProviderFailure(
     response.status === 429 ? 'rate_limited' : 'unavailable',
-    `Provider request failed (${response.status})`,
+    message,
     retryable,
   )
 }
@@ -85,6 +135,26 @@ const modelList = (value: Record<string, unknown>): ProviderModel[] => {
 
 const sourceText = (request: ProviderGenerationRequest): string =>
   JSON.stringify(requestPayload(request))
+
+const jsonExampleValue = (schema: unknown): unknown => {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return null
+  const value = schema as Record<string, unknown>
+  if (value.type === 'string') return '...'
+  if (value.type === 'number' || value.type === 'integer') return 0
+  if (value.type === 'boolean') return false
+  if (value.type === 'array') return []
+  if (value.type !== 'object' || !value.properties || typeof value.properties !== 'object') {
+    return null
+  }
+  const properties = value.properties as Record<string, unknown>
+  const required = Array.isArray(value.required)
+    ? value.required.filter((key): key is string => typeof key === 'string')
+    : Object.keys(properties)
+  return Object.fromEntries(required.map((key) => [key, jsonExampleValue(properties[key])]))
+}
+
+const jsonOnlyInstructions = (request: ProviderGenerationRequest): string =>
+  `${request.instructions}\n\nReturn exactly one JSON object. Example JSON output: ${JSON.stringify(jsonExampleValue(request.outputSchema))}. Do not include Markdown fences, commentary, or trailing prose.`
 
 const extractOpenAiChatText = (body: Record<string, unknown>): string => {
   const choices = body.choices
@@ -217,9 +287,9 @@ export class OpenAiCompatibleProvider extends HttpProvider {
               {
                 role: 'system',
                 content:
-                  this.chatJsonMode === 'prompt_json_only'
-                    ? `${request.instructions}\n\nReturn exactly one JSON object matching output_schema. Do not include Markdown fences, commentary, or trailing prose.`
-                    : request.instructions,
+                  this.chatJsonMode === 'json_schema'
+                    ? request.instructions
+                    : jsonOnlyInstructions(request),
               },
               { role: 'user', content: sourceText(request) },
             ],
@@ -270,6 +340,28 @@ export class OpenAiCompatibleProvider extends HttpProvider {
     } catch (error) {
       return preserveWireWitness(error, witness)
     }
+  }
+}
+
+const RETIRED_DEEPSEEK_MODELS = new Set(['deepseek-chat', 'deepseek-reasoner'])
+
+export class DeepSeekProvider extends OpenAiCompatibleProvider {
+  constructor(baseUrl: string, credential?: string) {
+    super(baseUrl, credential, false, 'deepseek_chat_v4', 'json_object', true)
+  }
+
+  override async generateStructured(
+    request: ProviderGenerationRequest,
+    signal?: AbortSignal,
+  ): Promise<ProviderGenerationResult> {
+    if (RETIRED_DEEPSEEK_MODELS.has(request.model.trim().toLowerCase())) {
+      throw new ProviderFailure(
+        'unavailable',
+        `Il modello DeepSeek “${request.model}” non è più supportato. Rileva i modelli e seleziona deepseek-v4-flash o deepseek-v4-pro.`,
+        false,
+      )
+    }
+    return await super.generateStructured(request, signal)
   }
 }
 
@@ -453,6 +545,13 @@ export class Ds4Provider extends OpenAiCompatibleProvider {
 }
 
 export const commercialProvider = (profile: CommercialProfile): ProviderAdapter => {
+  const deepSeekDeviceProxy =
+    profile.provider === 'deepseek' &&
+    !profile.baseUrl &&
+    import.meta.env.MODE === 'development' &&
+    typeof window !== 'undefined'
+      ? `${window.location.origin}/__sprout-ai/deepseek`
+      : undefined
   const defaultBase = {
     openai: 'https://api.openai.com',
     anthropic: 'https://api.anthropic.com',
@@ -461,23 +560,27 @@ export const commercialProvider = (profile: CommercialProfile): ProviderAdapter 
     openai_compatible: '',
     anthropic_compatible: '',
   }[profile.provider]
-  const baseUrl = profile.baseUrl || defaultBase
-  if (!baseUrl || !baseUrl.startsWith('https://')) {
+  const baseUrl = deepSeekDeviceProxy || profile.baseUrl || defaultBase
+  const usesLocalDevelopmentProxy = Boolean(
+    deepSeekDeviceProxy && baseUrl === deepSeekDeviceProxy,
+  )
+  if (!baseUrl || (!baseUrl.startsWith('https://') && !usesLocalDevelopmentProxy)) {
     throw new ProviderFailure('unavailable', 'Commercial provider URL must use HTTPS', false)
   }
-  return profile.provider === 'anthropic' || profile.provider === 'anthropic_compatible'
-    ? new AnthropicCompatibleProvider(baseUrl, profile.credential)
-    : new OpenAiCompatibleProvider(
+  if (profile.provider === 'anthropic' || profile.provider === 'anthropic_compatible') {
+    return new AnthropicCompatibleProvider(baseUrl, profile.credential)
+  }
+  if (profile.provider === 'deepseek') {
+    return new DeepSeekProvider(baseUrl, profile.credential)
+  }
+  return new OpenAiCompatibleProvider(
         baseUrl,
         profile.credential,
         profile.provider === 'openai',
-        profile.provider === 'deepseek'
-          ? 'deepseek_chat_v4'
-          : profile.provider === 'openai'
+        profile.provider === 'openai'
             ? 'openai_responses_v1'
             : 'openai_chat_completions_v1',
-        profile.provider === 'deepseek' ? 'json_object' : 'json_schema',
-        profile.provider === 'deepseek',
+        'json_schema',
       )
 }
 
@@ -519,6 +622,16 @@ export const lanProvider = (profile: LanProfile): ProviderAdapter => {
   return profile.engine === 'ollama'
     ? new OllamaProvider(profile.baseUrl, profile.token)
     : new Ds4Provider(profile.baseUrl, profile.token)
+}
+
+export const providerForLocalProfile = (profile: LocalAiProfile): ProviderAdapter => {
+  if (profile.mode === 'commercial_api') return commercialProvider(profile)
+  if (profile.mode === 'lan_inference') return lanProvider(profile)
+  throw new ProviderFailure(
+    'unavailable',
+    'Questa modalità richiede un runtime locale dedicato.',
+    false,
+  )
 }
 
 export const providerFailureStatus = (error: unknown): string =>

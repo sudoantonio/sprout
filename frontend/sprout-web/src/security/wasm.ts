@@ -248,6 +248,7 @@ const RESOURCE_PAYLOAD_CONTENT_KIND = 1
 const legacyContentKind = (kind: ResourceKind): number | undefined =>
   (
     {
+      'agent-chat': undefined,
       project: undefined,
       topic: 2,
       'task-list': 3,

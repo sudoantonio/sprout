@@ -1,3 +1,4 @@
+import { fromAgentPayload, toAgentPayload, type AgentEncryptedPayload } from './agent-api'
 import type { ApiClient } from '../api/client'
 import type { EncryptedPayloadDto, Uuid } from '../api/contracts'
 import { canonicalGovernanceJson, sha256Hex } from './canonical'
@@ -105,11 +106,11 @@ export class ApiAgentLanguageTransport implements AgentLanguageTransport {
     executionProfileCommitmentHex: string,
     signal?: AbortSignal,
   ): Promise<ClaimedLanguageInvocation | null> {
-    return this.api.request(`/v1/projects/${projectId}/agents/${agentId}/runner/client-provider/claim`, {
+    return this.api.request<(Omit<ClaimedLanguageInvocation, 'encrypted_input'> & { encrypted_input: AgentEncryptedPayload }) | null>(`/v1/projects/${projectId}/agents/${agentId}/runner/client-provider/claim`, {
       method: 'POST',
       body: { execution_profile_commitment_hex: executionProfileCommitmentHex },
       signal,
-    })
+    }).then((claim) => claim ? { ...claim, encrypted_input: fromAgentPayload(claim.encrypted_input) } : null)
   }
 
   submit(
@@ -239,10 +240,10 @@ const buildArtifact = async (
 ): Promise<{
   artifact: Record<string, unknown>
   structuredOutput: StructuredLanguageOutput
-  encryptedOutput: EncryptedPayloadDto
+  encryptedOutput: AgentEncryptedPayload
 }> => {
   const candidate = result.value as Record<string, unknown>
-  const encryptedOutput = await cryptoBoundary.encryptOutput(JSON.stringify(candidate))
+  const encryptedOutput = toAgentPayload(await cryptoBoundary.encryptOutput(JSON.stringify(candidate)))
   if (input.kind === 'answer_from_authorized_context') {
     assertClosedObject(candidate, ['answer'])
     const answer = expectString(candidate.answer, 'answer')
@@ -252,7 +253,7 @@ const buildArtifact = async (
       artifact: {
         kind: 'interrogation_answer',
         session_id: input.session_id,
-        encrypted_answer: await cryptoBoundary.encryptOutput(answer),
+        encrypted_answer: toAgentPayload(await cryptoBoundary.encryptOutput(answer)),
         context_sources: claim.sources,
       },
     }
@@ -311,7 +312,7 @@ const buildArtifact = async (
         intent_id: crypto.randomUUID(),
         resource_effects: effects,
         tool_invocations: tools,
-        encrypted_explanation: await cryptoBoundary.encryptOutput(candidate.explanation),
+        encrypted_explanation: toAgentPayload(await cryptoBoundary.encryptOutput(candidate.explanation)),
       },
     },
   }
@@ -319,10 +320,10 @@ const buildArtifact = async (
 
 const outputCommitment = async (
   structuredOutput: StructuredLanguageOutput,
-  encryptedOutput: EncryptedPayloadDto,
+  encryptedOutput: AgentEncryptedPayload,
 ): Promise<string> =>
   sha256Hex(
-    JSON.stringify({
+    canonicalGovernanceJson({
       structured_output: structuredOutput,
       encrypted_output: encryptedOutput,
       effects: [],

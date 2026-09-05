@@ -1,3 +1,4 @@
+import { AgentConversation } from './AgentConversation'
 import { createPortal } from 'react-dom'
 import { useEffect, useState, type FormEvent } from 'react'
 import type {
@@ -7,12 +8,21 @@ import type {
 } from '../api/contracts'
 import type { DecryptedTask, TaskListColumnColor } from '../domain/models'
 import type { TaskListIcon } from '../domain/task-list-icon'
+import type { WorkspaceChatService, WorkspaceSnapshot } from '../ai/workspace-chat'
+import {
+  AGENT_ACTIONS,
+  AGENT_ACTION_LABELS,
+  compileAgentProvisioningPreview,
+  type AgentActionClass,
+  type AgentAvailability,
+  type AgentProvisioningDraft,
+  type AgentProvisioningPreview,
+} from '../domain/agent-provisioning'
 import {
   activityForAgent,
   type AgentActivity,
 } from '../domain/agents'
 import {
-  ChevronDownIcon,
   PlusIcon,
   XIcon,
 } from './icons'
@@ -32,7 +42,15 @@ interface AgentManagementPanelProps {
   restoreDemoWorkspace?: boolean
   directoryResetKey?: number
   onSelectTask?(taskId: Uuid): void
-  onProvision(envelope: unknown): Promise<ProvisionAgentResponse>
+  onProvision(draft: AgentProvisioningDraft): Promise<ProvisionAgentResponse>
+  workspaceAiService?: WorkspaceChatService
+  workspaceSnapshot?: WorkspaceSnapshot
+  onPostPersonalAgentComment?(
+    agent: AgentDirectoryItemDto,
+    task: DecryptedTask,
+    markdown: string,
+  ): Promise<void>
+  onOpenAiSettings(): void
 }
 
 type AgentEditorPreferences = {
@@ -64,45 +82,6 @@ const runnerLabel = (
   if (state === 'active') return 'Runner connesso'
   if (state === 'pending_key') return 'In attesa della chiave'
   return 'Runner revocato'
-}
-
-const resizeChatComposer = (textarea: HTMLTextAreaElement) => {
-  textarea.style.height = 'auto'
-  textarea.style.height = `${Math.min(textarea.scrollHeight, 288)}px`
-}
-
-
-const validateProvisioningEnvelope = (value: string): unknown => {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(value)
-  } catch {
-    throw new Error('Il provisioning non contiene JSON valido.')
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('L’envelope di provisioning deve essere un oggetto JSON.')
-  }
-  const record = parsed as Record<string, unknown>
-  const required = [
-    'id',
-    'principal_identity_id',
-    'controller_identity_id',
-    'identity_handle',
-    'encrypted_profile',
-    'profile_resource_node_id',
-    'key_epoch',
-    'availability',
-    'runner_id',
-    'runner_device_id',
-    'encrypted_runner_label',
-    'initial_local_goal',
-    'final_prompt_approval',
-  ]
-  const missing = required.filter((key) => record[key] == null)
-  if (missing.length > 0) {
-    throw new Error(`Campi obbligatori mancanti: ${missing.join(', ')}.`)
-  }
-  return parsed
 }
 
 const activityMeta: Record<
@@ -181,15 +160,25 @@ export const AgentManagementPanel = ({
   directoryResetKey,
   onSelectTask,
   onProvision,
+  workspaceAiService,
+  workspaceSnapshot,
+  onPostPersonalAgentComment,
+  onOpenAiSettings,
 }: AgentManagementPanelProps) => {
   const [createOpen, setCreateOpen] = useState(false)
-  const [envelope, setEnvelope] = useState('')
+  const [provisioningHandle, setProvisioningHandle] = useState('')
+  const [provisioningPrompt, setProvisioningPrompt] = useState('')
+  const [provisioningAvailability, setProvisioningAvailability] =
+    useState<AgentAvailability>('controller_private')
+  const [provisioningActions, setProvisioningActions] =
+    useState<AgentActionClass[]>(['post_comment'])
+  const [provisioningPreview, setProvisioningPreview] =
+    useState<AgentProvisioningPreview>()
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string>()
   const [bootstrap, setBootstrap] = useState<ProvisionAgentResponse>()
   const [copied, setCopied] = useState(false)
   const [demoWorkspaceOpen, setDemoWorkspaceOpen] = useState(false)
-  const [chatDraft, setChatDraft] = useState('')
   const [tasksCollapsed, setTasksCollapsed] = useState(false)
   const [tasksOpening, setTasksOpening] = useState(false)
   const [agentEditorOpen, setAgentEditorOpen] = useState(false)
@@ -207,6 +196,7 @@ export const AgentManagementPanel = ({
     useState<DOMRect | null>(null)
 
   const selectedAgent = agents.find((agent) => agent.id === selectedAgentId)
+  const selectedWorkspaceAgentId = selectedAgent?.id
   const workspaceAgentName = selectedAgent?.identity_handle ?? (demoWorkspaceOpen ? 'Atlas' : undefined)
   const workspaceAgentInitial = workspaceAgentName?.slice(0, 1).toUpperCase()
   const displayedAgentName = agentDisplayName || workspaceAgentName
@@ -217,7 +207,7 @@ export const AgentManagementPanel = ({
     onWorkspaceChange?.(
       workspaceAgentName
         ? {
-            ...(selectedAgent ? { agentId: selectedAgent.id } : {}),
+            ...(selectedWorkspaceAgentId ? { agentId: selectedWorkspaceAgentId } : {}),
             name: displayedAgentName ?? workspaceAgentName,
             avatar: displayedAgentAvatar ?? workspaceAgentInitial ?? '',
           }
@@ -227,6 +217,7 @@ export const AgentManagementPanel = ({
     displayedAgentAvatar,
     displayedAgentName,
     onWorkspaceChange,
+    selectedWorkspaceAgentId,
     workspaceAgentInitial,
     workspaceAgentName,
   ])
@@ -362,30 +353,46 @@ export const AgentManagementPanel = ({
   const closeProvisioning = () => {
     if (submitting) return
     setCreateOpen(false)
-    setEnvelope('')
+    setProvisioningHandle('')
+    setProvisioningPrompt('')
+    setProvisioningAvailability('controller_private')
+    setProvisioningActions(['post_comment'])
+    setProvisioningPreview(undefined)
     setError(undefined)
     setBootstrap(undefined)
     setCopied(false)
   }
 
-  const submitProvisioning = async (event: FormEvent) => {
+  const reviewProvisioning = (event: FormEvent) => {
     event.preventDefault()
     setError(undefined)
-    let parsed: unknown
     try {
-      parsed = validateProvisioningEnvelope(envelope)
+      setProvisioningPreview(compileAgentProvisioningPreview({
+        identityHandle: provisioningHandle,
+        systemPrompt: provisioningPrompt,
+        availability: provisioningAvailability,
+        actions: provisioningActions,
+      }))
     } catch (validationError) {
       setError(
         validationError instanceof Error
           ? validationError.message
           : 'Provisioning non valido.',
       )
-      return
     }
+  }
+
+  const submitProvisioning = async () => {
+    if (!provisioningPreview) return
+    setError(undefined)
     setSubmitting(true)
     try {
-      setBootstrap(await onProvision(parsed))
-      setEnvelope('')
+      setBootstrap(await onProvision({
+        identityHandle: provisioningPreview.identityHandle,
+        systemPrompt: provisioningPreview.systemPrompt,
+        availability: provisioningPreview.availability,
+        actions: provisioningPreview.actions,
+      }))
     } catch (requestError) {
       setError(
         requestError instanceof Error
@@ -435,6 +442,15 @@ export const AgentManagementPanel = ({
                   <span aria-hidden>•••</span>
                 </button>
               </div>
+              {selectedAgent ? <AgentConversation
+                agent={selectedAgent}
+                snapshot={workspaceSnapshot}
+                service={workspaceAiService}
+                onPostComment={onPostPersonalAgentComment
+                  ? (task, markdown) => onPostPersonalAgentComment(selectedAgent, task, markdown)
+                  : undefined}
+                onOpenAiSettings={onOpenAiSettings}
+              /> : <p role="status">Atlas è un esempio. Crea un agente per consultare il suo lavoro tramite il tuo agente personale.</p>}
             </section>
 
             <aside className="agent-workspace-tasks" aria-label={`Task di ${workspaceAgentName}`}>
@@ -488,47 +504,7 @@ export const AgentManagementPanel = ({
                 </>
               )}
             </aside>
-            <label className="agent-chat-composer">
-              <textarea
-                value={chatDraft}
-                onChange={(event) => {
-                  setChatDraft(event.target.value)
-                  resizeChatComposer(event.currentTarget)
-                }}
-                placeholder="Ask everything"
-                aria-label={`Messaggio per ${workspaceAgentName}`}
-                rows={1}
-              />
-              <button
-                type="button"
-                className="agent-chat-attach"
-                aria-label="Aggiungi contesto"
-                title="Aggiungi contesto"
-              >
-                <PlusIcon aria-hidden />
-              </button>
-              <button
-                type="button"
-                className="agent-chat-model"
-                aria-label="Seleziona modello: Sprout 1"
-                aria-haspopup="listbox"
-                title="Seleziona modello"
-              >
-                Sprout 1
-                <ChevronDownIcon aria-hidden />
-              </button>
-              <button
-                type="button"
-                className="agent-chat-send"
-                disabled={!chatDraft.trim()}
-                aria-label="Invia messaggio"
-                title="La consegna E2EE sarà disponibile con l'attivazione della chat sicura"
-              >
-                <svg viewBox="0 0 24 24" fill="none" aria-hidden>
-                  <path d="M12 19V5m0 0-6 6m6-6 6 6" />
-                </svg>
-              </button>
-            </label>
+
           </div>
         ) : (
           <div className="agent-stage" aria-label="Agenti per stato operativo">
@@ -636,7 +612,12 @@ export const AgentManagementPanel = ({
                   <XIcon aria-hidden />
                 </button>
               </header>
-              <div className="agent-editor-fields">
+              {selectedAgent && <p className="agent-conversation-notice">
+                Qui puoi personalizzare nome e icona. Una modifica alle istruzioni operative
+                deve passare dall’agente personale e da una nuova revisione compilata e approvata;
+                non dipende dal runner dell’agente osservato.
+              </p>}
+              {!selectedAgent && <div className="agent-editor-fields">
                 <label className="agent-editor-prompt">
                   <textarea
                     value={agentSystemPrompt}
@@ -645,9 +626,9 @@ export const AgentManagementPanel = ({
                     aria-label="Istruzioni agente"
                   />
                 </label>
-              </div>
+              </div>}
               <footer>
-                <div className="agent-editor-footer-tools">
+                {!selectedAgent && <div className="agent-editor-footer-tools">
                   <button
                     type="button"
                     className="agent-editor-add-capability"
@@ -687,7 +668,7 @@ export const AgentManagementPanel = ({
                       ))}
                     </div>
                   )}
-                </div>
+                </div>}
                 <button
                   type="button"
                   className="primary-button"
@@ -767,34 +748,137 @@ export const AgentManagementPanel = ({
                   </button>
                 </div>
               </div>
-            ) : (
-              <form onSubmit={(event) => void submitProvisioning(event)}>
+            ) : provisioningPreview ? (
+              <div className="agent-provisioning-review">
                 <p className="agent-provisioning-intro">
-                  Sprout crea un agente soltanto da un envelope completo: identità,
-                  profilo cifrato, LocalGoal compilato, firme e final approval.
+                  Controlla la proposta compilata. L’approvazione firma il prompt
+                  esatto e crea insieme identità, LocalGoal e runner.
                 </p>
-                <label className="agent-envelope-field">
-                  Envelope di provisioning firmato
-                  <textarea
+                <dl>
+                  <div>
+                    <dt>Nome tecnico</dt>
+                    <dd>{provisioningPreview.identityHandle}</dd>
+                  </div>
+                  <div>
+                    <dt>Visibilità</dt>
+                    <dd>{provisioningPreview.availability === 'controller_private'
+                      ? 'Privato al controller'
+                      : 'Delegabile nel progetto'}</dd>
+                  </div>
+                </dl>
+                <section className="agent-provisioning-prompt-review" aria-labelledby="agent-prompt-review-title">
+                  <h3 id="agent-prompt-review-title">System prompt</h3>
+                  <p>{provisioningPreview.systemPrompt}</p>
+                </section>
+                <section className="agent-provisioning-capabilities" aria-labelledby="agent-capabilities-title">
+                  <h3 id="agent-capabilities-title">Azioni richieste dal contratto</h3>
+                  <ul>
+                    {provisioningPreview.actions.map((action) => (
+                      <li key={action}>{AGENT_ACTION_LABELS[action]}</li>
+                    ))}
+                  </ul>
+                  <p>Nessun tool esterno viene autorizzato durante la creazione.</p>
+                </section>
+                {error && <p className="agent-provisioning-error" role="alert">{error}</p>}
+                <div className="agent-dialog-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={submitting}
+                    onClick={() => {
+                      setProvisioningPreview(undefined)
+                      setError(undefined)
+                    }}
+                  >
+                    Modifica
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={submitting}
+                    onClick={() => void submitProvisioning()}
+                  >
+                    {submitting ? 'Firma e crea…' : 'Approva e crea agente'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <form onSubmit={reviewProvisioning}>
+                <p className="agent-provisioning-intro">
+                  Descrivi in linguaggio naturale identità, obiettivi e modo di
+                  lavorare. Sprout compilerà una proposta di provisioning da
+                  controllare prima della firma.
+                </p>
+                <label className="agent-provisioning-field">
+                  Nome tecnico
+                  <input
                     required
                     autoFocus
-                    spellCheck={false}
-                    value={envelope}
-                    onChange={(event) => setEnvelope(event.target.value)}
-                    placeholder={'{\n  "id": "…",\n  "principal_identity_id": "…",\n  "initial_local_goal": { … }\n}'}
+                    minLength={3}
+                    maxLength={128}
+                    value={provisioningHandle}
+                    onChange={(event) => setProvisioningHandle(event.target.value)}
+                    placeholder="es. assistente-progetto"
+                    autoComplete="off"
                   />
                 </label>
+                <label className="agent-provisioning-field">
+                  System prompt
+                  <textarea
+                    required
+                    maxLength={12_000}
+                    value={provisioningPrompt}
+                    onChange={(event) => setProvisioningPrompt(event.target.value)}
+                    placeholder="Descrivi cosa deve fare l’agente, come deve comportarsi e quali limiti deve rispettare."
+                  />
+                </label>
+                <label className="agent-provisioning-field">
+                  Visibilità
+                  <select
+                    value={provisioningAvailability}
+                    onChange={(event) => setProvisioningAvailability(event.target.value as AgentAvailability)}
+                  >
+                    <option value="controller_private">Privato al controller</option>
+                    <option value="project_delegable">Delegabile nel progetto</option>
+                  </select>
+                </label>
+                <fieldset className="agent-provisioning-action-picker">
+                  <legend>Capacità operative</legend>
+                  <p>
+                    Scegli esplicitamente cosa potrà fare l’agente. Il system prompt
+                    non può concedere permessi da solo.
+                  </p>
+                  <div>
+                    {AGENT_ACTIONS.map((action) => (
+                      <label key={action}>
+                        <input
+                          type="checkbox"
+                          checked={provisioningActions.includes(action)}
+                          onChange={(event) => setProvisioningActions((current) =>
+                            event.target.checked
+                              ? [...current, action]
+                              : current.filter((candidate) => candidate !== action))}
+                        />
+                        <span>{AGENT_ACTION_LABELS[action]}</span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
                 <p className="agent-provisioning-note">
-                  Le chiavi private e il testo in chiaro non devono essere inclusi.
-                  Certificati e firme vengono verificati dal backend.
+                  Il prompt viene cifrato sul dispositivo. Il backend riceve soltanto
+                  ciphertext, impegni crittografici, contratto compilato e firme.
                 </p>
                 {error && <p className="agent-provisioning-error" role="alert">{error}</p>}
                 <div className="agent-dialog-actions">
-                  <button type="button" className="secondary-button" onClick={closeProvisioning} disabled={submitting}>
+                  <button type="button" className="secondary-button" onClick={closeProvisioning}>
                     Annulla
                   </button>
-                  <button type="submit" className="primary-button" disabled={submitting || !envelope.trim()}>
-                    {submitting ? 'Verifica e crea…' : 'Verifica e crea agente'}
+                  <button
+                    type="submit"
+                    className="primary-button"
+                    disabled={!provisioningHandle.trim() || !provisioningPrompt.trim() || provisioningActions.length === 0}
+                  >
+                    Struttura proposta
                   </button>
                 </div>
               </form>

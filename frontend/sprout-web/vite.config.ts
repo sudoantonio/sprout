@@ -13,6 +13,20 @@ const developmentTrustedTypesCompatibility = {
 
 export default defineConfig(({ command }) => {
   const proxyTarget = process.env.SPROUT_DEV_API_PROXY_TARGET
+  const proxy = {
+    ...(proxyTarget
+      ? {
+          '/v1': { target: proxyTarget },
+          '/health': { target: proxyTarget },
+        }
+      : {}),
+    '/__sprout-ai/deepseek': {
+      target: 'https://api.deepseek.com',
+      changeOrigin: true,
+      secure: true,
+      rewrite: (path: string) => path.replace(/^\/__sprout-ai\/deepseek/, ''),
+    },
+  }
   return {
     plugins: [
       react(),
@@ -22,13 +36,6 @@ export default defineConfig(({ command }) => {
       target: 'es2022',
       sourcemap: false,
     },
-    server: proxyTarget
-      ? {
-          proxy: {
-            '/v1': { target: proxyTarget },
-            '/health': { target: proxyTarget },
-          },
-        }
-      : undefined,
+    server: { proxy },
   }
 })

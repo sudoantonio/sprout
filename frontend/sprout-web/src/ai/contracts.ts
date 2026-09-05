@@ -179,12 +179,13 @@ export type JsonSchema = {
 
 export type InformationSource =
   | { kind: 'resource_body'; resource_id: Uuid }
-  | { kind: 'task_event'; task_id: Uuid; event_id: Uuid }
-  | { kind: 'comment'; comment_id: Uuid }
-  | { kind: 'tool_outcome'; invocation_id: Uuid }
-  | { kind: 'global_contract'; goal_id: Uuid; revision: number }
-  | { kind: 'user_proxy_transcript'; request_id: Uuid }
-  | { kind: 'interrogation_transcript'; interrogation_id: Uuid }
+  | { kind: 'comment'; resource_id: Uuid; comment_id: Uuid }
+  | { kind: 'info_document'; resource_id: Uuid; document_id: Uuid }
+  | { kind: 'info_file'; resource_id: Uuid; file_id: Uuid }
+  | { kind: 'tool_output'; call_id: Uuid }
+  | { kind: 'proxy_transcript'; thread_id: Uuid }
+  | { kind: 'event_history'; event_id: Uuid }
+  | { kind: 'provenance'; provenance_id: Uuid }
 
 export interface StructuredLanguageTaskEnvelopeDto {
   id: Uuid

@@ -1,10 +1,12 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentDirectoryItemDto } from '../api/contracts'
 import { AgentManagementPanel } from './AgentManagementPanel'
 
 const agent: AgentDirectoryItemDto = {
+  profile_resource_node_id: '00000000-0000-4000-8000-000000000107',
+  key_epoch: 1,
   id: '00000000-0000-4000-8000-000000000101',
   principal_identity_id: '00000000-0000-4000-8000-000000000102',
   identity_handle: 'minerva-agent',
@@ -25,6 +27,7 @@ const baseProps = {
   agents: [agent],
   onSelectAgent: vi.fn(),
   onShowDirectory: vi.fn(),
+  onOpenAiSettings: vi.fn(),
   onProvision: vi.fn().mockResolvedValue({
     agent_id: agent.id,
     principal_identity_id: agent.principal_identity_id,
@@ -36,22 +39,6 @@ const baseProps = {
   }),
 }
 
-const validEnvelope = {
-  id: agent.id,
-  principal_identity_id: agent.principal_identity_id,
-  controller_identity_id: agent.controller_identity_id,
-  identity_handle: agent.identity_handle,
-  encrypted_profile: { ciphertext: 'encrypted' },
-  profile_resource_node_id: '00000000-0000-4000-8000-000000000107',
-  key_epoch: 1,
-  availability: 'controller_private',
-  runner_id: agent.runner_id,
-  runner_device_id: agent.runner_device_id,
-  encrypted_runner_label: { ciphertext: 'encrypted' },
-  initial_local_goal: { signed: true },
-  final_prompt_approval: { signed: true },
-}
-
 describe('AgentManagementPanel', () => {
   it('shows the server-derived directory and opens an agent detail', async () => {
     const user = userEvent.setup()
@@ -59,33 +46,31 @@ describe('AgentManagementPanel', () => {
     render(<AgentManagementPanel {...baseProps} onSelectAgent={onSelectAgent} />)
 
     expect(screen.getByRole('heading', { name: 'Agenti' })).toBeVisible()
-    expect(screen.getByLabelText('Atlas, agente di esempio, Working')).toBeVisible()
-    expect(screen.getByRole('heading', { name: 'Working' })).toBeVisible()
+    expect(screen.getByLabelText('Atlas, agente di esempio, Rest')).toBeVisible()
+    expect(screen.queryByRole('heading', { name: 'Working' })).not.toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Done' })).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Rest' })).toBeVisible()
     await user.click(screen.getByRole('button', { name: /minerva-agent/i }))
     expect(onSelectAgent).toHaveBeenCalledWith(agent.id)
   })
 
-  it('rejects an incomplete provisioning envelope before the request', async () => {
+  it('validates the natural-language proposal before the request', async () => {
     const user = userEvent.setup()
     const onProvision = vi.fn()
     render(<AgentManagementPanel {...baseProps} onProvision={onProvision} />)
 
     await user.click(screen.getByRole('button', { name: 'Crea nuovo agente' }))
-    fireEvent.change(
-      screen.getByLabelText('Envelope di provisioning firmato'),
-      { target: { value: JSON.stringify({ id: agent.id }) } },
-    )
-    await user.click(screen.getByRole('button', { name: 'Verifica e crea agente' }))
+    await user.type(screen.getByLabelText('Nome tecnico'), 'Nome non valido')
+    await user.type(screen.getByLabelText('System prompt'), 'Rispondi ai commenti del progetto.')
+    await user.click(screen.getByRole('button', { name: 'Struttura proposta' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Campi obbligatori mancanti',
+      'senza spazi',
     )
     expect(onProvision).not.toHaveBeenCalled()
   })
 
-  it('submits a complete envelope and presents the one-shot bootstrap token', async () => {
+  it('reviews the compiled proposal before provisioning and presents the one-shot token', async () => {
     const user = userEvent.setup()
     const onProvision = vi.fn().mockResolvedValue({
       agent_id: agent.id,
@@ -99,13 +84,27 @@ describe('AgentManagementPanel', () => {
     render(<AgentManagementPanel {...baseProps} onProvision={onProvision} />)
 
     await user.click(screen.getByRole('button', { name: 'Crea nuovo agente' }))
-    fireEvent.change(
-      screen.getByLabelText('Envelope di provisioning firmato'),
-      { target: { value: JSON.stringify(validEnvelope) } },
+    await user.type(screen.getByLabelText('Nome tecnico'), 'project-helper')
+    await user.type(
+      screen.getByLabelText('System prompt'),
+      'Crea task e pubblica commenti sintetici sul progetto.',
     )
-    await user.click(screen.getByRole('button', { name: 'Verifica e crea agente' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Creare task' }))
+    await user.selectOptions(screen.getByLabelText('Visibilità'), 'project_delegable')
+    await user.click(screen.getByRole('button', { name: 'Struttura proposta' }))
 
-    expect(onProvision).toHaveBeenCalledWith(validEnvelope)
+    expect(screen.getByRole('heading', { name: 'System prompt' })).toBeVisible()
+    expect(screen.getByText('Creare task')).toBeVisible()
+    expect(screen.getByText('Pubblicare commenti')).toBeVisible()
+    expect(onProvision).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Approva e crea agente' }))
+
+    expect(onProvision).toHaveBeenCalledWith({
+      identityHandle: 'project-helper',
+      systemPrompt: 'Crea task e pubblica commenti sintetici sul progetto.',
+      availability: 'project_delegable',
+      actions: ['post_comment', 'create_task'],
+    })
     expect(await screen.findByDisplayValue('one-shot-bootstrap-token')).toBeVisible()
     expect(screen.getByText('Visibile una sola volta')).toBeVisible()
   })

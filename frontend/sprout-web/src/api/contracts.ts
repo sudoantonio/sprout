@@ -72,6 +72,8 @@ export interface ParticipantSuggestionDto {
 }
 
 export interface AgentDirectoryItemDto {
+  profile_resource_node_id: Uuid
+  key_epoch: number
   id: Uuid
   principal_identity_id: Uuid
   identity_handle: string

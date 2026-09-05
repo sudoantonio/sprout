@@ -13341,3 +13341,231 @@ async fn cross_owner_review_requires_exact_active_task_provenance_and_current_pe
         semantic_provenance_after_concurrency
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database; applies migrations"]
+async fn browser_chat_history_and_invocation_status_are_creator_scoped() {
+    let database_url = env::var("DATABASE_URL").expect("disposable DATABASE_URL");
+    sprout_storage_postgres::PostgresStorage::connect(&database_url, 5)
+        .await
+        .unwrap()
+        .migrate(concat!(env!("CARGO_MANIFEST_DIR"), "/../../db/migrations"))
+        .await
+        .unwrap();
+    let fixture = fixture().await;
+    let app = app(&fixture);
+    let (status, provisioned) =
+        provision_administrator_governed_agent(&fixture, &app, 201, None, None, |_| {}, true).await;
+    assert_eq!(status, StatusCode::OK);
+    let runner = activate_exact_tool_runner(&fixture, &app, &provisioned).await;
+    let (_, _, other_token, _) = add_human_member(&fixture, "member").await;
+    let base = format!(
+        "/v1/projects/{}/agents/{}",
+        fixture.project_id, provisioned.agent_id
+    );
+    let mut ids = Vec::new();
+    for _ in 0..32 {
+        let id = Uuid::new_v4();
+        let response = app.clone().oneshot(Request::builder().method("POST")
+            .uri(format!("{base}/interrogations"))
+            .header("authorization", format!("Bearer {}", fixture.owner_token))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "id": id, "transcript_resource_node_id": fixture.profile_resource_id,
+                "key_epoch": 1, "encrypted_transcript": encrypted(9),
+                "causal_delta": { "resource_effects": [], "tool_invocations": [],
+                    "prompt_revisions": [], "local_goal_revisions": [], "created_work": [],
+                    "activated_obligations": [], "assigned_tasks": [] }
+            }).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        ids.push(id);
+    }
+    let invocation_id = Uuid::new_v4();
+    let queue = json!({
+        "id": invocation_id, "surface": "interrogation", "interrogation_id": ids[31],
+        "encrypted_input": encrypted(9),
+        "authority_envelope": { "resource_authority": [], "tool_authority": [] },
+        "sources": [{ "kind": "resource_body", "resource_id": fixture.profile_resource_id }],
+        "language_task": {
+            "id": Uuid::new_v4(), "kind": "answer_from_authorized_context",
+            "input_item_count": 1, "max_input_items": 1, "max_output_items": 1,
+            "max_nesting_depth": 2, "max_attempts": 2, "closed_output_schema": true,
+            "grounded_identifiers_only": true, "requires_formal_proof": false,
+            "requires_permission_decision": false, "requires_exact_semantic_equivalence": false,
+            "requires_exhaustive_world_knowledge": false,
+            "allowed_resource_ids": [fixture.profile_resource_id],
+            "allowed_principal_ids": [fixture.owner_id], "allowed_tools": []
+        }
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{base}/invocations/client-provider"))
+                .header("authorization", format!("Bearer {}", fixture.owner_token))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(queue.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&to_bytes(response.into_body(), 65536).await.unwrap())
+    );
+
+    async fn read(app: &axum::Router, path: &str, token: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+    let (status, first) = read(
+        &app,
+        &format!("{base}/interrogations"),
+        &fixture.owner_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["messages"].as_array().unwrap().len(), 30);
+    assert_eq!(first["messages"][0]["id"], ids[31].to_string());
+    assert_eq!(first["messages"][0]["encrypted_transcript"], encrypted(9));
+    assert_eq!(first["messages"][0]["invocation"]["status"], "pending");
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let (status, second) = read(
+        &app,
+        &format!("{base}/interrogations?before={cursor}"),
+        &fixture.owner_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["messages"].as_array().unwrap().len(), 2);
+    assert!(second["next_cursor"].is_null());
+    assert_eq!(second["messages"][1]["id"], ids[0].to_string());
+    let (status, other) = read(&app, &format!("{base}/interrogations"), &other_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(other["messages"], json!([]));
+    let status_path = format!("{base}/invocations/{invocation_id}");
+    let (status, projection) = read(&app, &status_path, &fixture.owner_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        projection,
+        json!({ "id": invocation_id, "status": "pending", "attempt": 0, "max_attempts": 2 })
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{base}/runner/client-provider/claim"))
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"execution_profile_commitment_hex": "66".repeat(32)}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let claim: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    let output = json!({"items": [], "max_observed_nesting_depth": 1});
+    let artifact = json!({ "kind": "interrogation_answer", "session_id": ids[31],
+        "encrypted_answer": encrypted(33), "context_sources": queue["sources"] });
+    let output_hash = sha256_hex(
+        json!({"structured_output": output, "encrypted_output": encrypted(32), "effects": []})
+            .to_string()
+            .as_bytes(),
+    );
+    let statement = json!({
+        "observation_id": Uuid::new_v4(), "dispatch_id": claim["dispatch_id"],
+        "invocation_id": invocation_id, "attempt": claim["attempt"], "lease_id": claim["lease_id"],
+        "principal_identity_id": fixture.owner_id, "exposed_sources": queue["sources"],
+        "request_commitment_hex": claim["request_commitment_hex"],
+        "context_commitment_hex": claim["context_commitment_hex"],
+        "transport_commitment_hex": claim["transport_commitment_hex"],
+        "endpoint_request_commitment_hex": "44".repeat(32), "endpoint_request_exact": true,
+        "runtime_kind": "client_provider_v1", "execution_profile_commitment_hex": "66".repeat(32),
+        "output_commitment_hex": output_hash, "artifact_commitment_hex": canonical_hash_hex(&artifact),
+        "provider_status": "schema_valid", "hidden_persistent_model_memory_available": false,
+        "idempotency_key": Uuid::new_v4(), "observed_at": Utc::now()
+    });
+    let signatures = signed_statement_by(
+        provisioned.principal_identity_id,
+        provisioned.runner_device_id,
+        &runner.ed25519_private_key,
+        &runner.ml_dsa_65_private_key,
+        &statement,
+        b"sprout-model-runtime-observation-v1",
+    );
+    let submit = json!({ "lease_id": claim["lease_id"], "structured_output": output,
+        "encrypted_output": encrypted(32), "effects": [], "artifact": artifact,
+        "endpoint_request_commitment_hex": "44".repeat(32), "endpoint_request_exact": true,
+        "runtime_kind": "client_provider_v1", "execution_profile_commitment_hex": "66".repeat(32),
+        "observation": { "statement": statement, "signatures": signatures } });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{base}/invocations/{invocation_id}/submit"))
+                .header("authorization", format!("Bearer {}", runner.bearer))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(submit.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 65536).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (_, completed) = read(
+        &app,
+        &format!("{base}/interrogations"),
+        &fixture.owner_token,
+    )
+    .await;
+    assert_eq!(
+        completed["messages"][0]["invocation"]["status"],
+        "succeeded"
+    );
+    assert_eq!(completed["messages"][0]["encrypted_answer"], encrypted(33));
+    assert!(completed["messages"][0]["answered_at"].is_string());
+    assert_eq!(
+        read(&app, &status_path, &other_token).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        read(&app, &status_path, &runner.bearer).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        read(&app, &format!("{base}/interrogations"), &runner.bearer)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let foreign_path = format!(
+        "/v1/projects/{}/agents/{}/interrogations",
+        Uuid::new_v4(),
+        provisioned.agent_id
+    );
+    assert!(matches!(
+        read(&app, &foreign_path, &fixture.owner_token).await.0,
+        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+    ));
+}

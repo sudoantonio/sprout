@@ -41,10 +41,12 @@ device owns provider selection, model, credential, endpoint, plaintext,
 network transport and output encryption. The backend never calls an inference
 provider and has no outbound AI client dependency.
 
-The browser is a control plane. `LocalEdgeInferenceBridge` defines the native
-user-owned transport contract, while direct browser inference is always
-disabled because Node `fetch` success is not evidence of browser CORS or safe
-credential handling. No Sprout-backend proxy exists.
+For governed agent invocations the browser remains a control plane and
+`LocalEdgeInferenceBridge` defines the native user-owned transport contract.
+The standalone project assistant and model discovery may call an explicitly
+configured `commercial_api` or `lan_inference` adapter from the device when the
+provider accepts the browser origin. Those calls do not claim or submit an
+agent invocation. No Sprout-backend proxy exists.
 
 **Current classification:** the provider adapters and edge contract are
 concretely implemented and live-tested, but Mode A/B are not yet production

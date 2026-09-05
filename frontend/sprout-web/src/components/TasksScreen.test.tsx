@@ -15,6 +15,7 @@ import type {
   InfoDocumentContent,
 } from '../domain/models'
 import { startOfWeek } from '../domain/timeline'
+import { WorkspaceChatService, type WorkspaceChatTurn } from '../ai/workspace-chat'
 import type {
   BoardMember,
   ProjectItem,
@@ -125,6 +126,12 @@ const members: BoardMember[] = [
   { identityId: otherMemberId, label: 'Lucia Bianchi' },
 ]
 
+const emptyWorkspaceChatVault = {
+  getLocalSetting: () => undefined,
+  putLocalSetting: vi.fn().mockResolvedValue(true),
+  deleteLocalSetting: vi.fn().mockResolvedValue(true),
+}
+
 const makeTask = (
   title: string,
   list: string,
@@ -185,6 +192,7 @@ const baseProps = {
   lockedTasks: [],
   boardMembers: members,
   agents: [],
+  workspaceAiService: new WorkspaceChatService(emptyWorkspaceChatVault),
   agentsLoading: false,
   boardFocus: { type: 'generali' as const },
   boardViewMode: 'board' as const,
@@ -239,6 +247,7 @@ const baseProps = {
     bootstrap_expires_at: '2026-08-26T03:00:00.000Z',
     runner_state: 'pending_key' as const,
   }),
+  onOpenAiSettings: vi.fn(),
   taskAttachments: [],
   taskAttachmentLabels: {},
   onRefreshTaskAttachments: vi.fn().mockResolvedValue(undefined),
@@ -384,20 +393,74 @@ describe('board shell', () => {
     expect(onSelectProject).toHaveBeenCalledWith(otherProjectId)
   })
 
-  it('expands the Ask to AI composer with multiline content', async () => {
+  it('opens project AI independently from the agent directory', async () => {
     const user = userEvent.setup()
     render(<TasksScreen {...baseProps} />)
+    await user.click(screen.getByRole('button', { name: 'Ask to AI' }))
+    const dialog = screen.getByRole('dialog', { name: 'New chat' })
+    expect(dialog).toHaveTextContent('New chat')
+    expect(dialog).toHaveTextContent('Configura un provider esterno')
+    expect(dialog).not.toHaveTextContent('agente')
+    const input = within(dialog).getByLabelText('Messaggio per Ask to AI')
+    expect(input).toBeEnabled()
+    await user.type(input, 'Quali task scadono questa settimana?')
+    expect(input).toHaveValue('Quali task scadono questa settimana?')
+    await user.click(within(dialog).getByRole('button', { name: 'Apri impostazioni AI' }))
+    expect(baseProps.onOpenAiSettings).toHaveBeenCalledOnce()
+  })
+
+  it('materializes a confirmed UserProxy create-task plan with the current user action', async () => {
+    const user = userEvent.setup()
+    const requestId = crypto.randomUUID()
+    const assistantId = crypto.randomUUID()
+    const proposal = {
+      id: crypto.randomUUID(),
+      requestId,
+      kind: 'create_task' as const,
+      targetId: taskList.wire.id,
+      title: 'Analizzare i certificati API',
+      notes: '',
+      priority: 'high' as const,
+      assigneeIdentityId: '' as const,
+      name: '',
+      email: '',
+      role: '' as const,
+      summary: 'Crea il task “Analizzare i certificati API” nella tasklist “List A” con priorità high.',
+      status: 'pending' as const,
+    }
+    const turns: WorkspaceChatTurn[] = [
+      { id: requestId, role: 'user', content: 'Crea il task', createdAt: new Date().toISOString() },
+      { id: assistantId, role: 'assistant', content: 'Controlla e conferma.', createdAt: new Date().toISOString(), proposal },
+    ]
+    const service = {
+      history: vi.fn().mockReturnValue(turns),
+      availability: vi.fn().mockReturnValue({ profileConfigured: true, runtimeConnected: true }),
+      updateProposalStatus: vi.fn().mockResolvedValue([
+        turns[0],
+        { ...turns[1], proposal: { ...proposal, status: 'executed' } },
+      ]),
+      clear: vi.fn(),
+      ask: vi.fn(),
+    } as unknown as WorkspaceChatService
+    const onCreateTask = vi.fn().mockResolvedValue(undefined)
+    render(
+      <TasksScreen
+        {...baseProps}
+        workspaceAiService={service}
+        onCreateTask={onCreateTask}
+      />,
+    )
 
     await user.click(screen.getByRole('button', { name: 'Ask to AI' }))
-    const composer = screen.getByLabelText('Messaggio per Ask to AI')
-    Object.defineProperty(composer, 'scrollHeight', {
-      configurable: true,
-      value: 132,
-    })
+    await user.click(screen.getByRole('button', { name: 'Conferma ed esegui' }))
 
-    fireEvent.change(composer, { target: { value: 'Testo su più righe' } })
-
-    expect(composer).toHaveStyle({ height: '132px', overflowY: 'hidden' })
+    expect(onCreateTask).toHaveBeenCalledWith({
+      title: 'Analizzare i certificati API',
+      notes: undefined,
+      taskKind: 'priority',
+      priority: 'high',
+    }, taskList.wire.id)
+    expect(await screen.findByText('Azione eseguita')).toBeVisible()
   })
 
   it('renders note URLs as links only in the open task detail', () => {
@@ -2884,7 +2947,7 @@ describe('board shell', () => {
       wire: {
         id: olderPresetId,
         project_id: projectId,
-        payload: null,
+        payload: taskList.wire.payload!,
         created_at: '2026-09-02T12:00:00.000Z',
         deleted_at: null,
       },

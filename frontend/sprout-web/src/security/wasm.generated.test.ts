@@ -17,6 +17,9 @@ import {
   wrapResourceKeyForRecipient,
 } from './wasm'
 import type { GeneratedSproutCryptoModule } from './wasm'
+import { chatCrypto } from '../ai/chat'
+import { createAgentChatCrypto } from '../ai/chat-runner'
+import { fromAgentPayload, toAgentPayload } from '../ai/agent-api'
 import type { ResourceKind } from '../domain/models'
 
 const encoder = new TextEncoder()
@@ -115,11 +118,33 @@ const loadGeneratedModule =
   }
 
 describe('generated Rust/WASM crypto boundary', () => {
+  it('round-trips browser chat through the native runner with turn and epoch isolation', async () => {
+    configureCryptoModuleForTests(await loadGeneratedModule())
+    const projectId = crypto.randomUUID(), resourceId = crypto.randomUUID(), sessionId = crypto.randomUUID()
+    const key = new Uint8Array(32).fill(0x53)
+    const vault = { getResourceKey: (_id: string, epoch?: number) => epoch === 2 ? key.slice() : undefined }
+    const browser = chatCrypto(vault, projectId, resourceId, 2, sessionId)
+    const runner = createAgentChatCrypto(vault, projectId, { profile_resource_node_id: resourceId, key_epoch: 2 }, async () => [])
+    try {
+      await expect(runner.encryptOutput('unbound')).rejects.toThrow('No authenticated')
+      const input = { kind: 'answer_from_authorized_context', session_id: sessionId, question: 'Quale risposta?', instructions: 'Return JSON' }
+      const encrypted = await browser.encrypt(input)
+      expect(JSON.stringify(encrypted)).not.toContain('Quale risposta?')
+      await expect(runner.decryptInvocationInput(fromAgentPayload(encrypted))).resolves.toEqual(input)
+      const answer = toAgentPayload(await runner.encryptOutput('Risposta autorizzata'))
+      await expect(browser.decrypt(answer)).resolves.toBe('Risposta autorizzata')
+      await expect(chatCrypto(vault, projectId, resourceId, 2, crypto.randomUUID()).decrypt(answer)).rejects.toBeDefined()
+      await expect(chatCrypto(vault, projectId, resourceId, 3, sessionId).decrypt(answer)).rejects.toBeDefined()
+      await expect(chatCrypto(vault, crypto.randomUUID(), resourceId, 2, sessionId).decrypt(answer)).rejects.toBeDefined()
+    } finally { configureCryptoModuleForTests(); key.fill(0) }
+  })
+
   it('encrypts every application resource as a resource payload', async () => {
     const module = await loadGeneratedModule()
     configureCryptoModuleForTests(module)
     const resourceKey = new Uint8Array(32).fill(0x41)
     const kinds: ResourceKind[] = [
+      'agent-chat',
       'project',
       'topic',
       'task-list',

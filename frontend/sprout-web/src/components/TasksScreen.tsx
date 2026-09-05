@@ -81,7 +81,6 @@ import {
   CalendarIcon,
   CheckIcon,
   ChevronIcon,
-  ChevronDownIcon,
   CircleIcon,
   ClockIcon,
   ExpandDetailIcon,
@@ -101,7 +100,6 @@ import {
   SearchIcon,
   SidebarAgentIcon,
   StarIcon,
-  TimeHistoryIcon,
   TrashIcon,
   XIcon,
 } from './icons'
@@ -110,7 +108,10 @@ import {
   type WorkspaceUserMenuProps,
 } from './WorkspaceUserMenu'
 import { NaturalLanguageDateField } from './NaturalLanguageDateField'
+import type { WorkspaceActionProposal, WorkspaceChatService } from '../ai/workspace-chat'
+import { WorkspaceAiChat } from './WorkspaceAiChat'
 import { AgentManagementPanel } from './AgentManagementPanel'
+import type { AgentProvisioningDraft } from '../domain/agent-provisioning'
 
 type AgentActivityFilter = 'all' | 'working' | 'done' | 'rest'
 
@@ -127,6 +128,7 @@ export interface TasksScreenProps {
   lockedTasks: TaskDto[]
   boardMembers: BoardMember[]
   agents: AgentDirectoryItemDto[]
+  workspaceAiService?: WorkspaceChatService
   boardFocus: BoardFocus
   boardViewMode: BoardViewMode
   selectedTopicId?: Uuid
@@ -220,7 +222,13 @@ export interface TasksScreenProps {
     memberIdentityId: Uuid,
     responsibilities: string,
   ): Promise<void>
-  onProvisionAgent(envelope: unknown): Promise<ProvisionAgentResponse>
+  onProvisionAgent(draft: AgentProvisioningDraft): Promise<ProvisionAgentResponse>
+  onPostPersonalAgentComment?(
+    agent: AgentDirectoryItemDto,
+    task: DecryptedTask,
+    markdown: string,
+  ): Promise<void>
+  onOpenAiSettings(): void
   taskAttachments: AttachmentCollectionItemDto[]
   taskAttachmentLabels: Record<string, string>
   onRefreshTaskAttachments(taskId: Uuid): Promise<void>
@@ -2319,107 +2327,6 @@ const BoardViewNavigation = ({
   </div>
 )
 
-const resizeBoardAiComposer = (textarea: HTMLTextAreaElement) => {
-  textarea.style.height = 'auto'
-  const nextHeight = Math.min(textarea.scrollHeight, 288)
-  textarea.style.height = `${nextHeight}px`
-  textarea.style.overflowY =
-    textarea.scrollHeight > nextHeight ? 'auto' : 'hidden'
-}
-
-const BoardAiBadge = ({ onClose }: { onClose(): void }) => {
-  const [draft, setDraft] = useState('')
-  const [historyOpen, setHistoryOpen] = useState(false)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
-
-  useEffect(() => {
-    inputRef.current?.focus()
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', onKeyDown)
-    return () => document.removeEventListener('keydown', onKeyDown)
-  }, [onClose])
-
-  return createPortal(
-    <section className="board-ai-badge" role="dialog" aria-label="New chat">
-      <header className="board-ai-badge-header">
-        <div className="board-ai-badge-title">
-          <button
-            type="button"
-            className="board-ai-badge-history"
-            onClick={() => setHistoryOpen((open) => !open)}
-            aria-label="Mostra chat passate"
-            aria-expanded={historyOpen}
-            title="Chat passate"
-          >
-            <TimeHistoryIcon aria-hidden />
-          </button>
-          <span>New chat</span>
-        </div>
-        <button type="button" onClick={onClose} aria-label="Chiudi New chat">
-          <XIcon aria-hidden />
-        </button>
-      </header>
-      {historyOpen && (
-        <div className="board-ai-badge-history-menu" role="status">
-          Nessuna chat precedente
-        </div>
-      )}
-      <div className="board-ai-badge-body">
-        {!historyOpen && (
-          <img
-            className="board-ai-badge-empty-logo"
-            src="/sprout-ai-logo.png"
-            alt=""
-          />
-        )}
-        <label className="agent-chat-composer board-ai-badge-composer">
-          <textarea
-            ref={inputRef}
-            value={draft}
-            onChange={(event) => {
-              setDraft(event.target.value)
-              resizeBoardAiComposer(event.currentTarget)
-            }}
-            placeholder="Ask everything"
-            aria-label="Messaggio per Ask to AI"
-            rows={1}
-          />
-          <button
-            type="button"
-            className="agent-chat-attach"
-            aria-label="Aggiungi contesto"
-            title="Aggiungi contesto"
-          >
-            <PlusIcon aria-hidden />
-          </button>
-          <button
-            type="button"
-            className="agent-chat-model"
-            aria-label="Seleziona modello: Sprout 1"
-            title="Seleziona modello"
-          >
-            Sprout 1
-            <ChevronDownIcon aria-hidden />
-          </button>
-          <button
-            type="button"
-            className="agent-chat-send"
-            disabled={!draft.trim()}
-            aria-label="Invia messaggio"
-            title="Disponibile prossimamente"
-          >
-            <svg viewBox="0 0 24 24" fill="none" aria-hidden>
-              <path d="M12 19V5m0 0-6 6m6-6 6 6" />
-            </svg>
-          </button>
-        </label>
-      </div>
-    </section>,
-    document.body,
-  )
-}
 
 const BoardPathBadge = ({
   topics,
@@ -5244,6 +5151,7 @@ export const TasksScreen = ({
   lockedTasks,
   boardMembers,
   agents,
+  workspaceAiService,
   boardFocus,
   boardViewMode,
   selectedTopicId,
@@ -5294,6 +5202,8 @@ export const TasksScreen = ({
   onInviteMember,
   onUpdateMemberResponsibilities,
   onProvisionAgent,
+  onPostPersonalAgentComment,
+  onOpenAiSettings,
   taskAttachments,
   taskAttachmentLabels,
   onRefreshTaskAttachments,
@@ -6194,6 +6104,113 @@ export const TasksScreen = ({
     setShowNewList(false)
   }
 
+  const executeWorkspaceAiAction = useCallback(async (proposal: WorkspaceActionProposal) => {
+    const topic = topics.find((item) => item.wire.id === proposal.targetId)
+    const list = taskLists.find((item) => item.wire.id === proposal.targetId)
+    const task = tasks.find((item) => item.wire.id === proposal.targetId)
+    const member = boardMembers.find((item) => item.identityId === proposal.targetId)
+
+    switch (proposal.kind) {
+      case 'create_topic':
+        await onCreateTopic(proposal.name)
+        return
+      case 'rename_topic':
+        if (!topic) throw new Error('La categoria non è più disponibile.')
+        await onRenameTopic(topic, proposal.name)
+        return
+      case 'toggle_topic_favorite':
+        if (!topic) throw new Error('La categoria non è più disponibile.')
+        await onToggleTopicFavorite(topic)
+        return
+      case 'delete_topic':
+        if (!topic) throw new Error('La categoria non è più disponibile.')
+        await onDeleteTopic(topic)
+        return
+      case 'create_task_list':
+        if (!topic) throw new Error('La categoria non è più disponibile.')
+        await onCreateList(proposal.name, topic.wire.id)
+        return
+      case 'rename_task_list':
+        if (!list?.document) throw new Error('La tasklist non è più disponibile.')
+        await onUpdateTaskList(list, {
+          name: proposal.name,
+          color: list.document.color,
+          icon: list.document.icon,
+        })
+        return
+      case 'create_task':
+        if (!list) throw new Error('La tasklist non è più disponibile.')
+        await onCreateTask({
+          title: proposal.title,
+          notes: proposal.notes || undefined,
+          taskKind: 'priority',
+          priority: proposal.priority || 'normal',
+        }, list.wire.id)
+        return
+      case 'update_task': {
+        if (!task) throw new Error('Il task non è più disponibile.')
+        const input: TaskUpdateInput = {
+          title: proposal.title || task.document.title,
+          taskKind: task.wire.task_kind,
+          notes: proposal.notes || task.document.notes,
+          questionnaireVersionId: task.wire.questionnaire_version_id ?? undefined,
+        }
+        if (task.wire.task_kind === 'priority') {
+          input.priority = proposal.priority || task.document.priority || 'normal'
+        } else {
+          input.dueAt = task.document.due_at
+        }
+        if (task.wire.task_kind === 'recurring') {
+          input.recurrence = task.document.recurrence
+        }
+        await onUpdateTask(task, input)
+        return
+      }
+      case 'complete_task':
+        if (!task) throw new Error('Il task non è più disponibile.')
+        await onCompleteTask(task)
+        return
+      case 'copy_task':
+        if (!task) throw new Error('Il task non è più disponibile.')
+        await onCopyTask(task)
+        return
+      case 'assign_task':
+        if (!task || !proposal.assigneeIdentityId) {
+          throw new Error('Il task o l’assegnatario non sono più disponibili.')
+        }
+        await onAssignTask(task, proposal.assigneeIdentityId)
+        return
+      case 'invite_member':
+        await onInviteMember({
+          name: proposal.name,
+          email: proposal.email,
+          role: proposal.role || 'member',
+        })
+        return
+      case 'update_member_responsibilities':
+        if (!member) throw new Error('Il membro non è più disponibile.')
+        await onUpdateMemberResponsibilities(member.identityId, proposal.notes)
+    }
+  }, [
+    boardMembers,
+    onAssignTask,
+    onCompleteTask,
+    onCopyTask,
+    onCreateList,
+    onCreateTask,
+    onCreateTopic,
+    onDeleteTopic,
+    onInviteMember,
+    onRenameTopic,
+    onToggleTopicFavorite,
+    onUpdateMemberResponsibilities,
+    onUpdateTask,
+    onUpdateTaskList,
+    taskLists,
+    tasks,
+    topics,
+  ])
+
   if (!project) {
     const hasSelectedProject = Boolean(userMenu.selectedProjectId)
     return (
@@ -6842,6 +6859,10 @@ export const TasksScreen = ({
               directoryResetKey={agentDirectoryResetKey}
               onSelectTask={onSelectTask}
               onProvision={onProvisionAgent}
+              onPostPersonalAgentComment={onPostPersonalAgentComment}
+              workspaceAiService={workspaceAiService}
+              workspaceSnapshot={project ? { project, topics, taskLists, tasks } : undefined}
+              onOpenAiSettings={onOpenAiSettings}
             />
           </div>
         ) : isMemberBoard && isOverviewView ? (
@@ -7649,7 +7670,14 @@ export const TasksScreen = ({
         />
       )}
 
-      {aiBadgeOpen && <BoardAiBadge onClose={() => setAiBadgeOpen(false)} />}
+      {aiBadgeOpen && <WorkspaceAiChat
+        key={project?.wire.id}
+        snapshot={project ? { project, topics, taskLists, tasks, members: boardMembers } : undefined}
+        service={workspaceAiService}
+        onExecuteAction={executeWorkspaceAiAction}
+        onOpenAiSettings={onOpenAiSettings}
+        onClose={() => setAiBadgeOpen(false)}
+      />}
       {mobilePathPanelOpen && (
         <BoardPathBadge
           topics={sortedTopics}

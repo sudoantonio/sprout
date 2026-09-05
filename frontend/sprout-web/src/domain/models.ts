@@ -19,6 +19,7 @@ export { isSameTaskListIcon, taskListIconLabel } from './task-list-icon'
 
 export type TaskFilter = 'open' | 'today' | 'upcoming' | 'completed'
 export type ResourceKind =
+  | 'agent-chat'
   | 'project'
   | 'topic'
   | 'task-list'

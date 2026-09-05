@@ -133,6 +133,10 @@ describe('client-owned exact invocation runner', () => {
     const statement = observation.statement as Record<string, unknown>
     expect(statement.endpoint_request_commitment_hex).toMatch(/^[a-f0-9]{64}$/)
     expect(statement.exposed_sources).toEqual(claim().sources)
+    // Golden hash of the Rust serde_json::Value projection (sorted keys, native bytes).
+    expect(statement.output_commitment_hex).toBe('9c32e1d40c84f2d66d678a76c77afd88d8198af7c0279d96d47aad30841cc162')
+    expect(submitted[0].encrypted_output).toHaveProperty('ciphertext')
+    expect(submitted[0].encrypted_output).not.toHaveProperty('ciphertext_b64')
     expect(statement.hidden_persistent_model_memory_available).toBe(false)
     expect(statement.runtime_kind).toBe('client_provider_v1')
     expect(statement.execution_profile_commitment_hex).toBe('66'.repeat(32))

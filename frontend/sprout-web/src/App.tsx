@@ -1,3 +1,4 @@
+import { createWorkspaceChatService } from './ai/workspace-chat'
 import {
   useCallback,
   useEffect,
@@ -128,6 +129,10 @@ import {
   buildTaskCreation,
   partitionDuplicatePresetTasks,
 } from './domain/tasks'
+import {
+  buildAgentProvisioningEnvelope,
+  type AgentProvisioningDraft,
+} from './domain/agent-provisioning'
 import { availableRetentionArchiveCount } from './domain/retention'
 import {
   buildThreePretaskPreset,
@@ -544,6 +549,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   const [retentionWarnings, setRetentionWarnings] = useState<
     RetentionWarningDto[]
   >([])
+  const workspaceAiService = useMemo(
+    () => services ? createWorkspaceChatService(services.auth.vault) : undefined,
+    [services],
+  )
   const [agents, setAgents] = useState<AgentDirectoryItemDto[]>([])
   const [agentDirectoryRefreshToken, setAgentDirectoryRefreshToken] =
     useState(0)
@@ -1339,10 +1348,18 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   }, [state.selectedProjectId, state.session])
 
   const provisionAgent = useCallback(
-    async (envelope: unknown): Promise<ProvisionAgentResponse> => {
-      if (!state.selectedProjectId) {
+    async (draft: AgentProvisioningDraft): Promise<ProvisionAgentResponse> => {
+      if (!state.selectedProjectId || !selectedProject || !state.session || !services) {
         throw new Error('Seleziona un progetto prima di creare un agente.')
       }
+      const envelope = await buildAgentProvisioningEnvelope(draft, {
+        projectId: state.selectedProjectId,
+        projectScopeId: selectedProject.wire.root_resource_id,
+        keyEpoch: selectedProject.wire.key_epoch,
+        controllerIdentityId: state.session.identity_id,
+        controllerDeviceId: state.session.device_id,
+        vault: services.auth.vault,
+      })
       const response = await api.provisionAgent(
         state.selectedProjectId,
         envelope,
@@ -1350,7 +1367,49 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       setAgentDirectoryRefreshToken((value) => value + 1)
       return response
     },
-    [api, state.selectedProjectId],
+    [api, selectedProject, services, state.selectedProjectId, state.session],
+  )
+
+  const postPersonalAgentComment = useCallback(
+    async (
+      agent: AgentDirectoryItemDto,
+      task: DecryptedTask,
+      markdown: string,
+    ): Promise<void> => {
+      if (!services || !state.session) throw new Error('Accedi prima di pubblicare un commento.')
+      const text = markdown.trim()
+      if (!text) throw new Error('Scrivi il commento da pubblicare.')
+      if (task.wire.project_id !== state.selectedProjectId) {
+        throw new Error('Il task non appartiene al progetto aperto.')
+      }
+      const encryptedPayload = await encryptExistingResource(services.auth.vault, {
+        projectId: task.wire.project_id,
+        resourceId: task.wire.resource_node_id,
+        kind: 'task',
+        aggregateVersion: task.wire.payload_version,
+        keyEpoch: task.wire.key_epoch,
+        document: {
+          schema: 1,
+          markdown: text,
+          mediation: 'user_proxy',
+          observed_agent_id: agent.id,
+        },
+      })
+      await api.postHumanComment(task.wire.project_id, {
+        recipient_id: agent.principal_identity_id,
+        target_id: task.wire.resource_node_id,
+        parent_id: null,
+        encrypted_payload: encryptedPayload,
+        key_epoch: task.wire.key_epoch,
+        idempotency_key: crypto.randomUUID(),
+        run_id: null,
+      })
+      dispatch({
+        type: 'set-notice',
+        message: 'Commento pubblicato con i permessi dell’utente corrente.',
+      })
+    },
+    [api, services, state.selectedProjectId, state.session],
   )
 
   useEffect(() => {
@@ -6468,6 +6527,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             lockedTasks={state.lockedTasks}
             boardMembers={state.boardMembers}
             agents={agents}
+            workspaceAiService={workspaceAiService}
             boardFocus={state.boardFocus}
             boardViewMode={state.boardViewMode}
             selectedTopicId={state.selectedTopicId}
@@ -6522,6 +6582,8 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             onInviteMember={inviteProjectParticipant}
             onUpdateMemberResponsibilities={updateProjectMemberResponsibilities}
             onProvisionAgent={provisionAgent}
+            onPostPersonalAgentComment={postPersonalAgentComment}
+            onOpenAiSettings={() => dispatch({ type: 'set-screen', screen: 'ai' })}
             taskAttachments={attachments}
             taskAttachmentLabels={attachmentLabels}
             onRefreshTaskAttachments={refreshTaskAttachments}

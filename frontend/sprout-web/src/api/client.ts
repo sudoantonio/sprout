@@ -640,6 +640,24 @@ export class ApiClient {
     })
   }
 
+  postHumanComment(
+    projectId: Uuid,
+    input: {
+      recipient_id: Uuid
+      target_id: Uuid
+      parent_id: Uuid | null
+      encrypted_payload: EncryptedPayloadDto
+      key_epoch: number
+      idempotency_key: Uuid
+      run_id: Uuid | null
+    },
+  ): Promise<{ id: Uuid; replayed: boolean }> {
+    return this.request(`/v1/projects/${projectId}/comments`, {
+      method: 'POST',
+      body: input,
+    })
+  }
+
   listTaskAssignments(
     projectId: Uuid,
     taskId: Uuid,

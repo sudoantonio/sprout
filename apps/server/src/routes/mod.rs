@@ -1,3 +1,4 @@
+mod agent_chat;
 pub(crate) mod agent_runs;
 pub(crate) mod agent_tools;
 mod agents;
@@ -129,7 +130,7 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         )
         .route(
             "/v1/projects/{project_id}/agents/{agent_id}/interrogations",
-            post(agents::record_interrogation),
+            get(agent_chat::history).post(agents::record_interrogation),
         )
         .route(
             "/v1/projects/{project_id}/agents/{agent_id}/interrogations/{interrogation_id}",
@@ -285,6 +286,10 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         .route(
             "/v1/projects/{project_id}/agents/{agent_id}/runner/client-provider/claim",
             post(agents::claim_client_provider_invocation),
+        )
+        .route(
+            "/v1/projects/{project_id}/agents/{agent_id}/invocations/{invocation_id}",
+            get(agent_chat::invocation_status),
         )
         .route(
             "/v1/projects/{project_id}/agents/{agent_id}/invocations/{invocation_id}/submit",

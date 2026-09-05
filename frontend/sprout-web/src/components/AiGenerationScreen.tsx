@@ -8,14 +8,17 @@ import {
   type SelfHostedEngine,
 } from '../ai/contracts'
 import { LocalAiProfileStore } from '../ai/profile'
-import { commercialProvider, lanProvider } from '../ai/providers'
+import { providerForLocalProfile } from '../ai/providers'
 import {
   OLLAMA_CHECKPOINT_MODEL,
   installOllamaWithConsent,
   pullOllamaModelWithSeparateConsent,
   type OllamaLifecycle,
 } from '../ai/ollama-lifecycle'
-import { inferenceExecutionEnvironment } from '../ai/execution-boundary'
+import {
+  browserDirectInferenceAllowed,
+  resolveLocalEdgeInferenceBridge,
+} from '../ai/execution-boundary'
 
 const modes: Array<{ id: AiMode; label: string }> = [
   { id: 'commercial_api', label: 'A. API commerciale' },
@@ -117,19 +120,13 @@ export const AiGenerationScreen = ({
     setBusy(true)
     setStatus('')
     try {
-      if (inferenceExecutionEnvironment() === 'browser_control_plane') {
-        throw new Error(
-          'Il browser è il control plane: model discovery richiede lo Sprout Local Edge Runtime e non usa il backend Sprout.',
-        )
+      const bridge = resolveLocalEdgeInferenceBridge()
+      if (!bridge && !browserDirectInferenceAllowed(profile)) {
+        throw new Error('Questa modalità richiede lo Sprout Local Edge Runtime.')
       }
-      const adapter =
-        profile.mode === 'commercial_api'
-          ? commercialProvider(profile)
-          : profile.mode === 'lan_inference'
-            ? lanProvider(profile)
-            : undefined
-      if (!adapter) throw new Error('Questa modalità non consente discovery nel checkpoint 0032')
-      const discovered = await adapter.discoverModels()
+      const discovered = bridge
+        ? await bridge.discoverModels(profile)
+        : await providerForLocalProfile(profile).discoverModels()
       setModels(discovered.map((model) => model.id))
       setStatus(
         discovered.length > 0
