@@ -334,18 +334,38 @@ export const decryptTaskList = (
 export const decryptTask = async (
   task: TaskDto,
   vault: KeyVault,
-): Promise<DecryptedTask> => ({
-  wire: task,
-  document: await decryptBodyOrHeader<TaskDocument>(vault, {
-    payload: task.payload,
-    header: task.header ?? null,
-    projectId: task.project_id,
-    resourceId: task.resource_node_id,
-    kind: 'task',
-    aggregateVersion: task.payload_version,
-    keyEpoch: task.key_epoch,
-  }),
-})
+): Promise<DecryptedTask> => {
+  const decryptAtVersion = (aggregateVersion: number) =>
+    decryptBodyOrHeader<TaskDocument>(vault, {
+      payload: task.payload,
+      header: task.header ?? null,
+      projectId: task.project_id,
+      resourceId: task.resource_node_id,
+      kind: 'task',
+      aggregateVersion,
+      keyEpoch: task.key_epoch,
+    })
+
+  let document: TaskDocument
+  try {
+    document = await decryptAtVersion(task.payload_version)
+  } catch (currentVersionError) {
+    // Completing a task advances the row version because the state changes,
+    // while its encrypted document remains bound to the preceding version.
+    // Keep the current version first so completed tasks edited afterwards
+    // continue to decrypt normally, then recover state-only completions.
+    if (task.state.state !== 'completed' || task.payload_version <= 1) {
+      throw currentVersionError
+    }
+    try {
+      document = await decryptAtVersion(task.payload_version - 1)
+    } catch {
+      throw currentVersionError
+    }
+  }
+
+  return { wire: task, document }
+}
 
 export const decryptPreset = async (
   preset: PresetDto,

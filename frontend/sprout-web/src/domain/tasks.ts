@@ -23,6 +23,55 @@ export interface BuiltTaskCreation {
   selectedValue: TaskSelectedValueDocument
 }
 
+export interface PresetTaskDeduplication {
+  tasks: DecryptedTask[]
+  duplicates: DecryptedTask[]
+}
+
+/**
+ * A board preset template has one concrete task per list, preset and template
+ * index. Keep the oldest instance because later instances can only be retries
+ * created by older clients during bootstrap.
+ */
+export const partitionDuplicatePresetTasks = (
+  tasks: DecryptedTask[],
+): PresetTaskDeduplication => {
+  const canonicalByTemplate = new Map<string, DecryptedTask>()
+  for (const task of tasks) {
+    const presetId = task.document.preset_id
+    const templateIndex = task.document.preset_template_index
+    if (!presetId || templateIndex === undefined) continue
+    const key = `${task.wire.list_id}:${presetId}:${templateIndex}`
+    const current = canonicalByTemplate.get(key)
+    if (
+      !current ||
+      task.wire.created_at < current.wire.created_at ||
+      (task.wire.created_at === current.wire.created_at &&
+        task.wire.id < current.wire.id)
+    ) {
+      canonicalByTemplate.set(key, task)
+    }
+  }
+
+  const unique: DecryptedTask[] = []
+  const duplicates: DecryptedTask[] = []
+  for (const task of tasks) {
+    const presetId = task.document.preset_id
+    const templateIndex = task.document.preset_template_index
+    if (!presetId || templateIndex === undefined) {
+      unique.push(task)
+      continue
+    }
+    const key = `${task.wire.list_id}:${presetId}:${templateIndex}`
+    if (canonicalByTemplate.get(key)?.wire.id === task.wire.id) {
+      unique.push(task)
+    } else {
+      duplicates.push(task)
+    }
+  }
+  return { tasks: unique, duplicates }
+}
+
 const validDate = (value: string): boolean =>
   value.length > 0 && Number.isFinite(new Date(value).getTime())
 
@@ -39,12 +88,18 @@ export const buildTaskCreation = (
 ): BuiltTaskCreation => {
   const title = input.title.trim()
   if (!title) throw new Error('Task title is required')
+  const presetDocument = {
+    ...(input.presetId ? { preset_id: input.presetId } : {}),
+    ...(Number.isSafeInteger(input.presetTemplateIndex)
+      ? { preset_template_index: input.presetTemplateIndex }
+      : {}),
+  }
 
   if (input.taskKind === 'priority') {
     return {
       taskKind: 'priority',
       document: withNotes(
-        { schema: 1, title, priority: input.priority },
+        { schema: 1, title, priority: input.priority, ...presetDocument },
         input.notes,
       ),
       selectedValue: { schema: 1, priority: input.priority },
@@ -59,7 +114,7 @@ export const buildTaskCreation = (
     return {
       taskKind: 'deadline',
       document: withNotes(
-        { schema: 1, title, due_at: input.dueAt },
+        { schema: 1, title, due_at: input.dueAt, ...presetDocument },
         input.notes,
       ),
       selectedValue: { schema: 1, due_at: input.dueAt },
@@ -81,6 +136,7 @@ export const buildTaskCreation = (
         title,
         due_at: input.dueAt,
         recurrence,
+        ...presetDocument,
       },
       input.notes,
     ),

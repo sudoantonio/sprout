@@ -188,6 +188,13 @@ export const LayoutGridIcon = (props: IconProps) => (
   </svg>
 )
 
+export const TableIcon = (props: IconProps) => (
+  <svg {...iconProps} {...props}>
+    <rect x="3.5" y="5" width="17" height="14" rx="1" />
+    <path d="M3.5 10h17M9 5v14" />
+  </svg>
+)
+
 export const PresetIcon = (props: IconProps) => (
   <svg {...iconProps} fill="currentColor" stroke="none" {...props}>
     <circle cx="5" cy="5" r="2" />
@@ -426,10 +433,11 @@ export const PencilIcon = (props: IconProps) => (
 /** Open / expand into detail view. */
 export const ExpandDetailIcon = (props: IconProps) => (
   <svg {...iconProps} {...props}>
-    <path d="M15 3h6v6" />
-    <path d="M9 21H3v-6" />
-    <path d="M21 3l-7 7" />
-    <path d="M3 21l7-7" />
+    <path
+      fill="currentColor"
+      stroke="none"
+      d="M3 20v-8a1 1 0 0 1 2 0v5.585L17.586 5H12a1 1 0 0 1 0-2h8a1 1 0 0 1 1 1v8a1 1 0 0 1-2 0V6.414L6.414 19H12a1 1 0 0 1 0 2H4a1 1 0 0 1-1-1Z"
+    />
   </svg>
 )
 

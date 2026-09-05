@@ -14,17 +14,38 @@ import {
   saveThemePreference,
 } from './theme'
 
+const memoryStorage = (() => {
+  const values = new Map<string, string>()
+  return {
+    get length() { return values.size },
+    clear: () => values.clear(),
+    getItem: (key: string) => values.get(key) ?? null,
+    key: (index: number) => [...values.keys()][index] ?? null,
+    removeItem: (key: string) => { values.delete(key) },
+    setItem: (key: string, value: string) => { values.set(key, value) },
+  } satisfies Storage
+})()
+
 describe('theme', () => {
   beforeEach(() => {
-    localStorage.clear()
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      value: memoryStorage,
+    })
+    window.localStorage.clear()
     document.documentElement.removeAttribute('data-theme')
     document.documentElement.removeAttribute('data-style')
+    const favicon = document.createElement('link')
+    favicon.id = 'sprout-favicon'
+    favicon.rel = 'icon'
+    document.head.append(favicon)
   })
 
   afterEach(() => {
-    localStorage.clear()
+    window.localStorage.clear()
     document.documentElement.removeAttribute('data-theme')
     document.documentElement.removeAttribute('data-style')
+    document.querySelector('#sprout-favicon')?.remove()
   })
 
   it('defaults to system when nothing is stored', () => {
@@ -50,9 +71,9 @@ describe('theme', () => {
   })
 
   it('ignores invalid stored values', () => {
-    localStorage.setItem(THEME_STORAGE_KEY, 'invalid')
+    window.localStorage.setItem(THEME_STORAGE_KEY, 'invalid')
     expect(loadThemePreference()).toBe('system')
-    localStorage.setItem(APPEARANCE_STYLE_STORAGE_KEY, 'invalid')
+    window.localStorage.setItem(APPEARANCE_STYLE_STORAGE_KEY, 'invalid')
     expect(loadAppearanceStyle()).toBe('default')
   })
 
@@ -64,8 +85,14 @@ describe('theme', () => {
   it('applies resolved theme to the document root', () => {
     applyThemePreference('dark')
     expect(document.documentElement.dataset.theme).toBe('dark')
+    expect(document.querySelector<HTMLLinkElement>('#sprout-favicon')?.getAttribute('href')).toBe(
+      '/favicon-dark.svg?v=4',
+    )
     applyThemePreference('light')
     expect(document.documentElement.dataset.theme).toBe('light')
+    expect(document.querySelector<HTMLLinkElement>('#sprout-favicon')?.getAttribute('href')).toBe(
+      '/favicon-light.svg?v=4',
+    )
   })
 
   it('applies appearance style to the document root', () => {

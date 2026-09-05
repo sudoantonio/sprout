@@ -35,6 +35,7 @@ export interface ProjectItem {
   wire: ProjectView
   document?: ProjectDocument
   lockedReason?: string
+  deferred?: boolean
 }
 
 export interface TopicItem {
@@ -52,6 +53,10 @@ export interface TaskListItem {
 export interface BoardMember {
   identityId: Uuid
   label: string
+  email?: string
+  role?: 'owner' | 'admin' | 'member' | 'guest'
+  joinedAt?: string
+  responsibilities?: string
 }
 
 export type BoardFocus =
@@ -153,7 +158,11 @@ export type AppAction =
       value: AppState['storagePersistence']
     }
   | { type: 'set-vault-persistence'; value: VaultPersistence }
-  | { type: 'set-projects'; projects: ProjectItem[] }
+  | {
+      type: 'set-projects'
+      projects: ProjectItem[]
+      selectedProjectId?: Uuid
+    }
   | { type: 'select-project'; projectId: Uuid }
   | { type: 'set-topics'; topics: TopicItem[] }
   | { type: 'select-topic'; topicId: Uuid }
@@ -256,14 +265,21 @@ export const appReducer = (state: AppState, action: AppAction): AppState => {
       return { ...state, storagePersistence: action.value }
     case 'set-vault-persistence':
       return { ...state, vaultPersistence: action.value }
-    case 'set-projects':
+    case 'set-projects': {
+      const requestedProjectId =
+        action.selectedProjectId ?? state.selectedProjectId
+      const selectedProjectId = action.projects.some(
+        (project) => project.wire.id === requestedProjectId,
+      )
+        ? requestedProjectId
+        : action.projects[0]?.wire.id
       return {
         ...state,
         projects: action.projects,
-        selectedProjectId:
-          state.selectedProjectId ?? action.projects[0]?.wire.id,
+        selectedProjectId,
         loading: false,
       }
+    }
     case 'select-project':
       return {
         ...state,

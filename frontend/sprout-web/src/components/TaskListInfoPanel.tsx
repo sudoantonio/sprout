@@ -26,6 +26,7 @@ import {
   DownloadIcon,
   PaperclipIcon,
   PencilIcon,
+  TableIcon,
   XIcon,
 } from './icons'
 import { InfoMarkdown } from './InfoMarkdown'
@@ -281,24 +282,117 @@ const markdownWithRememberedOverviewCollapses = (
 
 const imageFullWidthSnapThreshold = 12
 
-const markdownToOverviewHtml = (markdown: string): string =>
-  markdown.split('\n').map((line) => {
-    const isClosedCollapse = line.startsWith(closedCollapsePrefix)
-    if (isClosedCollapse || line.startsWith(openCollapsePrefix)) {
-      const prefix = isClosedCollapse ? closedCollapsePrefix : openCollapsePrefix
-      return overviewLineHtml(
-        'div',
-        inlineMarkdownToHtml(line.slice(prefix.length)),
-        ` class="tasklist-info-overview-collapse" data-md-kind="collapse" data-collapsed="${String(isClosedCollapse)}"><button type="button" class="tasklist-info-overview-collapse-toggle" contenteditable="false" data-overview-collapse-toggle aria-label="${isClosedCollapse ? 'Espandi' : 'Comprimi'} capitolo" aria-expanded="${String(!isClosedCollapse)}">${isClosedCollapse ? '▶' : '▼'}</button`,
-      )
+const overviewTableWidthsPattern = /^<!-- sprout-table-widths:([\d,]+) -->$/
+const overviewTableDefaultColumnWidth = 180
+const overviewTableMinimumColumnWidth = 96
+
+const markdownTableCells = (line: string): string[] => {
+  const source = line.trim().replace(/^\|/, '').replace(/\|$/, '')
+  const cells: string[] = []
+  let cell = ''
+  let escaped = false
+  for (const character of source) {
+    if (escaped) {
+      cell += character
+      escaped = false
+    } else if (character === '\\') {
+      escaped = true
+    } else if (character === '|') {
+      cells.push(cell.trim())
+      cell = ''
+    } else {
+      cell += character
     }
-    if (line.startsWith('### ')) return overviewLineHtml('h3', inlineMarkdownToHtml(line.slice(4)))
-    if (line.startsWith('## ')) return overviewLineHtml('h2', inlineMarkdownToHtml(line.slice(3)))
-    if (line.startsWith('# ')) return overviewLineHtml('h1', inlineMarkdownToHtml(line.slice(2)))
-    if (line.startsWith('> ')) return overviewLineHtml('blockquote', inlineMarkdownToHtml(line.slice(2)))
-    if (line.startsWith('- ')) return overviewLineHtml('div', inlineMarkdownToHtml(line.slice(2)), ' class="tasklist-info-overview-bullet" data-md-kind="bullet"')
-    return overviewLineHtml('p', inlineMarkdownToHtml(line))
-  }).join('')
+  }
+  if (escaped) cell += '\\'
+  cells.push(cell.trim())
+  return cells
+}
+
+const isMarkdownTableDivider = (line: string, columnCount: number): boolean => {
+  const cells = markdownTableCells(line)
+  return cells.length === columnCount && cells.every((cell) => /^:?-{3,}:?$/.test(cell))
+}
+
+const markdownTableCell = (value: string): string =>
+  value.replaceAll('|', '\\|').replace(/[\r\n]+/g, ' ').trim()
+
+const overviewTableHtml = (
+  header: string[],
+  rows: string[][],
+  widths: number[],
+): string => {
+  const columnCount = Math.max(1, header.length)
+  const normalizedWidths = Array.from(
+    { length: columnCount },
+    (_, index) => Math.max(
+      overviewTableMinimumColumnWidth,
+      widths[index] ?? overviewTableDefaultColumnWidth,
+    ),
+  )
+  const cellHtml = (value: string, rowIndex: number, columnIndex: number) =>
+    `<div class="tasklist-info-overview-table-cell" contenteditable="true" role="textbox" aria-label="Cella riga ${rowIndex + 1}, colonna ${columnIndex + 1}" data-table-cell>${inlineMarkdownToHtml(value) || '<br>'}</div>`
+  const headerHtml = header.map((cell, columnIndex) =>
+    `<th scope="col">${cellHtml(cell, 0, columnIndex)}<span class="tasklist-info-overview-table-resize" contenteditable="false" role="separator" aria-orientation="vertical" aria-label="Ridimensiona colonna ${columnIndex + 1}" tabindex="0" data-table-resize data-column-index="${columnIndex}"></span></th>`,
+  ).join('')
+  const bodyHtml = rows.map((row, rowIndex) =>
+    `<tr>${Array.from({ length: columnCount }, (_, columnIndex) =>
+      `<td>${cellHtml(row[columnIndex] ?? '', rowIndex + 1, columnIndex)}</td>`,
+    ).join('')}</tr>`,
+  ).join('')
+  return `<div class="tasklist-info-overview-table" contenteditable="false" data-md-kind="table" data-column-widths="${normalizedWidths.join(',')}"><button type="button" draggable="true" class="tasklist-info-block-drag-handle tasklist-info-overview-table-drag-handle" contenteditable="false" data-table-drag aria-label="Sposta tabella" title="Trascina per spostare"><svg aria-hidden="true" fill="none" height="24" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" viewBox="0 0 24 24" width="24"><circle cx="9" cy="6" r="0.75" fill="currentColor" stroke="none"></circle><circle cx="15" cy="6" r="0.75" fill="currentColor" stroke="none"></circle><circle cx="9" cy="12" r="0.75" fill="currentColor" stroke="none"></circle><circle cx="15" cy="12" r="0.75" fill="currentColor" stroke="none"></circle><circle cx="9" cy="18" r="0.75" fill="currentColor" stroke="none"></circle><circle cx="15" cy="18" r="0.75" fill="currentColor" stroke="none"></circle></svg></button><div class="tasklist-info-overview-table-layout"><div class="tasklist-info-overview-table-scroll"><table><colgroup>${normalizedWidths.map((width) => `<col style="width:${width}px">`).join('')}</colgroup><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table></div><button type="button" class="tasklist-info-overview-table-add tasklist-info-overview-table-add-column" data-table-action="add-column" aria-label="Aggiungi colonna" title="Aggiungi colonna">+</button></div><button type="button" class="tasklist-info-overview-table-add tasklist-info-overview-table-add-row" data-table-action="add-row" aria-label="Aggiungi riga" title="Aggiungi riga">+</button></div>`
+}
+
+const regularOverviewLineHtml = (line: string): string => {
+  const isClosedCollapse = line.startsWith(closedCollapsePrefix)
+  if (isClosedCollapse || line.startsWith(openCollapsePrefix)) {
+    const prefix = isClosedCollapse ? closedCollapsePrefix : openCollapsePrefix
+    return overviewLineHtml(
+      'div',
+      inlineMarkdownToHtml(line.slice(prefix.length)),
+      ` class="tasklist-info-overview-collapse" data-md-kind="collapse" data-collapsed="${String(isClosedCollapse)}"><button type="button" class="tasklist-info-overview-collapse-toggle" contenteditable="false" data-overview-collapse-toggle aria-label="${isClosedCollapse ? 'Espandi' : 'Comprimi'} capitolo" aria-expanded="${String(!isClosedCollapse)}">${isClosedCollapse ? '▶' : '▼'}</button`,
+    )
+  }
+  if (line.startsWith('### ')) return overviewLineHtml('h3', inlineMarkdownToHtml(line.slice(4)))
+  if (line.startsWith('## ')) return overviewLineHtml('h2', inlineMarkdownToHtml(line.slice(3)))
+  if (line.startsWith('# ')) return overviewLineHtml('h1', inlineMarkdownToHtml(line.slice(2)))
+  if (line.startsWith('> ')) return overviewLineHtml('blockquote', inlineMarkdownToHtml(line.slice(2)))
+  if (line.startsWith('- ')) return overviewLineHtml('div', inlineMarkdownToHtml(line.slice(2)), ' class="tasklist-info-overview-bullet" data-md-kind="bullet"')
+  return overviewLineHtml('p', inlineMarkdownToHtml(line))
+}
+
+const markdownToOverviewHtml = (markdown: string): string => {
+  const lines = markdown.split('\n')
+  const html: string[] = []
+  for (let index = 0; index < lines.length;) {
+    const metadataMatch = lines[index]?.match(overviewTableWidthsPattern)
+    const headerIndex = metadataMatch ? index + 1 : index
+    const header = markdownTableCells(lines[headerIndex] ?? '')
+    const divider = lines[headerIndex + 1]
+    const isTable =
+      (lines[headerIndex] ?? '').includes('|') &&
+      Boolean(divider) &&
+      isMarkdownTableDivider(divider ?? '', header.length)
+    if (!isTable) {
+      html.push(regularOverviewLineHtml(lines[index] ?? ''))
+      index += 1
+      continue
+    }
+
+    const widths = metadataMatch
+      ? metadataMatch[1]!.split(',').map((value) => Number(value))
+      : []
+    const rows: string[][] = []
+    let rowIndex = headerIndex + 2
+    while (rowIndex < lines.length && lines[rowIndex]!.includes('|')) {
+      rows.push(markdownTableCells(lines[rowIndex]!))
+      rowIndex += 1
+    }
+    html.push(overviewTableHtml(header, rows, widths))
+    index = rowIndex
+  }
+  return html.join('')
+}
 
 const overviewEditorToMarkdown = (editor: HTMLElement): string =>
   (Array.from(editor.children) as HTMLElement[]).map((element): string | null => {
@@ -310,6 +404,28 @@ const overviewEditorToMarkdown = (editor: HTMLElement): string =>
       : element
     const text = overviewInlineToMarkdown(textRoot).trimEnd()
     if (element.dataset.overviewPrompt === 'true' && text === '') return null
+    if (element.dataset.mdKind === 'table') {
+      const header = Array.from(
+        element.querySelectorAll<HTMLElement>('thead [data-table-cell]'),
+      ).map((cell) => markdownTableCell(overviewInlineToMarkdown(cell)))
+      const rows = Array.from(element.querySelectorAll('tbody tr')).map((row) =>
+        Array.from(row.querySelectorAll<HTMLElement>('[data-table-cell]'))
+          .map((cell) => markdownTableCell(overviewInlineToMarkdown(cell))),
+      )
+      const widths = (element.dataset.columnWidths ?? '')
+        .split(',')
+        .map((value) => Number(value))
+        .filter(Number.isFinite)
+      return [
+        `<!-- sprout-table-widths:${header.map((_, index) => Math.max(
+          overviewTableMinimumColumnWidth,
+          widths[index] ?? overviewTableDefaultColumnWidth,
+        )).join(',')} -->`,
+        `| ${header.join(' | ')} |`,
+        `| ${header.map(() => '---').join(' | ')} |`,
+        ...rows.map((row) => `| ${header.map((_, index) => row[index] ?? '').join(' | ')} |`),
+      ].join('\n')
+    }
     if (element.tagName === 'H1') return `# ${text}`
     if (element.tagName === 'H2') return `## ${text}`
     if (element.tagName === 'H3') return `### ${text}`
@@ -443,6 +559,152 @@ const ensureOverviewTrailingPromptLine = (
   }
 }
 
+const createOverviewTableCell = (
+  tag: 'th' | 'td',
+  rowIndex: number,
+  columnIndex: number,
+  value = '',
+): HTMLTableCellElement => {
+  const cell = window.document.createElement(tag)
+  if (tag === 'th') cell.scope = 'col'
+  cell.innerHTML = `<div class="tasklist-info-overview-table-cell" contenteditable="true" role="textbox" aria-label="Cella riga ${rowIndex + 1}, colonna ${columnIndex + 1}" data-table-cell>${inlineMarkdownToHtml(value) || '<br>'}</div>`
+  if (tag === 'th') {
+    const resize = window.document.createElement('span')
+    resize.className = 'tasklist-info-overview-table-resize'
+    resize.contentEditable = 'false'
+    resize.setAttribute('role', 'separator')
+    resize.setAttribute('aria-orientation', 'vertical')
+    resize.setAttribute('aria-label', `Ridimensiona colonna ${columnIndex + 1}`)
+    resize.tabIndex = 0
+    resize.dataset.tableResize = 'true'
+    resize.dataset.columnIndex = String(columnIndex)
+    cell.append(resize)
+  }
+  return cell
+}
+
+const refreshOverviewTableLabels = (tableRoot: HTMLElement): void => {
+  const rows = Array.from(tableRoot.querySelectorAll<HTMLTableRowElement>('tr'))
+  rows.forEach((row, rowIndex) => {
+    Array.from(row.cells).forEach((cell, columnIndex) => {
+      const editor = cell.querySelector<HTMLElement>('[data-table-cell]')
+      editor?.setAttribute(
+        'aria-label',
+        `Cella riga ${rowIndex + 1}, colonna ${columnIndex + 1}`,
+      )
+      const resize = cell.querySelector<HTMLElement>('[data-table-resize]')
+      if (!resize) return
+      resize.dataset.columnIndex = String(columnIndex)
+      resize.setAttribute('aria-label', `Ridimensiona colonna ${columnIndex + 1}`)
+    })
+  })
+}
+
+const addOverviewTableRow = (
+  tableRoot: HTMLElement,
+  afterRowIndex?: number,
+): HTMLElement | undefined => {
+  const body = tableRoot.querySelector<HTMLTableSectionElement>('tbody')
+  const columnCount = tableRoot.querySelectorAll('thead th').length
+  if (!body || columnCount === 0) return undefined
+  const insertionIndex = afterRowIndex === undefined
+    ? body.rows.length
+    : Math.min(body.rows.length, Math.max(0, afterRowIndex + 1))
+  const row = body.insertRow(insertionIndex)
+  const rowIndex = insertionIndex + 1
+  for (let columnIndex = 0; columnIndex < columnCount; columnIndex += 1) {
+    row.append(createOverviewTableCell('td', rowIndex, columnIndex))
+  }
+  refreshOverviewTableLabels(tableRoot)
+  return row.querySelector<HTMLElement>('[data-table-cell]') ?? undefined
+}
+
+const addOverviewTableColumn = (
+  tableRoot: HTMLElement,
+  afterColumnIndex?: number,
+): HTMLElement | undefined => {
+  const table = tableRoot.querySelector<HTMLTableElement>('table')
+  const colgroup = table?.querySelector<HTMLTableColElement>('colgroup')
+  const headerRow = table?.tHead?.rows[0]
+  if (!table || !colgroup || !headerRow) return undefined
+  const columnIndex = afterColumnIndex === undefined
+    ? headerRow.cells.length
+    : Math.min(headerRow.cells.length, Math.max(0, afterColumnIndex + 1))
+  const column = window.document.createElement('col')
+  column.style.width = `${overviewTableDefaultColumnWidth}px`
+  colgroup.insertBefore(column, colgroup.children[columnIndex] ?? null)
+  const headerCell = createOverviewTableCell(
+    'th',
+    0,
+    columnIndex,
+    `Colonna ${columnIndex + 1}`,
+  )
+  headerRow.insertBefore(headerCell, headerRow.cells[columnIndex] ?? null)
+  Array.from(table.tBodies[0]?.rows ?? []).forEach((row, index) => {
+    row.insertBefore(
+      createOverviewTableCell('td', index + 1, columnIndex),
+      row.cells[columnIndex] ?? null,
+    )
+  })
+  const widths = (tableRoot.dataset.columnWidths ?? '')
+    .split(',')
+    .map((value) => Number(value))
+    .filter(Number.isFinite)
+  widths.splice(columnIndex, 0, overviewTableDefaultColumnWidth)
+  tableRoot.dataset.columnWidths = widths.join(',')
+  refreshOverviewTableLabels(tableRoot)
+  return headerCell.querySelector<HTMLElement>('[data-table-cell]') ?? undefined
+}
+
+const removeOverviewTableRow = (
+  tableRoot: HTMLElement,
+  rowIndex: number,
+): void => {
+  tableRoot.querySelector<HTMLTableSectionElement>('tbody')?.deleteRow(rowIndex)
+  refreshOverviewTableLabels(tableRoot)
+}
+
+const removeOverviewTableColumn = (
+  tableRoot: HTMLElement,
+  columnIndex: number,
+): void => {
+  const table = tableRoot.querySelector<HTMLTableElement>('table')
+  const headerRow = table?.tHead?.rows[0]
+  if (!table || !headerRow || headerRow.cells.length <= 1) return
+  table.querySelectorAll<HTMLTableRowElement>('tr').forEach((row) => {
+    row.deleteCell(columnIndex)
+  })
+  table.querySelectorAll<HTMLTableColElement>('colgroup col')[columnIndex]?.remove()
+  const widths = (tableRoot.dataset.columnWidths ?? '')
+    .split(',')
+    .map((value) => Number(value))
+  widths.splice(columnIndex, 1)
+  tableRoot.dataset.columnWidths = widths.join(',')
+  refreshOverviewTableLabels(tableRoot)
+}
+
+const setOverviewTableColumnWidth = (
+  tableRoot: HTMLElement,
+  columnIndex: number,
+  width: number,
+): void => {
+  const nextWidth = Math.max(overviewTableMinimumColumnWidth, Math.round(width))
+  const column = tableRoot.querySelectorAll<HTMLTableColElement>('colgroup col')[columnIndex]
+  if (!column) return
+  column.style.width = `${nextWidth}px`
+  const widths = (tableRoot.dataset.columnWidths ?? '')
+    .split(',')
+    .map((value) => Number(value))
+  widths[columnIndex] = nextWidth
+  tableRoot.dataset.columnWidths = Array.from(
+    { length: tableRoot.querySelectorAll('thead th').length },
+    (_, index) => Math.max(
+      overviewTableMinimumColumnWidth,
+      widths[index] ?? overviewTableDefaultColumnWidth,
+    ),
+  ).join(',')
+}
+
 const InfoImageBlock = ({
   document,
   file,
@@ -561,7 +823,7 @@ const InfoImageBlock = ({
         <GripIcon aria-hidden />
       </button>
       <div
-        className="tasklist-info-image-frame"
+        className={`tasklist-info-image-frame${source ? '' : ' is-encrypted'}`}
         style={{ width: imageWidth ? `${imageWidth}px` : '100%' }}
       >
         {source ? (
@@ -590,7 +852,7 @@ const InfoImageBlock = ({
         >
           <XIcon aria-hidden />
         </button>
-        <span
+        {source && <span
           className="tasklist-info-image-resize-handle"
           role="separator"
           aria-label={`Ridimensiona ${file.file_name}`}
@@ -726,15 +988,17 @@ const InfoImageBlock = ({
             void onResize(file, nextWidth >= parentWidth ? undefined : nextWidth)
             event.preventDefault()
           }}
-        />
+        />}
       </div>
       <figcaption>
         <button
           type="button"
-          className="tasklist-info-attachment-link"
+          className="tasklist-info-attachment-link tasklist-info-image-download"
+          title={`Scarica ${file.file_name}`}
           onClick={() => void onDownload(document, file)}
         >
-          {file.file_name}
+          <DownloadIcon aria-hidden />
+          <span>Scarica immagine</span>
         </button>
       </figcaption>
       {previewOpen && source && createPortal(
@@ -750,6 +1014,7 @@ const InfoImageBlock = ({
           <div className="tasklist-info-image-lightbox-toolbar">
             <button
               type="button"
+              className="tasklist-info-image-lightbox-download"
               onClick={() => void onDownload(document, file)}
             >
               <DownloadIcon aria-hidden />
@@ -816,12 +1081,34 @@ const OverviewFlowEditor = ({
   const activeEmptyLineRef = useRef<{ blockId: Uuid; line: HTMLElement } | undefined>(undefined)
   const selectedRangeRef = useRef<Range | undefined>(undefined)
   const draggedBlockIdRef = useRef<Uuid | undefined>(undefined)
+  const draggedTableRef = useRef<{
+    blockId: Uuid
+    tableRoot: HTMLElement
+  } | undefined>(undefined)
   const [menu, setMenu] = useState<{ blockId: Uuid; top: number }>()
-  const [toolbar, setToolbar] = useState<{ blockId: Uuid; top: number; left: number }>()
-  const [dropLine, setDropLine] = useState<{ blockId: Uuid; index: number; position: 'before' | 'after'; top: number }>()
+  const [toolbar, setToolbar] = useState<{
+    blockId: Uuid
+    top: number
+    left: number
+    inlineOnly: boolean
+  }>()
+  const [dropLine, setDropLine] = useState<{
+    blockId: Uuid
+    cutIndex: number
+    top: number
+  }>()
   const [renamingId, setRenamingId] = useState<Uuid>()
   const [renameDraft, setRenameDraft] = useState('')
   const [selectedBlockId, setSelectedBlockId] = useState<Uuid>()
+  const [tableMenu, setTableMenu] = useState<{
+    blockId: Uuid
+    tableRoot: HTMLElement
+    rowIndex: number
+    columnIndex: number
+    header: boolean
+    x: number
+    y: number
+  }>()
   const trailingDraftTextIdsRef = useRef(new Map<Uuid, Uuid>())
   let trailingDraftTextId = trailingDraftTextIdsRef.current.get(document.wire.id)
   if (!trailingDraftTextId) {
@@ -829,6 +1116,26 @@ const OverviewFlowEditor = ({
     trailingDraftTextIdsRef.current.set(document.wire.id, trailingDraftTextId)
   }
   contentRef.current = document.document
+
+  useEffect(() => {
+    if (!tableMenu) return
+    const close = (event: MouseEvent) => {
+      if (
+        event.target instanceof Element &&
+        event.target.closest('.tasklist-info-overview-table-context-menu')
+      ) return
+      setTableMenu(undefined)
+    }
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setTableMenu(undefined)
+    }
+    window.document.addEventListener('mousedown', close)
+    window.document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.document.removeEventListener('mousedown', close)
+      window.document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [tableMenu])
   const lastPersistedBlock = document.document.blocks.at(-1)
   const flowBlocks: InfoDocumentBlock[] = lastPersistedBlock?.type === 'text'
     ? document.document.blocks
@@ -930,10 +1237,7 @@ const OverviewFlowEditor = ({
       return
     }
     editorRefs.current.set(blockId, editor)
-    if (
-      window.document.activeElement !== editor &&
-      editor.dataset.sourceMarkdown !== markdown
-    ) {
+    if (editor.dataset.sourceMarkdown !== markdown) {
       editor.innerHTML = markdownToOverviewHtml(markdown)
       applyRememberedOverviewCollapses(editor, document.wire.id, blockId)
       editor.dataset.sourceMarkdown = markdown
@@ -959,6 +1263,62 @@ const OverviewFlowEditor = ({
     const content = editorContent(blockId, markdown)
     setContent(content)
     return content
+  }
+
+  const commitTableChange = (
+    blockId: Uuid,
+    editor: HTMLElement,
+    focusTarget?: HTMLElement,
+  ) => {
+    const content = serializeEditor(blockId, editor)
+    if (focusTarget) {
+      window.requestAnimationFrame(() => {
+        focusTarget.focus()
+        const range = window.document.createRange()
+        range.selectNodeContents(focusTarget)
+        range.collapse(false)
+        const selection = window.getSelection()
+        selection?.removeAllRanges()
+        selection?.addRange(range)
+      })
+    }
+    void onCommit(content, 'Salvataggio tabella non riuscito')
+  }
+
+  const startTableColumnResize = (
+    blockId: Uuid,
+    editor: HTMLElement,
+    handle: HTMLElement,
+    pointerId: number,
+    clientX: number,
+  ) => {
+    const tableRoot = handle.closest<HTMLElement>('[data-md-kind="table"]')
+    const columnIndex = Number(handle.dataset.columnIndex)
+    const column = tableRoot?.querySelectorAll<HTMLTableColElement>('colgroup col')[columnIndex]
+    if (!tableRoot || !column || !Number.isFinite(columnIndex)) return
+    const initialWidth = column.getBoundingClientRect().width || overviewTableDefaultColumnWidth
+    const initialX = clientX
+    const previousCursor = window.document.body.style.cursor
+    const previousUserSelect = window.document.body.style.userSelect
+    const move = (event: PointerEvent) => {
+      if (event.pointerId !== pointerId) return
+      setOverviewTableColumnWidth(tableRoot, columnIndex, initialWidth + event.clientX - initialX)
+      event.preventDefault()
+    }
+    const finish = (event: PointerEvent) => {
+      if (event.pointerId !== pointerId) return
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', finish)
+      window.removeEventListener('pointercancel', finish)
+      window.document.body.style.cursor = previousCursor
+      window.document.body.style.userSelect = previousUserSelect
+      commitTableChange(blockId, editor)
+    }
+    window.document.body.style.cursor = 'col-resize'
+    window.document.body.style.userSelect = 'none'
+    window.addEventListener('pointermove', move, { passive: false })
+    window.addEventListener('pointerup', finish)
+    window.addEventListener('pointercancel', finish)
   }
 
   const insertionAnchor = (blockId: Uuid, line: HTMLElement): FlowInsertionAnchor | undefined => {
@@ -1011,6 +1371,7 @@ const OverviewFlowEditor = ({
         blockId,
         top: bounds.top >= 56 ? bounds.top - 52 : bounds.bottom + 8,
         left: Math.max(minimumLeft, Math.min(maximumLeft, bounds.left + bounds.width / 2)),
+        inlineOnly: startLine.dataset.mdKind === 'table',
       })
     })
   }
@@ -1019,10 +1380,15 @@ const OverviewFlowEditor = ({
     const editor = editorRefs.current.get(blockId)
     const range = selectedRangeRef.current
     if (!editor || !range) return
+    const rangeNode = range.commonAncestorContainer instanceof HTMLElement
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer.parentElement
+    const tableCell = rangeNode?.closest<HTMLElement>('[data-table-cell]')
     const selection = window.getSelection()
+    const formatTarget = tableCell ?? editor
+    formatTarget.focus()
     selection?.removeAllRanges()
     selection?.addRange(range)
-    editor.focus()
     window.document.execCommand(command, false, value)
     if (selection?.rangeCount) selectedRangeRef.current = selection.getRangeAt(0).cloneRange()
     serializeEditor(blockId, editor)
@@ -1063,16 +1429,27 @@ const OverviewFlowEditor = ({
 
   const insertMarkdownLine = (
     blockId: Uuid,
-    kind: 'h1' | 'h2' | 'h3' | 'bullet' | 'collapse',
+    kind: 'h1' | 'h2' | 'h3' | 'bullet' | 'collapse' | 'table',
   ) => {
     const editor = editorRefs.current.get(blockId)
     if (!editor) return
     const source = activeEmptyLineRef.current?.blockId === blockId
       ? activeEmptyLineRef.current.line
       : editor.lastElementChild as HTMLElement | null
-    const next = window.document.createElement(
-      kind === 'h1' ? 'h1' : kind === 'h2' ? 'h2' : kind === 'h3' ? 'h3' : 'div',
-    )
+    let next: HTMLElement
+    if (kind === 'table') {
+      const template = window.document.createElement('template')
+      template.innerHTML = overviewTableHtml(
+        ['Colonna 1', 'Colonna 2'],
+        [['', '']],
+        [overviewTableDefaultColumnWidth, overviewTableDefaultColumnWidth],
+      )
+      next = template.content.firstElementChild as HTMLElement
+    } else {
+      next = window.document.createElement(
+        kind === 'h1' ? 'h1' : kind === 'h2' ? 'h2' : kind === 'h3' ? 'h3' : 'div',
+      )
+    }
     if (kind === 'bullet') {
       next.dataset.mdKind = 'bullet'
       next.className = 'tasklist-info-overview-bullet'
@@ -1081,16 +1458,20 @@ const OverviewFlowEditor = ({
       next.dataset.collapsed = 'false'
       next.className = 'tasklist-info-overview-collapse'
     }
-    next.innerHTML = kind === 'collapse'
-      ? '<button type="button" class="tasklist-info-overview-collapse-toggle" contenteditable="false" data-overview-collapse-toggle aria-label="Comprimi capitolo" aria-expanded="true">▼</button><span data-task-text><br></span>'
-      : '<span data-task-text><br></span>'
+    if (kind !== 'table') {
+      next.innerHTML = kind === 'collapse'
+        ? '<button type="button" class="tasklist-info-overview-collapse-toggle" contenteditable="false" data-overview-collapse-toggle aria-label="Comprimi capitolo" aria-expanded="true">▼</button><span data-task-text><br></span>'
+        : '<span data-task-text><br></span>'
+    }
     if (source?.parentElement === editor) source.replaceWith(next)
     else editor.append(next)
     syncOverviewCollapseVisibility(editor)
     ensureOverviewTrailingPromptLine(editor, showsTrailingPrompt(blockId))
     activeEmptyLineRef.current = undefined
     setMenu(undefined)
-    const text = next.querySelector<HTMLElement>('[data-task-text]') ?? next
+    const text = next.querySelector<HTMLElement>(
+      kind === 'table' ? '[data-table-cell]' : '[data-task-text]',
+    ) ?? next
     const range = window.document.createRange()
     range.selectNodeContents(text)
     range.collapse(true)
@@ -1103,6 +1484,51 @@ const OverviewFlowEditor = ({
 
   const handleKeyDown = (blockId: Uuid, event: KeyboardEvent<HTMLDivElement>) => {
     const editor = event.currentTarget
+    const target = event.target instanceof HTMLElement ? event.target : null
+    const resizeHandle = target?.closest<HTMLElement>('[data-table-resize]')
+    if (resizeHandle && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      const tableRoot = resizeHandle.closest<HTMLElement>('[data-md-kind="table"]')
+      const columnIndex = Number(resizeHandle.dataset.columnIndex)
+      const column = tableRoot?.querySelectorAll<HTMLTableColElement>('colgroup col')[columnIndex]
+      if (tableRoot && column) {
+        const currentWidth = column.getBoundingClientRect().width || overviewTableDefaultColumnWidth
+        setOverviewTableColumnWidth(
+          tableRoot,
+          columnIndex,
+          currentWidth + (event.key === 'ArrowRight' ? 16 : -16),
+        )
+        commitTableChange(blockId, editor)
+      }
+      event.preventDefault()
+      return
+    }
+    const tableCell = target?.closest<HTMLElement>('[data-table-cell]')
+    if (
+      tableCell &&
+      (event.ctrlKey || event.metaKey) &&
+      !event.altKey &&
+      event.key.toLowerCase() === 'a'
+    ) {
+      const range = window.document.createRange()
+      range.selectNodeContents(tableCell)
+      const selection = window.getSelection()
+      selection?.removeAllRanges()
+      selection?.addRange(range)
+      event.preventDefault()
+      return
+    }
+    if (tableCell && event.key === 'Enter' && !event.shiftKey) {
+      const tableRoot = tableCell.closest<HTMLElement>('[data-md-kind="table"]')
+      if (tableRoot) {
+        const cells = Array.from(tableRoot.querySelectorAll<HTMLElement>('[data-table-cell]'))
+        const cellIndex = cells.indexOf(tableCell)
+        let nextCell: HTMLElement | undefined = cells[cellIndex + 1]
+        if (!nextCell) nextCell = addOverviewTableRow(tableRoot)
+        commitTableChange(blockId, editor, nextCell)
+      }
+      event.preventDefault()
+      return
+    }
     const selection = window.getSelection()
     const line = lineForTarget(editor, selection?.anchorNode ?? null)
       ?? editor.lastElementChild as HTMLElement | null
@@ -1170,16 +1596,48 @@ const OverviewFlowEditor = ({
   }
 
   const dropForEvent = (blockId: Uuid, event: DragEvent<HTMLDivElement>) => {
-    const line = lineForTarget(event.currentTarget, event.target)
-    if (!line) return undefined
-    const lines = Array.from(event.currentTarget.children) as HTMLElement[]
-    const index = lines.indexOf(line)
-    if (index < 0) return undefined
-    const bounds = line.getBoundingClientRect()
-    const canvas = event.currentTarget.parentElement?.getBoundingClientRect()
-    if (!canvas) return undefined
-    const position = event.clientY < bounds.top + bounds.height / 2 ? 'before' as const : 'after' as const
-    return { blockId, index, position, top: (position === 'before' ? bounds.top : bounds.bottom) - canvas.top }
+    const editor = event.currentTarget
+    const canvas = editor.parentElement
+    const canvasBounds = canvas?.getBoundingClientRect()
+    if (!canvas || !canvasBounds) return undefined
+
+    const visibleLines = (Array.from(editor.children) as HTMLElement[])
+      .map((line, index) => ({ line, index, bounds: line.getBoundingClientRect() }))
+      .filter(({ line }) => !line.classList.contains('is-collapsed-by-chapter'))
+    if (visibleLines.length === 0) return undefined
+
+    const first = visibleLines[0]!
+    const last = visibleLines.at(-1)!
+    const boundaries = [
+      {
+        cutIndex: first.index,
+        viewportTop: first.bounds.top,
+      },
+      ...visibleLines.slice(1).map((current, index) => {
+        const previous = visibleLines[index]!
+        return {
+          cutIndex: current.index,
+          viewportTop: previous.bounds.bottom,
+        }
+      }),
+      {
+        cutIndex: last.index + 1,
+        viewportTop: last.bounds.bottom,
+      },
+    ]
+    const nearest = boundaries.reduce((best, candidate) => (
+      Math.abs(candidate.viewportTop - event.clientY) < Math.abs(best.viewportTop - event.clientY)
+        ? candidate
+        : best
+    ))
+    const canvasScaleY = canvas.offsetHeight > 0
+      ? canvasBounds.height / canvas.offsetHeight
+      : 1
+    return {
+      blockId,
+      cutIndex: nearest.cutIndex,
+      top: (nearest.viewportTop - canvasBounds.top) / canvasScaleY,
+    }
   }
 
   const finishDrop = (blockId: Uuid, event: DragEvent<HTMLDivElement>) => {
@@ -1188,12 +1646,63 @@ const OverviewFlowEditor = ({
     const sourceId = draggedBlockIdRef.current || event.dataTransfer.getData('text/plain')
     if (!drop || drop.blockId !== blockId || !sourceId) return
     const editor = event.currentTarget
+    const draggedTable = draggedTableRef.current
+    if (draggedTable) {
+      const sourceEditor = editorRefs.current.get(draggedTable.blockId)
+      const targetLines = Array.from(editor.children) as HTMLElement[]
+      const reference = targetLines[drop.cutIndex]
+      if (!sourceEditor || reference === draggedTable.tableRoot) {
+        draggedBlockIdRef.current = undefined
+        draggedTableRef.current = undefined
+        setDropLine(undefined)
+        return
+      }
+
+      draggedTable.tableRoot.remove()
+      if (reference?.parentElement === editor) editor.insertBefore(draggedTable.tableRoot, reference)
+      else editor.append(draggedTable.tableRoot)
+      syncOverviewCollapseVisibility(sourceEditor)
+      if (sourceEditor !== editor) syncOverviewCollapseVisibility(editor)
+      ensureOverviewTrailingPromptLine(
+        sourceEditor,
+        showsTrailingPrompt(draggedTable.blockId),
+      )
+      if (sourceEditor !== editor) {
+        ensureOverviewTrailingPromptLine(editor, showsTrailingPrompt(blockId))
+      }
+
+      const sourceMarkdown = overviewEditorToMarkdown(sourceEditor)
+      const targetMarkdown = sourceEditor === editor
+        ? sourceMarkdown
+        : overviewEditorToMarkdown(editor)
+      sourceEditor.dataset.sourceMarkdown = sourceMarkdown
+      editor.dataset.sourceMarkdown = targetMarkdown
+      let blocks = contentRef.current.blocks.some((value) => value.id === draggedTable.blockId)
+        ? updateTextBlock(contentRef.current.blocks, draggedTable.blockId, sourceMarkdown)
+        : [...contentRef.current.blocks, {
+            id: draggedTable.blockId,
+            type: 'text' as const,
+            markdown: sourceMarkdown,
+          }]
+      if (draggedTable.blockId !== blockId) {
+        blocks = blocks.some((value) => value.id === blockId)
+          ? updateTextBlock(blocks, blockId, targetMarkdown)
+          : [...blocks, { id: blockId, type: 'text' as const, markdown: targetMarkdown }]
+      }
+      const content = { ...contentRef.current, blocks }
+      setContent(content)
+      void onCommit(content, 'Spostamento tabella non riuscito')
+      draggedBlockIdRef.current = undefined
+      draggedTableRef.current = undefined
+      setDropLine(undefined)
+      return
+    }
+    const snapshot = serializeEditor(blockId, editor)
     const lines = Array.from(editor.children) as HTMLElement[]
-    const cut = drop.index + (drop.position === 'after' ? 1 : 0)
-    const before = overviewElementsToMarkdown(lines.slice(0, cut))
-    const after = overviewElementsToMarkdown(lines.slice(cut))
+    const before = overviewElementsToMarkdown(lines.slice(0, drop.cutIndex))
+    const after = overviewElementsToMarkdown(lines.slice(drop.cutIndex))
     const blocks = moveFlowBlockToTextBoundary(
-      contentRef.current.blocks,
+      snapshot.blocks,
       sourceId,
       blockId,
       before,
@@ -1214,7 +1723,9 @@ const OverviewFlowEditor = ({
       aria-label="Formattazione testo"
       onMouseDown={(event) => event.preventDefault()}
     >
-      <button type="button" onClick={() => applyFormat(blockId, 'formatBlock', 'h3')} title="Titolo piccolo">H3⌄</button>
+      {!toolbar.inlineOnly && (
+        <button type="button" onClick={() => applyFormat(blockId, 'formatBlock', 'h3')} title="Titolo piccolo">H3⌄</button>
+      )}
       <button type="button" onClick={() => applyFormat(blockId, 'bold')} title="Grassetto"><strong>B</strong></button>
       <button type="button" onClick={() => applyFormat(blockId, 'italic')} title="Corsivo"><em>I</em></button>
       <button type="button" onClick={() => applyFormat(blockId, 'strikeThrough')} title="Barrato"><s>S</s></button>
@@ -1223,7 +1734,9 @@ const OverviewFlowEditor = ({
         const href = window.prompt('Inserisci il link')?.trim()
         if (href) applyFormat(blockId, 'createLink', href)
       }} title="Link">🔗</button>
-      <button type="button" onClick={() => applyFormat(blockId, 'formatBlock', 'blockquote')} title="Citazione">❞</button>
+      {!toolbar.inlineOnly && (
+        <button type="button" onClick={() => applyFormat(blockId, 'formatBlock', 'blockquote')} title="Citazione">❞</button>
+      )}
       <button type="button" onClick={() => {
         applyFormat(blockId, 'removeFormat')
         applyFormat(blockId, 'unlink')
@@ -1249,6 +1762,9 @@ const OverviewFlowEditor = ({
         ))}
         <button type="button" role="menuitem" onPointerDown={(event) => { event.preventDefault(); insertMarkdownLine(blockId, 'bullet') }}>
           <ListIcon aria-hidden /><span>Elenco puntato</span>
+        </button>
+        <button type="button" role="menuitem" onPointerDown={(event) => { event.preventDefault(); insertMarkdownLine(blockId, 'table') }}>
+          <TableIcon aria-hidden /><span>Tabella</span>
         </button>
         <button type="button" role="menuitem" onPointerDown={(event) => { event.preventDefault(); insertMarkdownLine(blockId, 'collapse') }}>
           <span className="tasklist-info-block-icon">▸</span><span>Collapse</span>
@@ -1284,6 +1800,69 @@ const OverviewFlowEditor = ({
     </div>
   ) : null
 
+  const applyTableContextAction = (
+    action: 'add-row' | 'add-column' | 'remove-row' | 'remove-column',
+  ) => {
+    if (!tableMenu || !tableMenu.tableRoot.isConnected) return
+    const editor = editorRefs.current.get(tableMenu.blockId)
+    if (!editor) return
+    let focusTarget: HTMLElement | undefined
+    if (action === 'add-row') {
+      focusTarget = addOverviewTableRow(
+        tableMenu.tableRoot,
+        tableMenu.header ? undefined : tableMenu.rowIndex,
+      )
+    } else if (action === 'add-column') {
+      focusTarget = addOverviewTableColumn(
+        tableMenu.tableRoot,
+        tableMenu.columnIndex,
+      )
+    } else if (action === 'remove-row' && !tableMenu.header) {
+      removeOverviewTableRow(tableMenu.tableRoot, tableMenu.rowIndex)
+    } else if (action === 'remove-column') {
+      removeOverviewTableColumn(tableMenu.tableRoot, tableMenu.columnIndex)
+    }
+    setTableMenu(undefined)
+    commitTableChange(tableMenu.blockId, editor, focusTarget)
+  }
+
+  const renderedTableMenu = tableMenu ? createPortal((
+    <div
+      className="tasklist-info-overview-table-context-menu"
+      role="menu"
+      aria-label="Azioni tabella"
+      style={{
+        top: `${Math.min(tableMenu.y, window.innerHeight - 190)}px`,
+        left: `${Math.min(tableMenu.x, window.innerWidth - 190)}px`,
+      }}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      <button type="button" role="menuitem" onClick={() => applyTableContextAction('add-row')}>
+        Aggiungi riga sotto
+      </button>
+      <button type="button" role="menuitem" onClick={() => applyTableContextAction('add-column')}>
+        Aggiungi colonna a destra
+      </button>
+      <span aria-hidden />
+      <button
+        type="button"
+        role="menuitem"
+        disabled={tableMenu.header}
+        onClick={() => applyTableContextAction('remove-row')}
+      >
+        Elimina riga
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        disabled={tableMenu.tableRoot.querySelectorAll('thead th').length <= 1}
+        onClick={() => applyTableContextAction('remove-column')}
+      >
+        Elimina colonna
+      </button>
+    </div>
+  ), window.document.body) : null
+
   const firstTextBlockId = flowBlocks.find(
     (block) => block.type === 'text',
   )?.id
@@ -1307,7 +1886,9 @@ const OverviewFlowEditor = ({
                 collapseState?.inheritedCollapsed ?? false,
                 blockIndex === flowBlocks.length - 1,
               )}
-              className="tasklist-info-overview-editor"
+              className={`tasklist-info-overview-editor${
+                dropLine?.blockId === block.id ? ' is-drop-target' : ''
+              }`}
               contentEditable
               suppressContentEditableWarning
               role="textbox"
@@ -1318,6 +1899,21 @@ const OverviewFlowEditor = ({
               data-placeholder="Scrivi una nota o usa / per aggiungere contenuti"
               onPointerDown={(event) => {
                 setSelectedBlockId(undefined)
+                const resizeHandle = event.target instanceof Element
+                  ? event.target.closest<HTMLElement>('[data-table-resize]')
+                  : null
+                if (resizeHandle) {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  startTableColumnResize(
+                    block.id,
+                    event.currentTarget,
+                    resizeHandle,
+                    event.pointerId,
+                    event.clientX,
+                  )
+                  return
+                }
                 const prompt = event.target instanceof Element
                   ? event.target.closest<HTMLElement>('[data-overview-prompt]')
                   : null
@@ -1340,9 +1936,73 @@ const OverviewFlowEditor = ({
                 )
                 serializeEditor(block.id, event.currentTarget)
               }}
+              onPaste={(event) => {
+                const tableCell = event.target instanceof Element
+                  ? event.target.closest<HTMLElement>('[data-table-cell]')
+                  : null
+                if (!tableCell) return
+                event.preventDefault()
+                const pastedText = event.clipboardData
+                  .getData('text/plain')
+                  .replace(/[\r\n]+/g, ' ')
+                const selection = window.getSelection()
+                let range = selection?.rangeCount ? selection.getRangeAt(0) : undefined
+                if (
+                  !range ||
+                  !tableCell.contains(range.startContainer) ||
+                  !tableCell.contains(range.endContainer)
+                ) {
+                  range = window.document.createRange()
+                  range.selectNodeContents(tableCell)
+                  range.collapse(false)
+                }
+                range.deleteContents()
+                const text = window.document.createTextNode(pastedText)
+                range.insertNode(text)
+                range.setStartAfter(text)
+                range.collapse(true)
+                selection?.removeAllRanges()
+                selection?.addRange(range)
+                serializeEditor(block.id, event.currentTarget)
+              }}
               onKeyUp={() => updateToolbar(block.id)}
               onMouseUp={() => updateToolbar(block.id)}
+              onContextMenu={(event) => {
+                const cellEditor = event.target instanceof Element
+                  ? event.target.closest<HTMLElement>('[data-table-cell]')
+                  : null
+                const tableRoot = cellEditor?.closest<HTMLElement>('[data-md-kind="table"]')
+                const cell = cellEditor?.closest<HTMLTableCellElement>('th, td')
+                const row = cell?.parentElement as HTMLTableRowElement | null
+                if (!cellEditor || !tableRoot || !cell || !row) return
+                const header = cell.tagName === 'TH'
+                const bodyRows = Array.from(
+                  tableRoot.querySelectorAll<HTMLTableRowElement>('tbody tr'),
+                )
+                event.preventDefault()
+                setTableMenu({
+                  blockId: block.id,
+                  tableRoot,
+                  rowIndex: header ? -1 : bodyRows.indexOf(row),
+                  columnIndex: Array.from(row.cells).indexOf(cell),
+                  header,
+                  x: event.clientX,
+                  y: event.clientY,
+                })
+              }}
               onClick={(event) => {
+                const tableAction = event.target instanceof Element
+                  ? event.target.closest<HTMLElement>('[data-table-action]')
+                  : null
+                if (tableAction) {
+                  const tableRoot = tableAction.closest<HTMLElement>('[data-md-kind="table"]')
+                  if (!tableRoot) return
+                  const focusTarget = tableAction.dataset.tableAction === 'add-column'
+                    ? addOverviewTableColumn(tableRoot)
+                    : addOverviewTableRow(tableRoot)
+                  commitTableChange(block.id, event.currentTarget, focusTarget)
+                  return
+                }
                 const toggle = event.target instanceof Element
                   ? event.target.closest('[data-overview-collapse-toggle]')
                   : null
@@ -1353,11 +2013,19 @@ const OverviewFlowEditor = ({
               }}
               onBlur={(event) => {
                 if (event.relatedTarget instanceof Node && event.relatedTarget.closest?.('.tasklist-info-block-menu')) return
+                if (event.relatedTarget instanceof Node && event.relatedTarget.closest?.('.tasklist-info-overview-table-context-menu')) return
+                if (
+                  event.relatedTarget instanceof Node &&
+                  event.currentTarget.contains(event.relatedTarget)
+                ) return
                 setMenu(undefined)
                 const content = serializeEditor(block.id, event.currentTarget)
                 event.currentTarget.innerHTML = markdownToOverviewHtml(
                   (content.blocks.find((value) => value.id === block.id && value.type === 'text') as { markdown?: string } | undefined)?.markdown ?? '',
                 )
+                event.currentTarget.dataset.sourceMarkdown = (
+                  content.blocks.find((value) => value.id === block.id && value.type === 'text') as { markdown?: string } | undefined
+                )?.markdown ?? ''
                 syncOverviewCollapseVisibility(
                   event.currentTarget,
                   collapseState?.inheritedCollapsed ?? false,
@@ -1382,6 +2050,26 @@ const OverviewFlowEditor = ({
                 }
               }}
               onDrop={(event) => finishDrop(block.id, event)}
+              onDragStart={(event) => {
+                const handle = event.target instanceof Element
+                  ? event.target.closest<HTMLElement>('[data-table-drag]')
+                  : null
+                const tableRoot = handle?.closest<HTMLElement>('[data-md-kind="table"]')
+                if (!handle || !tableRoot) return
+                event.dataTransfer.effectAllowed = 'move'
+                event.dataTransfer.setData('text/plain', block.id)
+                draggedBlockIdRef.current = block.id
+                draggedTableRef.current = { blockId: block.id, tableRoot }
+              }}
+              onDragEnd={(event) => {
+                const handle = event.target instanceof Element
+                  ? event.target.closest<HTMLElement>('[data-table-drag]')
+                  : null
+                if (!handle) return
+                draggedBlockIdRef.current = undefined
+                draggedTableRef.current = undefined
+                setDropLine(undefined)
+              }}
             />
             {renderToolbar(block.id)}
             {dropLine?.blockId === block.id && <span className="tasklist-info-text-drop-line" style={{ top: `${dropLine.top}px` }} aria-hidden />}
@@ -1483,6 +2171,7 @@ const OverviewFlowEditor = ({
           </div>
         )
       })}
+      {renderedTableMenu}
     </div>
   )
 }

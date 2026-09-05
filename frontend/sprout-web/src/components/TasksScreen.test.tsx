@@ -132,6 +132,9 @@ const makeTask = (
   options?: {
     kind?: 'priority' | 'deadline' | 'recurring'
     dueAt?: string
+    presetId?: string
+    presetTemplateIndex?: number
+    createdAt?: string
   },
 ): DecryptedTask => ({
   wire: {
@@ -153,7 +156,7 @@ const makeTask = (
     occurrence_number: options?.kind === 'recurring' ? 1 : null,
     active_assignment_id: assignee ? crypto.randomUUID() : null,
     active_assignee_identity_id: assignee,
-    created_at: '2026-07-18T12:00:00.000Z',
+    created_at: options?.createdAt ?? '2026-07-18T12:00:00.000Z',
     payload_version: 1,
   },
   document: {
@@ -161,6 +164,8 @@ const makeTask = (
     title,
     priority: 'normal',
     notes: `${title} notes`,
+    preset_id: options?.presetId,
+    preset_template_index: options?.presetTemplateIndex,
     due_at: options?.dueAt,
     recurrence:
       options?.kind === 'recurring'
@@ -223,6 +228,7 @@ const baseProps = {
   onCompleteTask: vi.fn().mockResolvedValue(undefined),
   onCopyTask: vi.fn().mockResolvedValue(undefined),
   onInviteMember: vi.fn().mockResolvedValue(undefined),
+  onUpdateMemberResponsibilities: vi.fn().mockResolvedValue(undefined),
   onRefreshAgents: vi.fn(),
   onProvisionAgent: vi.fn().mockResolvedValue({
     agent_id: crypto.randomUUID(),
@@ -378,6 +384,54 @@ describe('board shell', () => {
     expect(onSelectProject).toHaveBeenCalledWith(otherProjectId)
   })
 
+  it('expands the Ask to AI composer with multiline content', async () => {
+    const user = userEvent.setup()
+    render(<TasksScreen {...baseProps} />)
+
+    await user.click(screen.getByRole('button', { name: 'Ask to AI' }))
+    const composer = screen.getByLabelText('Messaggio per Ask to AI')
+    Object.defineProperty(composer, 'scrollHeight', {
+      configurable: true,
+      value: 132,
+    })
+
+    fireEvent.change(composer, { target: { value: 'Testo su più righe' } })
+
+    expect(composer).toHaveStyle({ height: '132px', overflowY: 'hidden' })
+  })
+
+  it('renders note URLs as links only in the open task detail', () => {
+    const url = 'https://docs.google.com/spreadsheets/d/example-id-without-spaces'
+    const linkedTask = makeTask('Riferimento', listId, memberId)
+    linkedTask.document.notes = url
+    const { rerender } = render(
+      <TasksScreen
+        {...baseProps}
+        tasks={[linkedTask]}
+      />,
+    )
+
+    expect(screen.queryByRole('link', { name: url })).toBeNull()
+
+    rerender(
+      <TasksScreen
+        {...baseProps}
+        tasks={[linkedTask]}
+        selectedTaskId={linkedTask.wire.id}
+      />,
+    )
+
+    const detail = screen.getByRole('dialog', { name: 'Task detail' })
+    const link = within(detail).getByRole('link', { name: url })
+    expect(link).toHaveAttribute('href', url)
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(within(detail).getAllByText(url)).toHaveLength(1)
+    expect(within(detail).queryByLabelText('Commento')).toBeNull()
+
+    fireEvent.click(within(detail).getByRole('button', { name: 'Modifica note' }))
+    expect(within(detail).getByLabelText('Commento')).toHaveValue(url)
+  })
+
   it('creates a project from the sidebar toolbar switcher', async () => {
     const user = userEvent.setup()
     const onCreateProject = vi.fn()
@@ -424,6 +478,129 @@ describe('board shell', () => {
       email: 'lucia@example.com',
       name: 'Lucia Bianchi',
       role: 'member',
+    })
+  })
+
+  it('opens a minimal member detail with role and assigned tasks', async () => {
+    const user = userEvent.setup()
+    const onSelectTask = vi.fn()
+    const assignedTask = makeTask('Controlla impianto', listId, memberId)
+    const completedTask = makeTask('Rapporto concluso', listId, memberId)
+    completedTask.wire.state = {
+      state: 'completed',
+      completed_by: memberId,
+      completed_at: '2026-09-03T12:00:00.000Z',
+    }
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'members' }}
+        boardViewMode="overview"
+        boardMembers={[{
+          identityId: memberId,
+          label: 'Elena Russo',
+          email: 'elena@example.test',
+          role: 'admin',
+          joinedAt: '2026-09-01T10:00:00.000Z',
+        }]}
+        tasks={[assignedTask, completedTask]}
+        onSelectTask={onSelectTask}
+      />,
+    )
+
+    await user.click(
+      screen.getByRole('button', { name: 'Apri dettagli di Elena Russo' }),
+    )
+
+    const detail = screen.getByLabelText('Dettagli di Elena Russo')
+    expect(screen.queryByRole('group', { name: 'Vista board' })).toBeNull()
+    expect(
+      screen.getByRole('button', { name: 'Torna alla board' }),
+    ).toBeTruthy()
+    expect(within(detail).getByText('elena@example.test')).toBeTruthy()
+    expect(within(detail).getByText('Ruolo')).toBeTruthy()
+    expect(within(detail).getByText('Amministratore')).toBeTruthy()
+    expect(within(detail).queryByLabelText(/Responsabilità di/)).toBeNull()
+    expect(within(detail).queryByText('Controlla impianto')).toBeNull()
+
+    const memberNavigation = screen.getByLabelText('Vista membro')
+    expect(within(memberNavigation).getByRole('button', { name: 'Torna alla board' })).toBeTruthy()
+    expect(within(memberNavigation).getByRole('tab', { name: 'Info' })).toBeTruthy()
+    await user.click(within(memberNavigation).getByRole('tab', { name: 'History' }))
+    expect(within(detail).queryByText('1 aperti · 1 completati')).toBeNull()
+
+    await user.click(
+      within(detail).getByRole('button', { name: /Controlla impianto/i }),
+    )
+    expect(onSelectTask).toHaveBeenCalledWith(assignedTask.wire.id)
+
+    await user.click(
+      within(detail).getByRole('button', { name: 'Filtra task membro' }),
+    )
+    expect(within(detail).getByText('Board')).toBeTruthy()
+    expect(within(detail).getByText('Tipologia')).toBeTruthy()
+    expect(within(detail).getByText('Stato')).toBeTruthy()
+    expect(within(detail).getByText('Data')).toBeTruthy()
+    expect(within(detail).queryByText('Membro')).toBeNull()
+    const boardCategory = within(detail).getByRole('button', { name: 'Board' })
+    const dateCategory = within(detail).getByRole('button', { name: 'Data' })
+    expect(boardCategory.getAttribute('aria-pressed')).toBe('false')
+    expect(dateCategory.getAttribute('aria-pressed')).toBe('true')
+    expect(boardCategory.querySelector('.board-filter-selection-circle')).toBeTruthy()
+    expect(dateCategory.querySelector('.board-filter-selection-circle.selected')).toBeTruthy()
+    await user.click(boardCategory)
+    expect(boardCategory.getAttribute('aria-pressed')).toBe('true')
+    expect(dateCategory.getAttribute('aria-pressed')).toBe('false')
+    expect(
+      detail.querySelector('.tasklist-history-day-label--violet'),
+    ).toBeTruthy()
+    await user.click(
+      within(detail).getByRole('button', { name: 'Apri filtri Stato' }),
+    )
+    await user.click(
+      within(detail).getByRole('menuitemcheckbox', { name: 'Completati' }),
+    )
+    expect(within(detail).queryByText('Controlla impianto')).toBeNull()
+    expect(within(detail).getByText('Rapporto concluso')).toBeTruthy()
+
+    await user.click(screen.getByRole('button', { name: 'Torna alla board' }))
+    expect(screen.getByRole('heading', { name: 'Membri' })).toBeTruthy()
+  })
+
+  it('edits responsibilities for a non-administrator member', async () => {
+    const user = userEvent.setup()
+    const onUpdateMemberResponsibilities = vi.fn().mockResolvedValue(undefined)
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'members' }}
+        boardViewMode="overview"
+        boardMembers={[{
+          identityId: memberId,
+          label: 'Elena Russo',
+          email: 'elena@example.test',
+          role: 'member',
+          responsibilities: 'Controllo qualità',
+        }]}
+        onUpdateMemberResponsibilities={onUpdateMemberResponsibilities}
+      />,
+    )
+
+    await user.click(
+      screen.getByRole('button', { name: 'Apri dettagli di Elena Russo' }),
+    )
+    const input = screen.getByRole('textbox', {
+      name: 'Responsabilità di Elena Russo',
+    })
+    expect(input).toHaveValue('Controllo qualità')
+    await user.clear(input)
+    await user.type(input, 'Verifica impianti{Enter}')
+
+    await waitFor(() => {
+      expect(onUpdateMemberResponsibilities).toHaveBeenCalledWith(
+        memberId,
+        'Verifica impianti',
+      )
     })
   })
 
@@ -603,6 +780,284 @@ describe('board shell', () => {
     ])
   })
 
+  it('adds and edits a resizable Markdown table in Overview', async () => {
+    const user = userEvent.setup()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{ id: crypto.randomUUID(), type: 'text', markdown: '' }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (_current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...projectRoot,
+        wire: { ...projectRoot.wire, payload_version: projectRoot.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    openSlashMenu(editor)
+    await user.click(await screen.findByRole('menuitem', { name: 'Tabella' }))
+
+    const table = editor.querySelector('table')!
+    expect(table.querySelectorAll('thead th')).toHaveLength(2)
+    expect(table.querySelectorAll('tbody tr')).toHaveLength(1)
+    expect(table.closest('.tasklist-info-overview-table-scroll')).toBeTruthy()
+
+    await user.click(screen.getByRole('button', { name: 'Aggiungi riga' }))
+    expect(table.querySelectorAll('tbody tr')).toHaveLength(2)
+    await user.click(screen.getByRole('button', { name: 'Aggiungi colonna' }))
+    expect(table.querySelectorAll('thead th')).toHaveLength(3)
+    expect(table.querySelectorAll('tbody tr')[0]?.querySelectorAll('td')).toHaveLength(3)
+
+    const firstCell = table.querySelector<HTMLElement>('[data-table-cell]')!
+    firstCell.textContent = 'Attività'
+    fireEvent.input(firstCell)
+    fireEvent.keyDown(firstCell, { key: 'a', ctrlKey: true })
+    expect(window.getSelection()?.toString()).toBe('Attività')
+    fireEvent.paste(firstCell, {
+      clipboardData: { getData: () => 'Nuovo\nvalore' },
+    })
+    expect(firstCell).toHaveTextContent('Nuovo valore')
+    const firstResize = screen.getByRole('separator', { name: 'Ridimensiona colonna 1' })
+    fireEvent.keyDown(firstResize, { key: 'ArrowRight' })
+
+    await waitFor(() => {
+      const markdown = onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks
+        .find((block) => block.type === 'text')?.markdown
+      expect(markdown).toContain('<!-- sprout-table-widths:196,180,180 -->')
+      expect(markdown).toContain('| Nuovo valore | Colonna 2 | Colonna 3 |')
+      expect(markdown?.match(/^\|  \|  \|  \|$/gm)).toHaveLength(2)
+    })
+
+    const bodyCell = table.querySelector<HTMLElement>('tbody [data-table-cell]')!
+    fireEvent.contextMenu(bodyCell, { clientX: 120, clientY: 140 })
+    const contextMenu = screen.getByRole('menu', { name: 'Azioni tabella' })
+    expect(within(contextMenu).getByRole('menuitem', { name: 'Elimina riga' })).toBeEnabled()
+    expect(within(contextMenu).getByRole('menuitem', { name: 'Elimina colonna' })).toBeEnabled()
+    await user.click(
+      within(contextMenu).getByRole('menuitem', { name: 'Aggiungi riga sotto' }),
+    )
+    expect(table.querySelectorAll('tbody tr')).toHaveLength(3)
+
+    fireEvent.contextMenu(bodyCell, { clientX: 120, clientY: 140 })
+    await user.click(screen.getByRole('menuitem', { name: 'Elimina riga' }))
+    expect(table.querySelectorAll('tbody tr')).toHaveLength(2)
+
+    const thirdHeader = table.querySelectorAll<HTMLElement>('thead [data-table-cell]')[2]!
+    fireEvent.contextMenu(thirdHeader, { clientX: 160, clientY: 140 })
+    await user.click(screen.getByRole('menuitem', { name: 'Elimina colonna' }))
+    expect(table.querySelectorAll('thead th')).toHaveLength(2)
+
+    await waitFor(() => {
+      const markdown = onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks
+        .find((block) => block.type === 'text')?.markdown
+      expect(markdown).toContain('<!-- sprout-table-widths:196,180 -->')
+      expect(markdown).toContain('| Nuovo valore | Colonna 2 |')
+      expect(markdown?.match(/^\|  \|  \|$/gm)).toHaveLength(2)
+    })
+  })
+
+  it('renders and preserves inline Markdown formatting inside table cells', async () => {
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{
+          id: crypto.randomUUID(),
+          type: 'text',
+          markdown: [
+            '<!-- sprout-table-widths:180 -->',
+            '| **Grassetto** *corsivo* ~~barrato~~ <u>sottolineato</u> `codice` [link](https://example.com) |',
+            '| --- |',
+            '| contenuto |',
+          ].join('\n'),
+        }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (_current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...projectRoot,
+        wire: { ...projectRoot.wire, payload_version: projectRoot.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    const cell = editor.querySelector<HTMLElement>('[data-table-cell]')!
+    expect(cell.querySelector('strong')).toHaveTextContent('Grassetto')
+    expect(cell.querySelector('em')).toHaveTextContent('corsivo')
+    expect(cell.querySelector('s')).toHaveTextContent('barrato')
+    expect(cell.querySelector('u')).toHaveTextContent('sottolineato')
+    expect(cell.querySelector('code')).toHaveTextContent('codice')
+    expect(cell.querySelector('a')).toHaveAttribute('href', 'https://example.com')
+
+    const text = cell.querySelector('strong')?.firstChild
+    expect(text).toBeTruthy()
+    const range = document.createRange()
+    range.selectNodeContents(text!)
+    Object.defineProperty(range, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        x: 320, y: 240, top: 240, right: 400, bottom: 264, left: 320,
+        width: 80, height: 24, toJSON: () => ({}),
+      }),
+    })
+    const selection = window.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+    fireEvent.mouseUp(cell)
+
+    const toolbar = await screen.findByRole('toolbar', { name: 'Formattazione testo' })
+    expect(within(toolbar).getByTitle('Grassetto')).toBeVisible()
+    expect(within(toolbar).getByTitle('Corsivo')).toBeVisible()
+    expect(within(toolbar).getByTitle('Barrato')).toBeVisible()
+    expect(within(toolbar).getByTitle('Sottolineato')).toBeVisible()
+    expect(within(toolbar).getByTitle('Link')).toBeVisible()
+    expect(within(toolbar).getByTitle('Codice')).toBeVisible()
+    expect(within(toolbar).queryByTitle('Titolo piccolo')).not.toBeInTheDocument()
+    expect(within(toolbar).queryByTitle('Citazione')).not.toBeInTheDocument()
+
+    fireEvent.input(cell)
+    fireEvent.blur(cell)
+    await waitFor(() => {
+      const markdown = onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks
+        .find((block) => block.type === 'text')?.markdown
+      expect(markdown).toContain(
+        '| **Grassetto** *corsivo* ~~barrato~~ <u>sottolineato</u> `codice` [link](https://example.com) |',
+      )
+    })
+  })
+
+  it('moves a Markdown table with its external drag handle', async () => {
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{
+          id: crypto.randomUUID(),
+          type: 'text',
+          markdown: [
+            'Prima',
+            '<!-- sprout-table-widths:180 -->',
+            '| Colonna |',
+            '| --- |',
+            '| Valore |',
+            'Dopo',
+          ].join('\n'),
+        }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (_current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...projectRoot,
+        wire: { ...projectRoot.wire, payload_version: projectRoot.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    const handle = screen.getByRole('button', { name: 'Sposta tabella' })
+    expect(handle).toHaveAttribute('draggable', 'true')
+    expect(handle).toHaveClass('tasklist-info-overview-table-drag-handle')
+
+    const canvas = editor.parentElement!
+    const rect = (top: number, bottom: number) => ({
+      x: 0,
+      y: top,
+      top,
+      right: 600,
+      bottom,
+      left: 0,
+      width: 600,
+      height: bottom - top,
+      toJSON: () => ({}),
+    })
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue(rect(80, 260))
+    Object.defineProperty(canvas, 'offsetHeight', { configurable: true, value: 180 })
+    vi.spyOn(editor.children[0]!, 'getBoundingClientRect').mockReturnValue(rect(100, 120))
+    vi.spyOn(editor.children[1]!, 'getBoundingClientRect').mockReturnValue(rect(130, 190))
+    vi.spyOn(editor.children[2]!, 'getBoundingClientRect').mockReturnValue(rect(200, 220))
+    vi.spyOn(editor.children[3]!, 'getBoundingClientRect').mockReturnValue(rect(230, 250))
+
+    const transferred: Record<string, string> = {}
+    const dataTransfer = {
+      effectAllowed: 'none',
+      setData: vi.fn((type: string, value: string) => { transferred[type] = value }),
+      getData: vi.fn((type: string) => transferred[type] ?? ''),
+    }
+    fireEvent.dragStart(handle, { dataTransfer })
+    const dragOver = new Event('dragover', { bubbles: true, cancelable: true })
+    Object.defineProperties(dragOver, {
+      clientY: { value: 96 },
+      dataTransfer: { value: dataTransfer },
+    })
+    fireEvent(editor, dragOver)
+    const drop = new Event('drop', { bubbles: true, cancelable: true })
+    Object.defineProperties(drop, {
+      clientY: { value: 96 },
+      dataTransfer: { value: dataTransfer },
+    })
+    fireEvent(editor, drop)
+
+    await waitFor(() => {
+      const markdown = onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks
+        .find((block) => block.type === 'text')?.markdown
+      expect(markdown).toMatch(/^<!-- sprout-table-widths:180 -->/)
+      expect(markdown).toContain('| Valore |\nPrima\nDopo')
+    })
+  })
+
   it('renders the text formatting toolbar above the document clipping layers', async () => {
     const projectRoot: DecryptedInfoDocument = {
       ...infoRoot,
@@ -690,6 +1145,9 @@ describe('board shell', () => {
     )
 
     const flow = await screen.findByTestId('overview-block-flow')
+    expect(
+      await screen.findByRole('button', { name: 'Scarica immagine' }),
+    ).toHaveClass('tasklist-info-image-download')
     const prompts = flow.querySelectorAll('[data-overview-prompt]')
     expect(prompts).toHaveLength(1)
     const trailingTextBlock = prompts[0]?.closest<HTMLElement>('[data-block-id]')
@@ -730,6 +1188,61 @@ describe('board shell', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Seleziona foto.png' }))
     await waitFor(() => expect(imageBlock).toHaveClass('is-selected'))
     fireEvent.keyDown(imageBlock!, { key: 'Delete' })
+    await waitFor(() => {
+      const blocks = onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks ?? []
+      expect(blocks.some((block) => block.id === imageId)).toBe(false)
+    })
+  })
+
+  it('groups an unreadable encrypted image with its delete action', async () => {
+    const imageId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{
+          id: imageId,
+          type: 'file',
+          blob_id: crypto.randomUUID(),
+          file_name: 'cifrata.png',
+          content_type: 'image/png',
+          plaintext_size: 10,
+        }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onReadInfoDocumentFile={vi.fn().mockRejectedValue(new Error('missing key'))}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const placeholder = await screen.findByText('Immagine cifrata')
+    const frame = placeholder.closest<HTMLElement>('.tasklist-info-image-frame')
+    const remove = screen.getByRole('button', { name: 'Elimina cifrata.png' })
+    expect(frame).toHaveClass('is-encrypted')
+    expect(frame).toContainElement(remove)
+    expect(screen.queryByRole('separator', { name: 'Ridimensiona cifrata.png' })).toBeNull()
+
+    fireEvent.click(remove)
     await waitFor(() => {
       const blocks = onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks ?? []
       expect(blocks.some((block) => block.id === imageId)).toBe(false)
@@ -943,6 +1456,194 @@ describe('board shell', () => {
     expect(onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks).toEqual([
       { id: textId, type: 'text', markdown: 'Prima modificata\nDopo modificato' },
     ])
+  })
+
+  it('inserts an image at a focused row without duplicating the following text', async () => {
+    const user = userEvent.setup()
+    const textId = crypto.randomUUID()
+    const imageId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [{ id: textId, type: 'text', markdown: 'Sopra\nSotto' }],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+    const onUploadInfoDocumentFile = vi.fn().mockResolvedValue({
+      id: imageId,
+      type: 'file',
+      blob_id: crypto.randomUUID(),
+      file_name: 'in-mezzo.png',
+      content_type: 'image/png',
+      plaintext_size: 4,
+    })
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+        onUploadInfoDocumentFile={onUploadInfoDocumentFile}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    editor.focus()
+    expect(document.activeElement).toBe(editor)
+    openSlashMenuBefore(editor, editor.children[1]!)
+    await user.click(await screen.findByRole('menuitem', { name: 'Immagine' }))
+
+    await waitFor(() => {
+      expect(editor).toHaveTextContent('Sopra')
+      expect(editor).not.toHaveTextContent('Sotto')
+    })
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['image'], 'in-mezzo.png', { type: 'image/png' })] },
+    })
+    await waitFor(() => expect(onUploadInfoDocumentFile).toHaveBeenCalled())
+    await screen.findByRole('button', { name: 'Sposta in-mezzo.png' })
+    fireEvent.blur(editor)
+
+    await waitFor(() => {
+      const blocks = onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks ?? []
+      expect(blocks.map((block) => block.type === 'text' ? block.markdown : block.id)).toEqual([
+        'Sopra',
+        imageId,
+        'Sotto',
+      ])
+      expect(blocks.filter((block) => (
+        block.type === 'text' && block.markdown.includes('Sotto')
+      ))).toHaveLength(1)
+    })
+  })
+
+  it('moves an image below bullet and collapse row borders without duplicating text', async () => {
+    const textId = crypto.randomUUID()
+    const imageId = crypto.randomUUID()
+    const trailingTextId = crypto.randomUUID()
+    const projectRoot: DecryptedInfoDocument = {
+      ...infoRoot,
+      wire: {
+        ...infoRoot.wire,
+        topic_id: null,
+        task_list_id: null,
+        resource_node_id: project.wire.root_resource_id,
+      },
+      document: {
+        schema: 1,
+        blocks: [
+          { id: textId, type: 'text', markdown: 'Uno\n- Due\n:::collapse Tre' },
+          {
+            id: imageId,
+            type: 'file',
+            blob_id: crypto.randomUUID(),
+            file_name: 'da-spostare.png',
+            content_type: 'image/png',
+            plaintext_size: 4,
+          },
+          { id: trailingTextId, type: 'text', markdown: 'Quattro' },
+        ],
+      },
+    }
+    const onUpdateInfoDocument = vi.fn(
+      async (current: DecryptedInfoDocument, document: InfoDocumentContent) => ({
+        ...current,
+        wire: { ...current.wire, payload_version: current.wire.payload_version + 1 },
+        document,
+      }),
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'generali' }}
+        boardViewMode="overview"
+        onLoadProjectInfo={vi.fn().mockResolvedValue([projectRoot])}
+        onUpdateInfoDocument={onUpdateInfoDocument}
+      />,
+    )
+
+    const editor = await screen.findByRole('textbox', { name: 'Testo info in Markdown' })
+    const canvas = editor.parentElement!
+    const rect = (top: number, bottom: number) => ({
+      x: 0,
+      y: top,
+      top,
+      right: 600,
+      bottom,
+      left: 0,
+      width: 600,
+      height: bottom - top,
+      toJSON: () => ({}),
+    })
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue(rect(80, 220))
+    Object.defineProperty(canvas, 'offsetHeight', { configurable: true, value: 175 })
+    vi.spyOn(editor, 'getBoundingClientRect').mockReturnValue(rect(96, 204))
+    vi.spyOn(editor.children[0]!, 'getBoundingClientRect').mockReturnValue(rect(100, 120))
+    vi.spyOn(editor.children[1]!, 'getBoundingClientRect').mockReturnValue(rect(140, 160))
+    vi.spyOn(editor.children[2]!, 'getBoundingClientRect').mockReturnValue(rect(180, 200))
+
+    editor.focus()
+    const transferred: Record<string, string> = {}
+    const dataTransfer = {
+      effectAllowed: 'none',
+      setData: vi.fn((type: string, value: string) => { transferred[type] = value }),
+      getData: vi.fn((type: string) => transferred[type] ?? ''),
+    }
+    fireEvent.dragStart(screen.getByRole('button', { name: 'Sposta da-spostare.png' }), {
+      dataTransfer,
+    })
+
+    // The event deliberately targets editor whitespace just below the bullet row.
+    const dragOver = new Event('dragover', { bubbles: true, cancelable: true })
+    Object.defineProperties(dragOver, {
+      clientY: { value: 165 },
+      dataTransfer: { value: dataTransfer },
+    })
+    fireEvent(editor, dragOver)
+    expect(editor).toHaveClass('is-drop-target')
+    expect(canvas.querySelector('.tasklist-info-text-drop-line')).toHaveStyle({ top: '100px' })
+    const drop = new Event('drop', { bubbles: true, cancelable: true })
+    Object.defineProperties(drop, {
+      clientY: { value: 165 },
+      dataTransfer: { value: dataTransfer },
+    })
+    fireEvent(editor, drop)
+    expect(editor).not.toHaveClass('is-drop-target')
+
+    await waitFor(() => {
+      expect(editor).toHaveTextContent('Uno')
+      expect(editor).toHaveTextContent('Due')
+      expect(editor).not.toHaveTextContent('Tre')
+    })
+    fireEvent.blur(editor)
+
+    await waitFor(() => {
+      const blocks = onUpdateInfoDocument.mock.calls.at(-1)?.[1].blocks ?? []
+      expect(blocks.map((block) => block.type === 'text' ? block.markdown : block.id)).toEqual([
+        'Uno\n- Due',
+        imageId,
+        ':::collapse Tre\nQuattro',
+      ])
+      expect(blocks.filter((block) => block.id === imageId)).toHaveLength(1)
+    })
   })
 
   it('supports interactive Overview blocks and separate attachment commands', async () => {
@@ -1875,6 +2576,34 @@ describe('board shell', () => {
     expect(screen.getByText('Hidden task')).toBeTruthy()
   })
 
+  it('hides unavailable tabs and toolbar filters in member and agent views', () => {
+    const { rerender } = render(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'members' }}
+        boardViewMode="board"
+      />,
+    )
+
+    const memberViewSwitch = within(
+      screen.getByRole('group', { name: 'Vista board' }),
+    )
+    expect(memberViewSwitch.queryByRole('button', { name: 'Timeline' })).toBeNull()
+    expect(memberViewSwitch.queryByRole('button', { name: 'History' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Filtra task/ })).toBeNull()
+
+    rerender(
+      <TasksScreen
+        {...baseProps}
+        boardFocus={{ type: 'agents' }}
+        boardViewMode="overview"
+      />,
+    )
+
+    expect(screen.queryByRole('button', { name: 'Filtra agenti' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Filtra task/ })).toBeNull()
+  })
+
   it('search hides non-matching task lists and tasks', async () => {
     const user = userEvent.setup()
     render(<TasksScreen {...baseProps} />)
@@ -2031,6 +2760,7 @@ describe('board shell', () => {
 
   it('opens a linked preset as an internal tasklist page', async () => {
     const user = userEvent.setup()
+    const onCreateTask = vi.fn().mockResolvedValue(undefined)
     const presetId = crypto.randomUUID()
     const linkedPreset: DecryptedPreset = {
       wire: {
@@ -2066,17 +2796,57 @@ describe('board shell', () => {
       <TasksScreen
         {...baseProps}
         taskLists={[linkedList, otherList]}
+        tasks={[
+          ...baseProps.tasks,
+          makeTask('Task aggiunta al preset', listId, memberId, { presetId }),
+        ]}
         presets={[linkedPreset]}
+        onCreateTask={onCreateTask}
       />,
     )
 
     const column = screen.getByRole('listitem', { name: 'Elena Russo' })
+    expect(within(column).queryByText('Task aggiunta al preset')).toBeNull()
     await user.click(
       within(column).getByRole('button', { name: 'Apri preset Apertura locale' }),
     )
 
     expect(within(column).getByRole('region', { name: 'Preset Apertura locale' })).toBeTruthy()
     expect(within(column).getByText('Controlla sala')).toBeTruthy()
+    expect(within(column).getByText('Task aggiunta al preset')).toBeTruthy()
+    expect(within(column).getByRole('heading', { name: 'Apertura locale' })).toBeTruthy()
+    expect(within(column).queryByRole('heading', { name: 'Elena Russo' })).toBeNull()
+
+    await user.click(
+      within(column).getByRole('button', {
+        name: 'Apri dettaglio task Controlla sala',
+      }),
+    )
+    await waitFor(() => {
+      expect(onCreateTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Controlla sala',
+          presetId,
+          presetTemplateIndex: 0,
+        }),
+        listId,
+      )
+    })
+
+    await user.click(within(column).getByRole('button', { name: /Aggiungi/i }))
+    const taskEditor = screen.getByRole('dialog', { name: 'Nuovo task' })
+    await user.type(within(taskEditor).getByLabelText('Titolo'), 'Task locale')
+    await user.click(within(taskEditor).getByRole('button', { name: /^Crea$/i }))
+    await waitFor(() => {
+      expect(onCreateTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Task locale',
+          presetId,
+        }),
+        listId,
+      )
+    })
+
     await user.click(
       within(column).getByRole('button', { name: 'Torna alle task di Elena Russo' }),
     )
@@ -2093,6 +2863,92 @@ describe('board shell', () => {
     ).toBeTruthy()
     expect(within(column).getByRole('button', { name: 'Apri preset Apertura locale' })).toBeTruthy()
     expect(within(column).queryByText('Color test')).toBeNull()
+  })
+
+  it('shows one category and one canonical task for legacy preset duplicates', async () => {
+    const user = userEvent.setup()
+    const olderPresetId = crypto.randomUUID()
+    const newerPresetId = crypto.randomUUID()
+    const presetDocument = {
+      schema: 1 as const,
+      name: 'Apertura locale',
+      tasks: [
+        {
+          taskKind: 'priority' as const,
+          title: 'Controlla sala',
+          priority: 'normal' as const,
+        },
+      ],
+    }
+    const olderPreset: DecryptedPreset = {
+      wire: {
+        id: olderPresetId,
+        project_id: projectId,
+        payload: null,
+        created_at: '2026-09-02T12:00:00.000Z',
+        deleted_at: null,
+      },
+      document: presetDocument,
+    }
+    const newerPreset: DecryptedPreset = {
+      wire: {
+        ...olderPreset.wire,
+        id: newerPresetId,
+        created_at: '2026-09-03T12:00:00.000Z',
+      },
+      document: presetDocument,
+    }
+    const linkedList = {
+      ...taskList,
+      document: {
+        ...taskList.document!,
+        presetIds: [olderPresetId, olderPresetId, newerPresetId],
+      },
+    }
+    const originalTask = makeTask(
+      'Task materializzata',
+      listId,
+      memberId,
+      {
+        presetId: newerPresetId,
+        presetTemplateIndex: 0,
+        createdAt: '2026-09-03T12:01:00.000Z',
+      },
+    )
+    const duplicateTask = makeTask(
+      'Task materializzata',
+      listId,
+      memberId,
+      {
+        presetId: newerPresetId,
+        presetTemplateIndex: 0,
+        createdAt: '2026-09-03T12:02:00.000Z',
+      },
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        taskLists={[linkedList, otherList]}
+        tasks={[...baseProps.tasks, duplicateTask, originalTask]}
+        presets={[olderPreset, newerPreset]}
+      />,
+    )
+
+    const column = screen.getByRole('listitem', { name: 'Elena Russo' })
+    const categoryButtons = within(column).getAllByRole('button', {
+      name: 'Apri preset Apertura locale',
+    })
+    expect(categoryButtons).toHaveLength(1)
+
+    await user.click(categoryButtons[0])
+    const presetPage = within(column).getByRole('region', {
+      name: 'Preset Apertura locale',
+    })
+    expect(within(presetPage).getAllByText('Task materializzata')).toHaveLength(
+      1,
+    )
+    expect(within(presetPage).queryByText('Controlla sala')).toBeNull()
   })
 
   it('opens an existing preset in the editor from the vertical menu button', async () => {
@@ -3058,6 +3914,9 @@ describe('board shell', () => {
     const user = userEvent.setup()
     const { rerender } = render(<TasksScreen {...baseProps} />)
 
+    expect(screen.getByRole('button', { name: 'Filtra task' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Da completare' })).toBeNull()
+
     const search = screen.getByLabelText('Cerca task e tasklist')
     await user.type(search, 'Color')
     await user.click(screen.getByRole('button', { name: /^Filtra task/ }))
@@ -3106,10 +3965,42 @@ describe('board shell', () => {
     )
 
     expect(screen.getByLabelText('Cerca task e tasklist')).toHaveValue('')
-    expect(
-      screen.getByRole('button', { name: 'Filtra task: 1 filtri attivi' }),
-    ).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Da completare' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Filtra task' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Da completare' })).toBeNull()
     expect(screen.getByText('Visibile nel nuovo progetto')).toBeTruthy()
+  })
+
+  it('hides tasklists with no content matching an explicit filter', async () => {
+    const user = userEvent.setup()
+    const completedTask = makeTask('Già completata', listId, memberId)
+    completedTask.wire.state = {
+      state: 'completed',
+      completed_by: memberId,
+      completed_at: '2026-09-03T10:00:00.000Z',
+    }
+    const openTask = makeTask(
+      'Ancora aperta',
+      otherList.wire.id,
+      otherMemberId,
+    )
+
+    render(
+      <TasksScreen
+        {...baseProps}
+        tasks={[completedTask, openTask]}
+      />,
+    )
+
+    // The implicit "open" default must not remove otherwise empty tasklists.
+    expect(screen.getByRole('listitem', { name: 'Elena Russo' })).toBeTruthy()
+    expect(screen.getByRole('listitem', { name: 'Mattina' })).toBeTruthy()
+
+    await user.click(screen.getByRole('button', { name: /^Filtra task/ }))
+    await user.click(screen.getByRole('button', { name: 'Apri filtri Stato' }))
+    await user.click(screen.getByRole('menuitemcheckbox', { name: 'Completati' }))
+    await user.click(screen.getByRole('menuitemcheckbox', { name: 'Da completare' }))
+
+    expect(screen.getByRole('listitem', { name: 'Elena Russo' })).toBeTruthy()
+    expect(screen.queryByRole('listitem', { name: 'Mattina' })).toBeNull()
   })
 })

@@ -10,9 +10,16 @@ afterEach(() => {
 })
 
 describe('Sprout API shell', () => {
-  it('starts with a minimal passkey sign-in screen', () => {
+  it('shows the Sprout logo while bootstrapping, then the passkey screen', async () => {
     render(<App />)
-    expect(screen.getByText('Sprout')).toBeInTheDocument()
+    const loading = screen.getByRole('status', {
+      name: 'Caricamento progetto',
+    })
+    expect(loading.querySelector('img')).toHaveAttribute(
+      'src',
+      '/sprout-ai-logo.png',
+    )
+    expect(await screen.findByText('Sprout')).toBeInTheDocument()
     expect(
       screen.getByText(/workspace cifrato, solo sui tuoi device/i),
     ).toBeInTheDocument()
@@ -115,7 +122,9 @@ describe('Sprout API shell', () => {
     vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false)
     render(<App />)
     expect(
-      screen.getByText(/serve connessione per accedere o creare un account/i),
+      await screen.findByText(
+        /serve connessione per accedere o creare un account/i,
+      ),
     ).toBeInTheDocument()
     await waitFor(() =>
       expect(

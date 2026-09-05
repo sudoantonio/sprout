@@ -1,5 +1,12 @@
-const CACHE_VERSION = 'sprout-shell-v2'
-const SHELL_URLS = ['/', '/manifest.webmanifest', '/app-icon.svg', '/favicon.svg']
+const CACHE_VERSION = 'sprout-shell-v4'
+const SHELL_URLS = [
+  '/',
+  '/manifest.webmanifest',
+  '/app-icon.svg',
+  '/favicon.svg',
+  '/favicon-light.svg',
+  '/favicon-dark.svg',
+]
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

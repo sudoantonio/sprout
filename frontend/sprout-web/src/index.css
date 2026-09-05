@@ -307,10 +307,6 @@ ul {
   zoom: 0.9;
 }
 
-html[data-browser='safari'] {
-  font-size: 14.4px;
-}
-
 html[data-browser='safari'] #root {
   min-height: 100vh;
   zoom: 1;

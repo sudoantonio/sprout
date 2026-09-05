@@ -3,7 +3,10 @@ import type { ProjectItem } from '../store/app-store'
 import { CheckIcon, FolderIcon, PlusIcon } from './icons'
 
 const projectLabelFor = (item: ProjectItem): string =>
-  item.document?.name ?? `Locked ${item.wire.id.slice(0, 8)}`
+  item.document?.name ??
+  (item.deferred
+    ? `Progetto ${item.wire.id.slice(0, 8)}`
+    : `Locked ${item.wire.id.slice(0, 8)}`)
 
 export interface BoardProjectSwitcherProps {
   projects: ProjectItem[]

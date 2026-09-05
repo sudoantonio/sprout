@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { EncryptedDatabase } from '../storage/encrypted-db'
 import { KeyVault } from '../security/key-vault'
 import type { DeviceSecrets } from '../security/wasm'
-import type { EncryptedPayloadDto, ProjectView } from '../api/contracts'
+import type {
+  EncryptedPayloadDto,
+  ProjectView,
+  TaskDto,
+} from '../api/contracts'
 
 const secrets = (): DeviceSecrets => ({
   keyVersion: 1,
@@ -217,6 +221,79 @@ describe('createEncryptedResource key lifetime', () => {
 
     await expect(synchronizeProjectRootKey(vault, project)).resolves.toBe(false)
     expect(vault.getResourceKey(project.root_resource_id)).toBeUndefined()
+  })
+
+  it('recovers a completed task whose state transition advanced only the row version', async () => {
+    vi.stubEnv('DEV', false)
+    const attemptedVersions: number[] = []
+    const document = { schema: 1 as const, title: 'Task completato' }
+    vi.doMock('../security/wasm', async () => {
+      const actual =
+        await vi.importActual<typeof import('../security/wasm')>(
+          '../security/wasm',
+        )
+      return {
+        ...actual,
+        decryptDocument: async (
+          _ciphertext: EncryptedPayloadDto,
+          options: { aggregateVersion: number },
+        ) => {
+          attemptedVersions.push(options.aggregateVersion)
+          if (options.aggregateVersion !== 1) {
+            throw new Error('authentication failed')
+          }
+          return document
+        },
+      }
+    })
+
+    const { decryptTask } = await import('./resources')
+    const database = { putVault: vi.fn() } as unknown as EncryptedDatabase
+    const vault = new KeyVault(database)
+    const resourceId = crypto.randomUUID()
+    vault.setSessionSecrets(crypto.randomUUID(), secrets(), crypto.randomUUID())
+    await vault.putResourceKey(
+      resourceId,
+      crypto.getRandomValues(new Uint8Array(32)),
+    )
+    const task: TaskDto = {
+      id: crypto.randomUUID(),
+      project_id: crypto.randomUUID(),
+      list_id: crypto.randomUUID(),
+      resource_node_id: resourceId,
+      task_kind: 'priority',
+      payload: {
+        version: 1,
+        algorithm: 'test',
+        key_id: crypto.randomUUID(),
+        nonce_b64: 'nonce',
+        ciphertext_b64: 'ciphertext',
+      },
+      header: null,
+      selected_value_snapshot: null,
+      key_epoch: 1,
+      state: {
+        state: 'completed',
+        completed_by: crypto.randomUUID(),
+        completed_at: new Date().toISOString(),
+      },
+      source_pretask_id: null,
+      preset_assignment_id: null,
+      copied_from_task_id: null,
+      questionnaire_version_id: null,
+      recurrence_series_id: null,
+      occurrence_number: null,
+      active_assignment_id: crypto.randomUUID(),
+      active_assignee_identity_id: crypto.randomUUID(),
+      created_at: new Date().toISOString(),
+      payload_version: 2,
+    }
+
+    await expect(decryptTask(task, vault)).resolves.toEqual({
+      wire: task,
+      document,
+    })
+    expect(attemptedVersions).toEqual([2, 1])
   })
 
   it('rebinds a legacy backup slot only after ciphertext authentication', async () => {

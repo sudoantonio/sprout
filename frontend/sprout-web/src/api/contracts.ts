@@ -54,6 +54,16 @@ export interface ProjectInvitationDto {
   expires_at: IsoDateTime
 }
 
+export interface ProjectMemberDto {
+  identity_id: Uuid
+  identity_handle: string
+  email: string | null
+  role: 'owner' | 'admin' | 'member' | 'guest'
+  membership_state: 'active' | 'suspended' | 'left'
+  joined_at: IsoDateTime
+  responsibilities: string | null
+}
+
 export interface ParticipantSuggestionDto {
   identity_id: Uuid
   identity_handle: string

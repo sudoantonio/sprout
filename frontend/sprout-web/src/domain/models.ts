@@ -236,6 +236,10 @@ export interface TaskDocument {
   schema: 1
   title: string
   notes?: string
+  /** Preset page this task belongs to within its task list. */
+  preset_id?: Uuid
+  /** Original template position, used to materialize a preset task once. */
+  preset_template_index?: number
   /** Inclusive interval start; when set with due_at, timeline bars span start→due. */
   start_at?: string
   due_at?: string
@@ -249,6 +253,8 @@ export interface TaskDocument {
 interface TaskCreationBase {
   title: string
   notes?: string
+  presetId?: Uuid
+  presetTemplateIndex?: number
   questionnaireVersionId?: Uuid
   requiredAttachments?: File[]
   assigneeIdentityId?: Uuid

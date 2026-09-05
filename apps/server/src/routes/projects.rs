@@ -124,6 +124,125 @@ pub async fn list(
     Ok(Json(projects.into_iter().map(ProjectView::from).collect()))
 }
 
+pub async fn list_members(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<Vec<ProjectMemberView>>, AppError> {
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Member).await?;
+    let mut transaction = state.pool.begin().await?;
+    set_database_context(
+        &mut transaction,
+        actor.identity_id,
+        Some(actor.device_id),
+        Some(project_id),
+    )
+    .await?;
+    let members = sqlx::query_as::<_, ProjectMemberView>(
+        r#"
+        SELECT
+            identity_id,
+            identity_handle,
+            email,
+            role,
+            membership_state,
+            joined_at,
+            responsibilities
+        FROM sprout_private.project_member_directory($1)
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(members))
+}
+
+#[derive(FromRow, Serialize)]
+pub struct ProjectMemberView {
+    identity_id: Uuid,
+    identity_handle: String,
+    email: Option<String>,
+    role: String,
+    membership_state: String,
+    joined_at: DateTime<Utc>,
+    responsibilities: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateMemberResponsibilities {
+    responsibilities: String,
+}
+
+#[derive(Serialize)]
+pub struct UpdatedMemberResponsibilities {
+    responsibilities: Option<String>,
+}
+
+pub async fn update_member_responsibilities(
+    State(state): State<Arc<AppState>>,
+    actor: AuthSession,
+    Path((project_id, member_identity_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateMemberResponsibilities>,
+) -> Result<Json<UpdatedMemberResponsibilities>, AppError> {
+    require_project_access(&state.pool, actor, project_id, ProjectAccess::Manage).await?;
+    let responsibilities = request.responsibilities.trim();
+    if responsibilities.chars().count() > 500 {
+        return Err(AppError::BadRequest(
+            "member responsibilities exceed 500 characters",
+        ));
+    }
+
+    let mut transaction = state.pool.begin().await?;
+    set_database_context(
+        &mut transaction,
+        actor.identity_id,
+        Some(actor.device_id),
+        Some(project_id),
+    )
+    .await?;
+    let role = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT role
+        FROM project_memberships
+        WHERE project_id = $1
+          AND identity_id = $2
+          AND state = 'active'
+        "#,
+    )
+    .bind(project_id)
+    .bind(member_identity_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    if matches!(role.as_str(), "owner" | "admin") {
+        return Err(AppError::BadRequest(
+            "administrator responsibilities cannot be edited",
+        ));
+    }
+
+    let stored = (!responsibilities.is_empty()).then_some(responsibilities);
+    sqlx::query(
+        r#"
+        UPDATE project_memberships
+        SET responsibilities = $3
+        WHERE project_id = $1
+          AND identity_id = $2
+          AND state = 'active'
+        "#,
+    )
+    .bind(project_id)
+    .bind(member_identity_id)
+    .bind(stored)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(UpdatedMemberResponsibilities {
+        responsibilities: stored.map(str::to_owned),
+    }))
+}
+
 pub async fn get_project(
     State(state): State<Arc<AppState>>,
     actor: AuthSession,

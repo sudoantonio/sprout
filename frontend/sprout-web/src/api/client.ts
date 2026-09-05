@@ -36,6 +36,7 @@ import type {
   ProvisionProjectRecoveryRequest,
   ProvisionAgentResponse,
   ProjectInvitationDto,
+  ProjectMemberDto,
   ProjectView,
   ParticipantSuggestionDto,
   PermissionGrantDto,
@@ -80,7 +81,7 @@ export class ApiError extends Error {
 }
 
 interface RequestOptions<TBody> {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   body?: TBody
   signal?: AbortSignal
   authenticated?: boolean
@@ -422,6 +423,21 @@ export class ApiClient {
     return this.request(`/v1/projects/${projectId}/invitations`)
   }
 
+  listProjectMembers(projectId: Uuid): Promise<ProjectMemberDto[]> {
+    return this.request(`/v1/projects/${projectId}/members`)
+  }
+
+  updateProjectMemberResponsibilities(
+    projectId: Uuid,
+    memberIdentityId: Uuid,
+    responsibilities: string,
+  ): Promise<{ responsibilities: string | null }> {
+    return this.request(
+      `/v1/projects/${projectId}/members/${memberIdentityId}`,
+      { method: 'PATCH', body: { responsibilities } },
+    )
+  }
+
   createProjectInvitation(
     projectId: Uuid,
     input: {
@@ -684,6 +700,12 @@ export class ApiClient {
     return this.request(`/v1/projects/${projectId}/tasks/${taskId}`, {
       method: 'PUT',
       body,
+    })
+  }
+
+  deleteTask(projectId: Uuid, taskId: Uuid): Promise<void> {
+    return this.request(`/v1/projects/${projectId}/tasks/${taskId}`, {
+      method: 'DELETE',
     })
   }
 

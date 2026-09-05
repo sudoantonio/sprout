@@ -123,7 +123,11 @@ import {
   buildResourceKeyEnvelopes,
   importResourceKeyEnvelopes,
 } from './domain/envelopes'
-import { buildNextRecurringTask, buildTaskCreation } from './domain/tasks'
+import {
+  buildNextRecurringTask,
+  buildTaskCreation,
+  partitionDuplicatePresetTasks,
+} from './domain/tasks'
 import { availableRetentionArchiveCount } from './domain/retention'
 import {
   buildThreePretaskPreset,
@@ -372,6 +376,64 @@ const hydrateServerProject = async (
   }
 }
 
+const LAST_SELECTED_PROJECT_KEY_PREFIX = 'sprout.last-selected-project'
+
+const lastSelectedProjectKey = (identityId: Uuid): string =>
+  `${LAST_SELECTED_PROJECT_KEY_PREFIX}:${identityId}`
+
+const readLastSelectedProjectId = (identityId?: Uuid): Uuid | undefined => {
+  if (!identityId) return undefined
+  try {
+    return localStorage.getItem(lastSelectedProjectKey(identityId)) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+const persistLastSelectedProjectId = (
+  identityId: Uuid | undefined,
+  projectId: Uuid,
+): void => {
+  if (!identityId) return
+  try {
+    localStorage.setItem(lastSelectedProjectKey(identityId), projectId)
+  } catch {
+    // The selected project is only a navigation preference.
+  }
+}
+
+/**
+ * Populate the project switcher without recovering keys from the server.
+ * Metadata is decrypted only when its key is already in the local vault;
+ * otherwise the project remains a lazy catalog entry until it is selected.
+ */
+const buildLazyProjectCatalog = async (
+  services: Services,
+  projects: ProjectView[],
+  existing: ProjectItem[] = [],
+): Promise<ProjectItem[]> =>
+  Promise.all(
+    projects.map(async (project) => {
+      const previous = existing.find((item) => item.wire.id === project.id)
+      try {
+        return {
+          wire: project,
+          document: await decryptProject(project, services.auth.vault),
+          deferred: true,
+        }
+      } catch {
+        if (previous?.document) {
+          return {
+            wire: project,
+            document: previous.document,
+            deferred: true,
+          }
+        }
+        return { wire: project, deferred: true }
+      }
+    }),
+  )
+
 const availableCiphertext = (
   body: EncryptedPayloadDto | null,
   header?: EncryptedPayloadDto | null,
@@ -434,6 +496,9 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   const { appearance, setAppearance } = useTheme()
   const [state, dispatch] = useAppStore()
   const [services, setServices] = useState<Services>()
+  const [servicesInitializationPending, setServicesInitializationPending] =
+    useState(true)
+  const [projectBootstrapPending, setProjectBootstrapPending] = useState(true)
   const [offlineVaultAvailable, setOfflineVaultAvailable] = useState(false)
   const [projectName, setProjectName] = useState('')
   const [presetResult, setPresetResult] = useState<{
@@ -443,6 +508,8 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     detail?: string
   }>()
   const [boardPresets, setBoardPresets] = useState<DecryptedPreset[]>([])
+  const presetApplicationInFlightRef = useRef(new Set<string>())
+  const presetTaskCreationInFlightRef = useRef(new Set<string>())
   const [questionnaires, setQuestionnaires] = useState<QuestionnaireItem[]>([])
   const [questionnaireVersions, setQuestionnaireVersions] = useState<
     DecryptedQuestionnaireVersion[]
@@ -486,6 +553,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   const stateRef = useRef(state)
   stateRef.current = state
   const taskMutationQueuesRef = useRef(new Map<Uuid, Promise<void>>())
+  const projectSelectionRequestRef = useRef(0)
   const enqueueTaskMutation = (
     taskId: Uuid,
     operation: () => Promise<void>,
@@ -565,6 +633,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         const wake = new SyncWakeClient(api)
         initialized = { database, auth, sync, wake }
         setServices(initialized)
+        setServicesInitializationPending(false)
         void auth.hasLocalVault(deviceId).then((available) => {
           if (active) setOfflineVaultAvailable(available)
         })
@@ -603,9 +672,11 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           }
         }
       })
-      .catch((error: unknown) =>
-        dispatch({ type: 'set-error', message: errorMessage(error) }),
-      )
+      .catch((error: unknown) => {
+        if (!active) return
+        setServicesInitializationPending(false)
+        dispatch({ type: 'set-error', message: errorMessage(error) })
+      })
     return () => {
       active = false
       // Persist DEV vault BEFORE tearing down. Do NOT call auth.logout() here:
@@ -711,6 +782,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   useEffect(() => {
     if (!services || !state.session) return
     let active = true
+    setProjectBootstrapPending(true)
     dispatch({ type: 'set-loading', value: true })
     void api
       .listProjects()
@@ -719,21 +791,53 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         if (import.meta.env.DEV && identityId) {
           await restoreDevResourceKeys(identityId, services.auth.vault)
         }
-        const items = await Promise.all(
-          projects.map((project) =>
-            hydrateServerProject(api, services, project, identityId),
-          ),
+        const storedProjectId = readLastSelectedProjectId(identityId)
+        const preferredProjectId = projects.some(
+          (project) => project.id === storedProjectId,
         )
+          ? storedProjectId
+          : projects[0]?.id
+        const items = await buildLazyProjectCatalog(
+          services,
+          projects,
+          stateRef.current.projects,
+        )
+        if (preferredProjectId) {
+          const preferredProject = projects.find(
+            (project) => project.id === preferredProjectId,
+          )
+          if (preferredProject) {
+            const hydrated = await hydrateServerProject(
+              api,
+              services,
+              preferredProject,
+              identityId,
+            )
+            const index = items.findIndex(
+              (item) => item.wire.id === preferredProjectId,
+            )
+            if (index >= 0) items[index] = hydrated
+          }
+        }
         if (!active) return
         // After envelopes are imported, persist DEV vault so a reload can
         // decrypt without waiting for beforeunload.
         if (import.meta.env.DEV && state.session) {
           persistDevVault(state.session, services.auth.vault)
         }
-        dispatch({ type: 'set-projects', projects: items })
+        dispatch({
+          type: 'set-projects',
+          projects: items,
+          selectedProjectId: preferredProjectId,
+        })
+        if (preferredProjectId) {
+          persistLastSelectedProjectId(identityId, preferredProjectId)
+        }
+        setProjectBootstrapPending(false)
       })
       .catch((error: unknown) => {
         if (!active) return
+        setProjectBootstrapPending(false)
         if (error instanceof ApiError && error.status === 401) {
           clearDevSession()
           services.wake.stop()
@@ -742,7 +846,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           dispatch({ type: 'logout' })
           dispatch({
             type: 'set-notice',
-            message: 'Sessione server scaduta. Accedi di nuovo per ricaricare tutti i progetti.',
+            message: 'Sessione server scaduta. Accedi di nuovo per ricaricare il catalogo progetti.',
           })
           return
         }
@@ -771,8 +875,13 @@ const App = ({ apiClient, initialSession }: AppProps) => {
   }, [api, dispatch, services, state.session])
 
   useEffect(() => {
+    if (!state.session) setProjectBootstrapPending(true)
+  }, [state.session])
+
+  useEffect(() => {
     if (!services || state.phase !== 'local-ready') return
     let active = true
+    setProjectBootstrapPending(true)
     dispatch({ type: 'set-loading', value: true })
     void services.database
       .listRecords()
@@ -791,7 +900,22 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           }
         }
         if (active) {
-          dispatch({ type: 'set-projects', projects })
+          const identityId = state.localAccess?.identityId
+          const storedProjectId = readLastSelectedProjectId(identityId)
+          const preferredProjectId = projects.some(
+            (project) => project.wire.id === storedProjectId,
+          )
+            ? storedProjectId
+            : projects[0]?.wire.id
+          dispatch({
+            type: 'set-projects',
+            projects,
+            selectedProjectId: preferredProjectId,
+          })
+          if (preferredProjectId) {
+            persistLastSelectedProjectId(identityId, preferredProjectId)
+          }
+          setProjectBootstrapPending(false)
           dispatch({
             type: 'set-queue-count',
             count: await services.database.queueCount(),
@@ -804,13 +928,14 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       })
       .catch((error: unknown) => {
         if (active) {
+          setProjectBootstrapPending(false)
           dispatch({ type: 'set-error', message: errorMessage(error) })
         }
       })
     return () => {
       active = false
     }
-  }, [dispatch, services, state.phase])
+  }, [dispatch, services, state.localAccess?.identityId, state.phase])
 
   useEffect(() => {
     if (
@@ -887,8 +1012,13 @@ const App = ({ apiClient, initialSession }: AppProps) => {
           }
         }
         if (active) {
+          const uniqueTasks = partitionDuplicatePresetTasks(tasks).tasks
           dispatch({ type: 'set-task-lists', taskLists })
-          dispatch({ type: 'set-tasks', tasks, lockedTasks })
+          dispatch({
+            type: 'set-tasks',
+            tasks: uniqueTasks,
+            lockedTasks,
+          })
         }
       })
       .catch((error: unknown) => {
@@ -1015,10 +1145,20 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             }
           }
         }
+        const deduplicated = partitionDuplicatePresetTasks(decrypted)
+        const removableDuplicates = deduplicated.duplicates.filter(
+          (task) => task.wire.state.state === 'open',
+        )
+        await Promise.allSettled(
+          removableDuplicates.map(async (task) => {
+            await api.deleteTask(projectId, task.wire.id)
+            await services.database.deleteRecord(task.wire.resource_node_id)
+          }),
+        )
         if (active) {
           dispatch({
             type: 'set-tasks',
-            tasks: decrypted,
+            tasks: deduplicated.tasks,
             lockedTasks: locked,
           })
         }
@@ -1087,42 +1227,60 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     }
     let active = true
     const projectId = state.selectedProjectId
-    const project = state.projects.find(
-      (candidate) => candidate.wire.id === projectId,
-    )
     void (async () => {
       try {
-        const [packages, invites] = await Promise.all([
-          api.listProjectDevicePackages(projectId),
-          api.listProjectInvitations(projectId),
-        ])
-        const identityIds = new Set<Uuid>()
-        if (project) identityIds.add(project.wire.owner_identity_id)
-        for (const devicePackage of packages) {
-          identityIds.add(devicePackage.identity_id)
-        }
-        for (const invitation of invites) {
-          if (invitation.accepted_by_identity_id) {
-            identityIds.add(invitation.accepted_by_identity_id)
-          }
-        }
-        const handleById = new Map<Uuid, string>()
+        let members: BoardMember[]
         try {
-          const suggestions = await api.suggestProjectParticipants(
-            projectId,
-            '',
-          )
-          for (const suggestion of suggestions) {
-            handleById.set(suggestion.identity_id, suggestion.identity_handle)
-          }
+          const directory = await api.listProjectMembers(projectId)
+          members = directory.map((member) => ({
+            identityId: member.identity_id,
+            label: member.identity_handle,
+            email: member.email ?? undefined,
+            role: member.role,
+            joinedAt: member.joined_at,
+            responsibilities: member.responsibilities ?? undefined,
+          }))
         } catch {
-          // Handles are best-effort; fall back to truncated identity IDs.
+          // Keep the members overview working while an already-running server
+          // has not yet restarted with the project member directory route.
+          const project = state.projects.find(
+            (candidate) => candidate.wire.id === projectId,
+          )
+          const [packages, invites] = await Promise.all([
+            api.listProjectDevicePackages(projectId).catch(() => []),
+            api.listProjectInvitations(projectId).catch(() => []),
+          ])
+          const identityIds = new Set<Uuid>()
+          if (project) identityIds.add(project.wire.owner_identity_id)
+          packages.forEach((devicePackage) => {
+            identityIds.add(devicePackage.identity_id)
+          })
+          invites.forEach((invitation) => {
+            if (invitation.accepted_by_identity_id) {
+              identityIds.add(invitation.accepted_by_identity_id)
+            }
+          })
+          const invitationByIdentityId = new Map(
+            invites
+              .filter((invitation) => invitation.accepted_by_identity_id)
+              .map((invitation) => [
+                invitation.accepted_by_identity_id!,
+                invitation,
+              ]),
+          )
+          members = [...identityIds].map((identityId) => {
+            const invitation = invitationByIdentityId.get(identityId)
+            return {
+              identityId,
+              label: `User ${identityId.slice(0, 8)}`,
+              role:
+                identityId === project?.wire.owner_identity_id
+                  ? 'owner'
+                  : invitation?.role ?? 'member',
+              joinedAt: invitation?.created_at,
+            }
+          })
         }
-        const members: BoardMember[] = [...identityIds].map((identityId) => ({
-          identityId,
-          label:
-            handleById.get(identityId) ?? `User ${identityId.slice(0, 8)}`,
-        }))
         if (active) {
           dispatch({ type: 'set-board-members', members })
         }
@@ -1393,12 +1551,37 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       const restored = await restoreAllDevResourceKeys(services.auth.vault)
       persistDevVault(state.session, services.auth.vault)
       const projects = await api.listProjects()
-      const hydrated = await Promise.all(
-        projects.map((project) =>
-          hydrateServerProject(api, services, project, identityId),
-        ),
+      const selectedProjectId = projects.some(
+        (project) => project.id === state.selectedProjectId,
       )
-      dispatch({ type: 'set-projects', projects: hydrated })
+        ? state.selectedProjectId
+        : projects[0]?.id
+      const hydrated = await buildLazyProjectCatalog(
+        services,
+        projects,
+        state.projects,
+      )
+      if (selectedProjectId) {
+        const selectedWire = projects.find(
+          (project) => project.id === selectedProjectId,
+        )
+        const index = hydrated.findIndex(
+          (project) => project.wire.id === selectedProjectId,
+        )
+        if (selectedWire && index >= 0) {
+          hydrated[index] = await hydrateServerProject(
+            api,
+            services,
+            selectedWire,
+            identityId,
+          )
+        }
+      }
+      dispatch({
+        type: 'set-projects',
+        projects: hydrated,
+        selectedProjectId,
+      })
 
       // Decrypt topics immediately with the restored keys (don't wait on effects).
       if (state.selectedProjectId) {
@@ -1648,21 +1831,24 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       }
       await putRestRecord(current.database, projectRecord(project, payload))
       const serverProjects = await api.listProjects()
-      const hydratedProjects = await Promise.all(
-        serverProjects.map((serverProject) =>
-          hydrateServerProject(
-            api,
-            current,
-            serverProject,
-            state.session?.identity_id,
-          ),
-        ),
+      const hydratedProjects = await buildLazyProjectCatalog(
+        current,
+        serverProjects,
+        state.projects,
       )
+      const createdIndex = hydratedProjects.findIndex(
+        (item) => item.wire.id === id,
+      )
+      if (createdIndex >= 0) {
+        hydratedProjects[createdIndex] = { wire: project, document }
+      }
       dispatch({
         type: 'set-projects',
         projects: hydratedProjects,
+        selectedProjectId: id,
       })
       dispatch({ type: 'select-project', projectId: id })
+      persistLastSelectedProjectId(state.session.identity_id, id)
       setProjectName('')
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
@@ -1763,6 +1949,31 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     })
   }
 
+  const updateProjectMemberResponsibilities = async (
+    memberIdentityId: Uuid,
+    responsibilities: string,
+  ) => {
+    if (!state.selectedProjectId) {
+      throw new Error('Select a project before updating a member')
+    }
+    const updated = await api.updateProjectMemberResponsibilities(
+      state.selectedProjectId,
+      memberIdentityId,
+      responsibilities,
+    )
+    dispatch({
+      type: 'set-board-members',
+      members: state.boardMembers.map((member) => (
+        member.identityId === memberIdentityId
+          ? {
+              ...member,
+              responsibilities: updated.responsibilities ?? undefined,
+            }
+          : member
+      )),
+    })
+  }
+
   const acceptProjectInvitation = async (input: {
     projectId: Uuid
     invitationId: Uuid
@@ -1779,15 +1990,19 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     if (import.meta.env.DEV && identityId) {
       await restoreDevResourceKeys(identityId, current.auth.vault)
     }
-    const hydrated = await Promise.all(
-      projects.map((project) =>
-        hydrateServerProject(api, current, project, identityId),
-      ),
+    const hydrated = await buildLazyProjectCatalog(
+      current,
+      projects,
+      state.projects,
     )
     if (import.meta.env.DEV && identityId && state.session) {
       persistDevVault(state.session, current.auth.vault)
     }
-    dispatch({ type: 'set-projects', projects: hydrated })
+    dispatch({
+      type: 'set-projects',
+      projects: hydrated,
+      selectedProjectId: state.selectedProjectId,
+    })
     dispatch({
       type: 'set-notice',
       message:
@@ -2789,7 +3004,11 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     }
   }
 
-  const createTask = async (input: TaskCreationInput, listId: Uuid) => {
+  const createTask = async (
+    input: TaskCreationInput,
+    listId: Uuid,
+    options: { selectAfterCreate?: boolean } = {},
+  ) => {
     if (!state.session || !state.selectedProjectId || !listId) {
       const error = new Error('Server sign-in is required to create a task.')
       dispatch({
@@ -2797,6 +3016,19 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         message: error.message,
       })
       throw error
+    }
+    const presetTaskCreationKey =
+      input.presetId !== undefined && input.presetTemplateIndex !== undefined
+        ? `${listId}:${input.presetId}:${input.presetTemplateIndex}`
+        : undefined
+    if (
+      presetTaskCreationKey &&
+      presetTaskCreationInFlightRef.current.has(presetTaskCreationKey)
+    ) {
+      return
+    }
+    if (presetTaskCreationKey) {
+      presetTaskCreationInFlightRef.current.add(presetTaskCreationKey)
     }
     try {
       const current = requireServices()
@@ -3024,12 +3256,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
         active_assignee_identity_id: assignment.assignee_identity_id,
       }
       await putRestRecord(current.database, taskRecord(task))
-      dispatch({
-        type: 'set-tasks',
-        tasks: [...state.tasks, { wire: task, document }],
-        lockedTasks: state.lockedTasks,
-      })
-      dispatch({ type: 'select-task', taskId: task.id })
+      dispatch({ type: 'upsert-task', task: { wire: task, document } })
+      if (options.selectAfterCreate !== false) {
+        dispatch({ type: 'select-task', taskId: task.id })
+      }
       if (input.requiredAttachments?.length) {
         const attachmentResourceKey = current.auth.vault.getResourceKey(
           task.resource_node_id,
@@ -3118,6 +3348,10 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     } catch (error) {
       dispatch({ type: 'set-error', message: errorMessage(error) })
       throw error
+    } finally {
+      if (presetTaskCreationKey) {
+        presetTaskCreationInFlightRef.current.delete(presetTaskCreationKey)
+      }
     }
   }
 
@@ -4053,15 +4287,49 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     }
   }
 
+  const materializeBoardPresetTasks = async (
+    preset: DecryptedPreset,
+    listId: Uuid,
+  ): Promise<void> => {
+    const materializedTemplateIndexes = new Set(
+      stateRef.current.tasks
+        .filter(
+          (task) =>
+            task.wire.list_id === listId &&
+            task.document.preset_id === preset.wire.id,
+        )
+        .map((task) => task.document.preset_template_index)
+        .filter((index): index is number => index !== undefined),
+    )
+    for (const [index, task] of (preset.document.tasks ?? []).entries()) {
+      if (materializedTemplateIndexes.has(index)) continue
+      await createTask(
+        {
+          ...task,
+          presetId: preset.wire.id,
+          presetTemplateIndex: index,
+        },
+        listId,
+        { selectAfterCreate: false },
+      )
+      materializedTemplateIndexes.add(index)
+    }
+  }
+
   const applyBoardPreset = async (
     preset: DecryptedPreset,
     listId: Uuid,
   ): Promise<void> => {
-    const list = state.taskLists.find((item) => item.wire.id === listId)
+    const normalizedName = preset.document.name.trim().toLocaleLowerCase('it')
+    const applicationKey = `${listId}:${normalizedName}`
+    if (presetApplicationInFlightRef.current.has(applicationKey)) return
+    const list = stateRef.current.taskLists.find(
+      (item) => item.wire.id === listId,
+    )
     if (!list?.document) {
       throw new Error('Questa tasklist non può essere aggiornata su questo dispositivo.')
     }
-    const currentPresetIds = list.document.presetIds ?? []
+    const currentPresetIds = [...new Set(list.document.presetIds ?? [])]
     if (currentPresetIds.includes(preset.wire.id)) {
       dispatch({
         type: 'set-notice',
@@ -4069,14 +4337,34 @@ const App = ({ apiClient, initialSession }: AppProps) => {
       })
       return
     }
-    await updateTaskListDocument(list, {
-      ...list.document,
-      presetIds: [...currentPresetIds, preset.wire.id],
+    const sameNamedPreset = currentPresetIds.some((presetId) => {
+      const linkedPreset = boardPresets.find((item) => item.wire.id === presetId)
+      return (
+        linkedPreset?.document.name.trim().toLocaleLowerCase('it') ===
+        normalizedName
+      )
     })
-    dispatch({
-      type: 'set-notice',
-      message: `Pagina preset “${preset.document.name}” aggiunta alla tasklist.`,
-    })
+    if (sameNamedPreset) {
+      dispatch({
+        type: 'set-notice',
+        message: `Una categoria “${preset.document.name}” è già nella tasklist.`,
+      })
+      return
+    }
+    presetApplicationInFlightRef.current.add(applicationKey)
+    try {
+      await materializeBoardPresetTasks(preset, listId)
+      await updateTaskListDocument(list, {
+        ...list.document,
+        presetIds: [...currentPresetIds, preset.wire.id],
+      })
+      dispatch({
+        type: 'set-notice',
+        message: `Pagina preset “${preset.document.name}” aggiunta alla tasklist.`,
+      })
+    } finally {
+      presetApplicationInFlightRef.current.delete(applicationKey)
+    }
   }
 
   const updateBoardPreset = async (
@@ -5943,6 +6231,53 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     return member?.label ?? `User ${state.session.identity_id.slice(0, 8)}`
   }, [state.boardMembers, state.session])
 
+  const selectProject = (projectId: Uuid) => {
+    const currentState = stateRef.current
+    const identityId = currentState.session?.identity_id
+    persistLastSelectedProjectId(
+      identityId ?? currentState.localAccess?.identityId,
+      projectId,
+    )
+
+    const project = currentState.projects.find(
+      (item) => item.wire.id === projectId,
+    )
+    if (
+      !services ||
+      !currentState.session ||
+      (project?.document && !project.deferred)
+    ) {
+      dispatch({ type: 'select-project', projectId })
+      return
+    }
+    if (!project) return
+
+    const requestId = ++projectSelectionRequestRef.current
+    dispatch({ type: 'set-loading', value: true })
+    void hydrateServerProject(
+      api,
+      services,
+      project.wire,
+      currentState.session.identity_id,
+    )
+      .then((hydrated) => {
+        if (requestId !== projectSelectionRequestRef.current) return
+        const projects = stateRef.current.projects.map((item) =>
+          item.wire.id === projectId ? hydrated : item,
+        )
+        dispatch({
+          type: 'set-projects',
+          projects,
+          selectedProjectId: projectId,
+        })
+        dispatch({ type: 'select-project', projectId })
+      })
+      .catch((error: unknown) => {
+        if (requestId !== projectSelectionRequestRef.current) return
+        dispatch({ type: 'set-error', message: errorMessage(error) })
+      })
+  }
+
   const userMenuProps = {
     userLabel,
     projects: state.projects,
@@ -5951,13 +6286,27 @@ const App = ({ apiClient, initialSession }: AppProps) => {
     conflictCount: state.conflicts.length,
     projectName,
     onProjectNameChange: setProjectName,
-    onSelectProject: (projectId: string) =>
-      dispatch({ type: 'select-project', projectId }),
+    onSelectProject: selectProject,
     onCreateProject: (event: FormEvent) => void createProject(event),
     onNavigate: (screen: AppScreen) => dispatch({ type: 'set-screen', screen }),
     onLogout: logout,
     appearance,
     onAppearanceChange: setAppearance,
+  }
+
+  if (
+    servicesInitializationPending ||
+    (state.session && projectBootstrapPending)
+  ) {
+    return (
+      <div
+        className="project-bootstrap"
+        role="status"
+        aria-label="Caricamento progetto"
+      >
+        <img src="/sprout-ai-logo.png" alt="" aria-hidden />
+      </div>
+    )
   }
 
   if (!state.session) {
@@ -6171,6 +6520,7 @@ const App = ({ apiClient, initialSession }: AppProps) => {
             onCompleteTask={completeTask}
             onCopyTask={copyTask}
             onInviteMember={inviteProjectParticipant}
+            onUpdateMemberResponsibilities={updateProjectMemberResponsibilities}
             onProvisionAgent={provisionAgent}
             taskAttachments={attachments}
             taskAttachmentLabels={attachmentLabels}

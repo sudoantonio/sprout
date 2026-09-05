@@ -13,6 +13,7 @@ import {
   isRecentlyCompleted,
   isRecurringTaskOverdue,
   groupTasksByHistoryDay,
+  partitionDuplicatePresetTasks,
   sortTaskListsByUrgency,
   sortTopicsByUrgency,
   TASK_RECENTLY_COMPLETED_WINDOW_MS,
@@ -258,6 +259,50 @@ describe('task creation semantics', () => {
         notes: 'Primo commento',
       },
       selectedValue: { schema: 1, priority: 'normal' },
+    })
+  })
+
+  it('keeps the assigned preset association in the encrypted task document', () => {
+    const presetId = crypto.randomUUID()
+    expect(
+      buildTaskCreation({
+        taskKind: 'priority',
+        title: 'Task del preset',
+        priority: 'normal',
+        presetId,
+        presetTemplateIndex: 0,
+      }).document,
+    ).toEqual({
+      schema: 1,
+      title: 'Task del preset',
+      priority: 'normal',
+      preset_id: presetId,
+      preset_template_index: 0,
+    })
+  })
+
+  it('keeps the oldest concrete task for each preset template slot', () => {
+    const presetId = crypto.randomUUID()
+    const listId = crypto.randomUUID()
+    const original = task({ state: 'open' })
+    original.wire.list_id = listId
+    original.wire.created_at = '2026-09-03T10:00:00.000Z'
+    original.document.preset_id = presetId
+    original.document.preset_template_index = 0
+    const duplicate = task({ state: 'open' })
+    duplicate.wire.list_id = listId
+    duplicate.wire.created_at = '2026-09-03T10:01:00.000Z'
+    duplicate.document.preset_id = presetId
+    duplicate.document.preset_template_index = 0
+    const manual = task({ state: 'open' })
+    manual.wire.list_id = listId
+    manual.document.preset_id = presetId
+
+    expect(
+      partitionDuplicatePresetTasks([duplicate, manual, original]),
+    ).toEqual({
+      tasks: [manual, original],
+      duplicates: [duplicate],
     })
   })
 

@@ -23,7 +23,7 @@ const isAppearanceStyle = (value: string): value is AppearanceStyle =>
 
 export const loadThemePreference = (): ThemePreference => {
   try {
-    const stored = localStorage.getItem(THEME_STORAGE_KEY)
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY)
     if (stored && isThemePreference(stored)) {
       return stored
     }
@@ -35,7 +35,7 @@ export const loadThemePreference = (): ThemePreference => {
 
 export const loadAppearanceStyle = (): AppearanceStyle => {
   try {
-    const stored = localStorage.getItem(APPEARANCE_STYLE_STORAGE_KEY)
+    const stored = window.localStorage.getItem(APPEARANCE_STYLE_STORAGE_KEY)
     if (stored && isAppearanceStyle(stored)) {
       return stored
     }
@@ -47,7 +47,7 @@ export const loadAppearanceStyle = (): AppearanceStyle => {
 
 export const saveThemePreference = (preference: ThemePreference): void => {
   try {
-    localStorage.setItem(THEME_STORAGE_KEY, preference)
+    window.localStorage.setItem(THEME_STORAGE_KEY, preference)
   } catch {
     // Ignore storage errors
   }
@@ -55,7 +55,7 @@ export const saveThemePreference = (preference: ThemePreference): void => {
 
 export const saveAppearanceStyle = (style: AppearanceStyle): void => {
   try {
-    localStorage.setItem(APPEARANCE_STYLE_STORAGE_KEY, style)
+    window.localStorage.setItem(APPEARANCE_STYLE_STORAGE_KEY, style)
   } catch {
     // Ignore storage errors
   }
@@ -100,6 +100,8 @@ export const preferencesFromAppearanceOption = (
 
 export const applyResolvedTheme = (resolved: ResolvedTheme): void => {
   document.documentElement.dataset.theme = resolved
+  const favicon = document.querySelector<HTMLLinkElement>('#sprout-favicon')
+  favicon?.setAttribute('href', `/favicon-${resolved}.svg?v=4`)
 }
 
 export const applyAppearanceStyle = (style: AppearanceStyle): void => {

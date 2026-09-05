@@ -300,6 +300,14 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         )
         .route("/v1/projects/{project_id}", get(projects::get_project))
         .route(
+            "/v1/projects/{project_id}/members",
+            get(projects::list_members),
+        )
+        .route(
+            "/v1/projects/{project_id}/members/{member_identity_id}",
+            axum::routing::patch(projects::update_member_responsibilities),
+        )
+        .route(
             "/v1/projects/{project_id}/invitations",
             get(projects::list_invitations).post(projects::create_invitation),
         )
